@@ -16,6 +16,7 @@ import (
 	"kubevirt.io/client-go/kubecli"
 
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ownership"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -36,6 +37,7 @@ type EventHandler struct {
 	dhcp           *dhcp.DHCPAllocator
 	metrics        *metrics.MetricsAllocator
 	cache          *kihcache.CacheAllocator
+	scope          *ownership.Scope
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
@@ -56,6 +58,7 @@ func NewEventHandler(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	cache *kihcache.CacheAllocator,
+	scope *ownership.Scope,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
@@ -68,6 +71,7 @@ func NewEventHandler(
 		dhcp:           dhcp,
 		metrics:        metrics,
 		cache:          cache,
+		scope:          scope,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
@@ -115,35 +119,50 @@ func (e *EventHandler) EventListener() (err error) {
 
 	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kubevirtv1.VirtualMachine{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			vm := obj.(*kubevirtv1.VirtualMachine)
+			if !e.scope.OwnsVirtualMachine(vm) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:         key,
 					action:      ADD,
-					vmName:      obj.(*kubevirtv1.VirtualMachine).GetName(),
-					vmNamespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					vmName:      vm.GetName(),
+					vmNamespace: vm.GetNamespace(),
 				})
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
+			vm := new.(*kubevirtv1.VirtualMachine)
+			if !e.scope.OwnsVirtualMachine(vm) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
 					key:         key,
 					action:      UPDATE,
-					vmName:      new.(*kubevirtv1.VirtualMachine).GetName(),
-					vmNamespace: new.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					vmName:      vm.GetName(),
+					vmNamespace: vm.GetNamespace(),
 				})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
+			vm := obj.(*kubevirtv1.VirtualMachine)
+			if !e.scope.OwnsVirtualMachine(vm) {
+				return
+			}
+
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:         key,
 					action:      DELETE,
-					vmName:      obj.(*kubevirtv1.VirtualMachine).GetName(),
-					vmNamespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					vmName:      vm.GetName(),
+					vmNamespace: vm.GetNamespace(),
 				})
 			}
 		},

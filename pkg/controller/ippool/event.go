@@ -15,6 +15,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ownership"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -35,6 +36,7 @@ type EventHandler struct {
 	dhcp               *dhcp.DHCPAllocator
 	metrics            *metrics.MetricsAllocator
 	cache              *kihcache.CacheAllocator
+	scope              *ownership.Scope
 	kubeConfig         string
 	kubeContext        string
 	kubeRestConfig     *rest.Config
@@ -56,6 +58,7 @@ func NewEventHandler(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	cache *kihcache.CacheAllocator,
+	scope *ownership.Scope,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
@@ -69,6 +72,7 @@ func NewEventHandler(
 		dhcp:               dhcp,
 		metrics:            metrics,
 		cache:              cache,
+		scope:              scope,
 		kubeConfig:         kubeConfig,
 		kubeContext:        kubeContext,
 		kubeRestConfig:     kubeRestConfig,
@@ -112,35 +116,50 @@ func (e *EventHandler) EventListener() (err error) {
 
 	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			pool := obj.(*kihv1.IPPool)
+			if !e.scope.OwnsIPPool(pool) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
 					action:          ADD,
-					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
+					poolName:        pool.ObjectMeta.Name,
+					poolNetworkName: pool.Spec.NetworkName,
 				})
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
+			pool := new.(*kihv1.IPPool)
+			if !e.scope.OwnsIPPool(pool) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
 					action:          UPDATE,
-					poolName:        new.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: new.(*kihv1.IPPool).Spec.NetworkName,
+					poolName:        pool.ObjectMeta.Name,
+					poolNetworkName: pool.Spec.NetworkName,
 				})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
+			pool := obj.(*kihv1.IPPool)
+			if !e.scope.OwnsIPPool(pool) {
+				return
+			}
+
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
 					action:          DELETE,
-					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
+					poolName:        pool.ObjectMeta.Name,
+					poolNetworkName: pool.Spec.NetworkName,
 				})
 			}
 		},

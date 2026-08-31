@@ -14,6 +14,7 @@ import (
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ownership"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vmnetcfg"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -47,6 +48,8 @@ type handler struct {
 	ipam                 *ipam.IPAllocator
 	dhcp                 *dhcp.DHCPAllocator
 	cache                *cache.CacheAllocator
+	scope                *ownership.Scope
+	vlanID               string
 	metrics              *metrics.MetricsAllocator
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
@@ -61,7 +64,12 @@ type handler struct {
 }
 
 func Register() *handler {
-	return &handler{}
+	vlanID := os.Getenv("VLAN_ID")
+
+	return &handler{
+		scope:  ownership.New(vlanID, nil),
+		vlanID: vlanID,
+	}
 }
 
 func (h *handler) getKubeConfig() (config *rest.Config, err error) {
@@ -107,12 +115,17 @@ func (h *handler) Init() {
 		handleErr(err)
 	}
 
+	leaseLockName := os.Getenv("LEASE_LOCK_NAME")
+	if leaseLockName == "" {
+		leaseLockName = "kubevirt-ip-helper-lock"
+	}
+
 	h.leaderId = uuid.NewString()
 	log.Infof("(app.Run) generated leader id: %s", h.leaderId)
 
 	h.lock = &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:      "kubevirt-ip-helper-lock",
+			Name:      leaseLockName,
 			Namespace: h.namespace,
 		},
 		Client: k8s_clientset.CoordinationV1(),
@@ -197,6 +210,7 @@ func (h *handler) RunServices(ctx context.Context) {
 
 	// initialize the pool cache
 	h.cache = cache.New()
+	h.scope = ownership.New(h.vlanID, h.cache)
 
 	// gather the ippool count so we know how many pools we should initialize during startup before initializing the next controller
 	IPPoolList, err := h.getIPPools()
@@ -216,6 +230,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.dhcp,
 		h.metrics,
 		h.cache,
+		h.scope,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
@@ -274,6 +289,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.dhcp,
 		h.metrics,
 		h.cache,
+		h.scope,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
@@ -325,6 +341,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.dhcp,
 		h.metrics,
 		h.cache,
+		h.scope,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
@@ -359,7 +376,14 @@ func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
 		return IPPools, fmt.Errorf("cannot get the IPPoolList: %s", err.Error())
 	}
 
-	return IPPoolList.Items, err
+	IPPools = IPPoolList.Items[:0]
+	for i := range IPPoolList.Items {
+		if h.scope.OwnsIPPool(&IPPoolList.Items[i]) {
+			IPPools = append(IPPools, IPPoolList.Items[i])
+		}
+	}
+
+	return IPPools, err
 }
 
 func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, err error) {
@@ -378,7 +402,14 @@ func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, er
 		return vmnetcfgs, fmt.Errorf("cannot get the vmnetcfgList: %s", err.Error())
 	}
 
-	return vmnetcfgList.Items, err
+	vmnetcfgs = vmnetcfgList.Items[:0]
+	for i := range vmnetcfgList.Items {
+		if h.scope.OwnsVirtualMachineNetworkConfig(&vmnetcfgList.Items[i]) {
+			vmnetcfgs = append(vmnetcfgs, vmnetcfgList.Items[i])
+		}
+	}
+
+	return vmnetcfgs, err
 }
 
 func (h *handler) NetworkCleanup() {

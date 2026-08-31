@@ -15,6 +15,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ownership"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -34,6 +35,7 @@ type EventHandler struct {
 	dhcp                 *dhcp.DHCPAllocator
 	metrics              *metrics.MetricsAllocator
 	cache                *kihcache.CacheAllocator
+	scope                *ownership.Scope
 	kubeConfig           string
 	kubeContext          string
 	kubeRestConfig       *rest.Config
@@ -53,6 +55,7 @@ func NewEventHandler(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	cache *kihcache.CacheAllocator,
+	scope *ownership.Scope,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
@@ -66,6 +69,7 @@ func NewEventHandler(
 		dhcp:                 dhcp,
 		metrics:              metrics,
 		cache:                cache,
+		scope:                scope,
 		kubeConfig:           kubeConfig,
 		kubeContext:          kubeContext,
 		kubeRestConfig:       kubeRestConfig,
@@ -109,6 +113,11 @@ func (e *EventHandler) EventListener() (err error) {
 
 	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.VirtualMachineNetworkConfig{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			vmnetcfg := obj.(*kihv1.VirtualMachineNetworkConfig)
+			if !e.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
@@ -118,6 +127,11 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
+			vmnetcfg := new.(*kihv1.VirtualMachineNetworkConfig)
+			if !e.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+				return
+			}
+
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
@@ -127,6 +141,11 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
+			vmnetcfg := obj.(*kihv1.VirtualMachineNetworkConfig)
+			if !e.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+				return
+			}
+
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{

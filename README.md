@@ -84,6 +84,20 @@ spec:
 
 > **_NOTE:_** Make sure to replace the \<NETWORKATTACHMENTDEFINITION_NAME> and \<NAMESPACE> placeholders.
 
+### Controller ownership
+
+`LEASE_LOCK_NAME` configures the leader-election lease. All replicas that manage the same resources (or the same VLAN) must use the same lease name. Deployments for distinct VLAN groups must use distinct lease names so that each group elects its own leader.
+
+`VLAN_ID` optionally limits a deployment to one exclusive VLAN group. When `VLAN_ID` is unset or empty, the deployment keeps the legacy behavior and manages all resources. When it is set:
+
+* An IPPool is owned only when its `kubevirtiphelper/vlan-id` annotation exactly matches `VLAN_ID`.
+* A VirtualMachine or VirtualMachineNetworkConfig is owned only when all of its referenced Multus `NetworkName` values resolve to IPPools owned by that deployment.
+* Mixed-VLAN VirtualMachines are unsupported and are ignored as a whole.
+
+For one legacy deployment, leave `VLAN_ID` unset or empty and share one `LEASE_LOCK_NAME` across its replicas. For multiple exclusive VLAN groups, assign one `VLAN_ID` and one distinct `LEASE_LOCK_NAME` to each group, sharing those values only among that group's replicas.
+
+Each IPPool `NetworkName` must be globally unique. Create and register owned IPPools before creating dependent VirtualMachines or VirtualMachineNetworkConfigs: a pool-cache miss while filtering an object drops that event until the object's next update. Perform changes to ownership annotations or network references through a controlled restart or recreation rather than reassigning a running object in place.
+
 ## Usage
 
 ### Creating an IPPool object
