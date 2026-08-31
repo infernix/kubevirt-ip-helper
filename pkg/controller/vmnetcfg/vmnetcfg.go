@@ -31,6 +31,15 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	}
 
 	newVmNetCfg := vmnetcfg.DeepCopy()
+	if c.scope.StampOwnership(newVmNetCfg) {
+		newVmNetCfg, err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(context.TODO(), newVmNetCfg, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot persist ownership: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		}
+		vmnetcfg = newVmNetCfg
+		newVmNetCfg = vmnetcfg.DeepCopy()
+	}
 	newVmNetCfgs := []kihv1.NetworkConfig{}
 	newNetCfgStatusList := []kihv1.NetworkConfigStatus{}
 	for _, v := range vmnetcfg.Spec.NetworkConfig {

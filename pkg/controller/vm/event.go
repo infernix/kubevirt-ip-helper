@@ -120,10 +120,6 @@ func (e *EventHandler) EventListener() (err error) {
 	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kubevirtv1.VirtualMachine{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			vm := obj.(*kubevirtv1.VirtualMachine)
-			if !e.scope.OwnsVirtualMachine(vm) {
-				return
-			}
-
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
@@ -136,10 +132,6 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
 			vm := new.(*kubevirtv1.VirtualMachine)
-			if !e.scope.OwnsVirtualMachine(vm) {
-				return
-			}
-
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
@@ -151,8 +143,8 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			vm := obj.(*kubevirtv1.VirtualMachine)
-			if !e.scope.OwnsVirtualMachine(vm) {
+			vm, ok := deletedVirtualMachine(obj)
+			if !ok {
 				return
 			}
 
@@ -178,4 +170,18 @@ func (e *EventHandler) EventListener() (err error) {
 		log.Infof("(vm.EventListener) stopping the VirtualMachine event listener")
 		return
 	}
+}
+
+func deletedVirtualMachine(obj interface{}) (*kubevirtv1.VirtualMachine, bool) {
+	if vm, ok := obj.(*kubevirtv1.VirtualMachine); ok {
+		return vm, vm != nil
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+
+	vm, ok := tombstone.Obj.(*kubevirtv1.VirtualMachine)
+	return vm, ok && vm != nil
 }

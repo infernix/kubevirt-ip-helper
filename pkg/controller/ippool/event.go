@@ -132,24 +132,40 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
-			pool := new.(*kihv1.IPPool)
-			if !e.scope.OwnsIPPool(pool) {
+			oldPool := old.(*kihv1.IPPool)
+			newPool := new.(*kihv1.IPPool)
+			oldOwned := e.scope.OwnsIPPool(oldPool)
+			newOwned := e.scope.OwnsIPPool(newPool)
+
+			var action string
+			var pool *kihv1.IPPool
+			switch {
+			case oldOwned && newOwned:
+				action = UPDATE
+				pool = newPool
+			case oldOwned:
+				action = DELETE
+				pool = oldPool
+			case newOwned:
+				action = ADD
+				pool = newPool
+			default:
 				return
 			}
 
-			key, err := cache.MetaNamespaceKeyFunc(new)
+			key, err := cache.MetaNamespaceKeyFunc(pool)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
-					action:          UPDATE,
+					action:          action,
 					poolName:        pool.ObjectMeta.Name,
 					poolNetworkName: pool.Spec.NetworkName,
 				})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			pool := obj.(*kihv1.IPPool)
-			if !e.scope.OwnsIPPool(pool) {
+			pool, ok := deletedIPPool(obj)
+			if !ok || !e.scope.OwnsIPPool(pool) {
 				return
 			}
 
@@ -174,5 +190,17 @@ func (e *EventHandler) EventListener() (err error) {
 	case <-e.ctx.Done():
 		log.Infof("(ippool.EventListener) stopping the IPPool event listener")
 		return
+	}
+}
+
+func deletedIPPool(obj interface{}) (*kihv1.IPPool, bool) {
+	switch value := obj.(type) {
+	case *kihv1.IPPool:
+		return value, value != nil
+	case cache.DeletedFinalStateUnknown:
+		pool, ok := value.Obj.(*kihv1.IPPool)
+		return pool, ok && pool != nil
+	default:
+		return nil, false
 	}
 }

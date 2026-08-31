@@ -141,8 +141,8 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			vmnetcfg := obj.(*kihv1.VirtualMachineNetworkConfig)
-			if !e.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+			vmnetcfg, ok := deletedVirtualMachineNetworkConfig(obj)
+			if !ok || !e.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
 				return
 			}
 
@@ -156,7 +156,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.vmnetcfgCountCurrent)
+	controller := NewController(queue, indexer, informer, e.cache, e.scope, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.vmnetcfgCountCurrent)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
@@ -165,5 +165,17 @@ func (e *EventHandler) EventListener() (err error) {
 	case <-e.ctx.Done():
 		log.Infof("(vmnetcfg.EventListener) stopping the VirtualMachineNetworkConfig event listener")
 		return
+	}
+}
+
+func deletedVirtualMachineNetworkConfig(obj interface{}) (*kihv1.VirtualMachineNetworkConfig, bool) {
+	switch value := obj.(type) {
+	case *kihv1.VirtualMachineNetworkConfig:
+		return value, value != nil
+	case cache.DeletedFinalStateUnknown:
+		vmnetcfg, ok := value.Obj.(*kihv1.VirtualMachineNetworkConfig)
+		return vmnetcfg, ok && vmnetcfg != nil
+	default:
+		return nil, false
 	}
 }
