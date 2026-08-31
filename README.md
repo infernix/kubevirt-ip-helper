@@ -91,12 +91,13 @@ spec:
 `VLAN_ID` optionally limits a deployment to one exclusive VLAN group. When `VLAN_ID` is unset or empty, the deployment keeps the legacy behavior and manages all resources. When it is set:
 
 * An IPPool is owned only when its `kubevirtiphelper/vlan-id` annotation exactly matches `VLAN_ID`.
-* A VirtualMachine or VirtualMachineNetworkConfig is owned only when all of its referenced Multus `NetworkName` values resolve to IPPools owned by that deployment.
+* A VirtualMachine is owned only when all of its referenced Multus `NetworkName` values resolve to IPPools owned by that deployment.
+* Generated VirtualMachineNetworkConfigs carry the same `kubevirtiphelper/vlan-id` ownership annotation. That annotation remains authoritative for cleanup even after the corresponding IPPool is deleted; unannotated legacy configs are owned only when all referenced Multus `NetworkName` values resolve to owned IPPools.
 * Mixed-VLAN VirtualMachines are unsupported and are ignored as a whole.
 
 For one legacy deployment, leave `VLAN_ID` unset or empty and share one `LEASE_LOCK_NAME` across its replicas. For multiple exclusive VLAN groups, assign one `VLAN_ID` and one distinct `LEASE_LOCK_NAME` to each group, sharing those values only among that group's replicas.
 
-Each IPPool `NetworkName` must be globally unique. Create and register owned IPPools before creating dependent VirtualMachines or VirtualMachineNetworkConfigs: a pool-cache miss while filtering an object drops that event until the object's next update. Perform changes to ownership annotations or network references through a controlled restart or recreation rather than reassigning a running object in place.
+Each IPPool `NetworkName` must be globally unique. Create and register owned IPPools before creating dependent VirtualMachines or VirtualMachineNetworkConfigs: a pool-cache miss while filtering an object drops that event until the object's next update. Removing the final owned network from a VirtualMachine deletes its derived VirtualMachineNetworkConfig. Cross-VLAN reassignment requires controlled deletion and cleanup of dependents before changing ownership and recreating them; a restart alone is not a supported live handoff.
 
 ## Usage
 
