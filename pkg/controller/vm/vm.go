@@ -18,13 +18,27 @@ import (
 )
 
 func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMachine) (err error) {
+	vmOwned := c.scope.OwnsVirtualMachine(vm)
+
 	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
+			if !vmOwned {
+				return nil
+			}
+
 			return c.createVirtualMachineNetworkConfigObject(vm)
-		} else {
-			return
 		}
+
+		return
+	}
+
+	if !c.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+		log.Debugf("(vm.handleVirtualMachineObjectChange) [%s/%s] vmnetcfg is owned by another controller", vm.Namespace, vm.Name)
+		return nil
+	}
+	if !vmOwned {
+		return c.deleteOwnedVirtualMachineNetworkConfigObject(vmnetcfg)
 	}
 
 	return c.updateVirtualMachineNetworkConfigObject(vm, vmnetcfg)
@@ -41,6 +55,7 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	finalizers = append(finalizers, "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup")
 	newVmNetCfg.ObjectMeta.Finalizers = finalizers
 	newVmNetCfg.Spec.VMName = vm.ObjectMeta.Name
+	c.scope.StampOwnership(&newVmNetCfg)
 
 	netCfgs, err := c.getNetworkConfigs(vm, nil)
 	if err != nil {
@@ -71,13 +86,15 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 		vm.Namespace, vm.Name, vm)
 
 	newVmNetCfg := vmnetcfg.DeepCopy()
+	ownershipStamped := c.scope.StampOwnership(newVmNetCfg)
 
 	netCfgs, err := c.getNetworkConfigs(vm, vmnetcfg.Spec.NetworkConfig)
 	if err != nil {
 		return
 	}
 
-	if reflect.DeepEqual(vmnetcfg.Spec.NetworkConfig, netCfgs) {
+	networkConfigChanged := !reflect.DeepEqual(vmnetcfg.Spec.NetworkConfig, netCfgs)
+	if !networkConfigChanged && !ownershipStamped {
 		log.Debugf("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] no network updates needed", vm.Namespace, vm.Name)
 		return
 	}
@@ -87,17 +104,19 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	log.Tracef("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] new vmnetcfg networkconfig: [%+v]",
 		vm.Namespace, vm.Name, newVmNetCfg.Spec.NetworkConfig)
 
-	// when the nics in the vm differs from the vmnetcfg the mismatches should be cleaned up first
-	var nicCleanup bool
-	for _, curNetCfg := range vmnetcfg.Spec.NetworkConfig {
-		nicCleanup = true
-		for _, newNetCfg := range netCfgs {
-			if curNetCfg.MACAddress == newNetCfg.MACAddress && curNetCfg.NetworkName == newNetCfg.NetworkName && curNetCfg.IPAddress == newNetCfg.IPAddress {
-				nicCleanup = false
+	if networkConfigChanged {
+		// when the nics in the vm differs from the vmnetcfg the mismatches should be cleaned up first
+		var nicCleanup bool
+		for _, curNetCfg := range vmnetcfg.Spec.NetworkConfig {
+			nicCleanup = true
+			for _, newNetCfg := range netCfgs {
+				if curNetCfg.MACAddress == newNetCfg.MACAddress && curNetCfg.NetworkName == newNetCfg.NetworkName && curNetCfg.IPAddress == newNetCfg.IPAddress {
+					nicCleanup = false
+				}
 			}
-		}
-		if nicCleanup {
-			c.cleanupNetworkInterface(vmnetcfg, &curNetCfg)
+			if nicCleanup {
+				c.cleanupNetworkInterface(vmnetcfg, &curNetCfg)
+			}
 		}
 	}
 
@@ -114,30 +133,36 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 }
 
 func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) (err error) {
-	if !c.checkVirtualMachineNetworkConfigObject(vmNamespace, vmName) {
-		log.Warnf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg %s/%s does not exists",
-			vmNamespace, vmName, vmNamespace, vmName)
+	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(context.TODO(), vmName, metav1.GetOptions{})
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			log.Warnf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg %s/%s does not exist",
+				vmNamespace, vmName, vmNamespace, vmName)
+			return nil
+		}
 
-		return
+		return fmt.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] cannot get VirtualMachineNetworkConfig object for vm: %s",
+			vmNamespace, vmName, err.Error())
+	}
+	if !c.scope.OwnsVirtualMachineNetworkConfig(vmnetcfg) {
+		log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg is owned by another controller",
+			vmNamespace, vmName)
+		return nil
 	}
 
-	if err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+	return c.deleteOwnedVirtualMachineNetworkConfigObject(vmnetcfg)
+}
+
+func (c *Controller) deleteOwnedVirtualMachineNetworkConfigObject(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
+	if err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmnetcfg.Namespace).Delete(context.TODO(), vmnetcfg.Name, metav1.DeleteOptions{}); err != nil {
 		return fmt.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] cannot delete VirtualMachineNetworkConfig object for vm: %s",
-			vmNamespace, vmName, err.Error())
+			vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 	}
 
 	log.Infof("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] successfully released vmnetcfg object [%s/%s]",
-		vmNamespace, vmName, vmNamespace, vmName)
+		vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Namespace, vmnetcfg.Name)
 
 	return
-}
-
-func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) bool {
-	if _, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(context.TODO(), vmName, metav1.GetOptions{}); err != nil {
-		return false
-	}
-
-	return true
 }
 
 func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig) (netCfgs []kihv1.NetworkConfig, err error) {

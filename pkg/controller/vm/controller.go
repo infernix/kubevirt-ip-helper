@@ -13,6 +13,7 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ownership"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -24,6 +25,7 @@ type Controller struct {
 	queue        workqueue.RateLimitingInterface
 	informer     cache.Controller
 	cache        *kihcache.CacheAllocator
+	scope        *ownership.Scope
 	ipam         *ipam.IPAllocator
 	dhcp         *dhcp.DHCPAllocator
 	metrics      *metrics.MetricsAllocator
@@ -35,6 +37,7 @@ func NewController(
 	indexer cache.Indexer,
 	informer cache.Controller,
 	cache *kihcache.CacheAllocator,
+	scope *ownership.Scope,
 	ipam *ipam.IPAllocator,
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
@@ -45,6 +48,7 @@ func NewController(
 		indexer:      indexer,
 		queue:        queue,
 		cache:        cache,
+		scope:        scope,
 		ipam:         ipam,
 		dhcp:         dhcp,
 		metrics:      metrics,
