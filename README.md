@@ -206,7 +206,7 @@ By default only the startup, error and warning logs are enabled. More logging ca
 
 # License
 
-Copyright (c) 2025 Joey Loman <joey@binbash.org>
+Copyright (c) 2026 Joey Loman <joey@binbash.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
