@@ -27,7 +27,7 @@ jobs:
       - name: Build the container with the commit shasum, tag it as v1.0.x-latest and push them
         id: build-image
         run: |
-          docker build -f Dockerfile.webhook -t $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker build -f build/Dockerfile.webhook -t $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
           docker push $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
           docker tag $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$IMAGE_NAME:v1.0.x-latest
           docker push $REGISTRY/$IMAGE_NAME:v1.0.x-latest

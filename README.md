@@ -50,10 +50,10 @@ kubectl create -f deployments/crds.yaml
 
 ## Building the container
 
-There is a Dockerfile in the current directory which can be used to build the container, for example:
+There is a Dockerfile in the build directory which can be used to build the container, for example:
 
 ```SH
-[docker|podman] build -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
+[docker|podman] build -f build/Dockerfile -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
 ```
 
 Then push it to the remote container registry target, for example:
@@ -183,7 +183,7 @@ The kubevirt-ip-helper controllers key the lease ownership on the `vmname` of th
 The webhook lives in the same repository and is built from the Dockerfile.webhook file, for example:
 
 ```SH
-[docker|podman] build -f Dockerfile.webhook -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest .
+[docker|podman] build -f build/Dockerfile.webhook -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest .
 ```
 
 Then push it to the remote container registry target, for example:
