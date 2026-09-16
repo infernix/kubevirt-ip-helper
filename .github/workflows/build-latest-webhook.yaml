@@ -1,0 +1,37 @@
+name: Build, tag, and push webhook image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  # the webhook ships as its own image so existing deployments keep pulling
+  # ghcr.io/joeyloman/kubevirt-ip-helper-webhook; github.repository resolves
+  # to joeyloman/kubevirt-ip-helper for this repo, so the -webhook suffix
+  # reproduces the original webhook repository's image name
+  IMAGE_NAME: ${{ github.repository }}-webhook
+
+jobs:
+  build-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the container with the commit shasum, tag it as latest and push them
+        id: build-image
+        run: |
+          docker build -f Dockerfile.webhook -t $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) .
+          docker push $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$IMAGE_NAME:latest
+          docker push $REGISTRY/$IMAGE_NAME:latest

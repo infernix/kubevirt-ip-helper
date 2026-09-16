@@ -1,0 +1,35 @@
+name: Tag and push webhook release to GHCR
+
+on:
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  # the webhook ships as its own image so existing deployments keep pulling
+  # ghcr.io/joeyloman/kubevirt-ip-helper-webhook; github.repository resolves
+  # to joeyloman/kubevirt-ip-helper for this repo, so the -webhook suffix
+  # reproduces the original webhook repository's image name
+  IMAGE_NAME: ${{ github.repository }}-webhook
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag a container build to the release version and push image to GHCR
+        id: build-image
+        run: |
+          docker pull $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8})
+          docker tag $REGISTRY/$IMAGE_NAME:$(echo ${GITHUB_SHA:0:8}) $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME
+          docker push $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME

@@ -28,7 +28,7 @@ Required locally:
 - Linux on `amd64`.
 - `bash`, `kubectl`, GNU `timeout`, `jq`, `sha256sum`, and `python3`. Python 3 runs the stdlib-only DHCP pcap decoder; `jq` parses generated reports and `sha256sum` verifies the artifact manifest.
 - A running Docker or Podman daemon with enough capacity for the three-node kind cluster, KubeVirt, the test fixtures, and guests. Hardware virtualization is not required.
-- Outbound HTTPS access to GitHub, Docker Hub, GHCR, Quay, and the Kubernetes registry.
+- Outbound HTTPS access to GitHub, Docker Hub, GHCR, Quay, the Kubernetes registry, and the Go module proxy (the helper image is built from the repository root on every run, and its builder stage downloads the Go modules through `go mod download`).
 
 The harness downloads checksum-pinned `kind`, `virtctl`, and CNI plugin assets into a per-profile cache, `${XDG_CACHE_HOME:-$HOME/.cache}/kubevirt-ip-helper-e2e/current` for the default lane and `${XDG_CACHE_HOME:-$HOME/.cache}/kubevirt-ip-helper-e2e/dependency-era` for the attribution lane, so the two lanes never overwrite each other's binaries or downloaded manifests. It does not add binaries to the checkout or system paths.
 

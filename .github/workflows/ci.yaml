@@ -28,7 +28,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted="$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+          unformatted="$(gofmt -l $(find . -name '*.go'))"
           if [ -n "$unformatted" ]; then
             echo "the following files are not gofmt clean:"
             echo "$unformatted"

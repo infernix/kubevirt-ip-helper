@@ -164,6 +164,46 @@ Description: Amount of warnings or errors detected.
 
 Metrics are exported on port 8080 by default. This can be changed by adding the METRICS_PORT environment variable in the deployment. The deployment example also contains a servicemonitor object which can be automatically picked up by the Prometheus monitoring solution.
 
+## The kubevirt-ip-helper-webhook
+
+The kubevirt-ip-helper-webhook is a webhook service for the kubevirt-ip-helper which prevents deleting IPPools which are still in use and rejects VirtualMachineNetworkConfig objects which record a (vmname, macaddress) pair that another object of the same namespace already records.
+
+The IPPool deletion gate blocks a deletion only while an allocation record is backed by a live VirtualMachineNetworkConfig: a record whose (namespace, vmname, macaddress) has no live object anymore - for example the record a deleted hand-created vmnetcfg without the cleanup finalizer leaves behind, which the helper itself only revalidates at its next service era - is orphaned and does not block the deletion. The lookup errs toward blocking: a failed cluster-wide list keeps every record blocking and an unparseable reference can never be proven orphaned.
+
+The ippool admission check rejects an IPPool spec whose ipv4 configuration cannot serve: a subnet which does not parse as an ipv4 prefix (the crd schema accepts spellings like 10.0.0.0/33), an allocation range outside the subnet, a pool end before its start, a pool end or exclude entry equal to the broadcast address of the subnet, a pool range larger than the helper's cap of 65536 addresses, or an exclude address outside the allocation range. The checks mirror the helper controller's own registration validation, so a projection the controller would register is never rejected - the controller accepts an off-subnet serverip, so the admission check deliberately does too. The helper controller rejects such a projection on its own sync as well, but only after the object is stored - on update the previously registered configuration keeps serving while the object carries the broken spec and the rejection is re-logged on every resync. Only fields which are present are validated, so an omitted optional field stays the controller's business.
+
+The vmnetcfg admission check also rejects an explicit `ipaddress` which does not lie between the start and the end of the allocation range of the IPPool serving its `networkname`: the helper's controller refuses such an interface too, but only after the object is stored, leaving a permanent ERROR status whose rejection is re-logged on every retry. The range check only runs when an IPPool for the networkname exists - a vmnetcfg whose network has no pool yet is the intended ordering of a vm created before its pool, and the controller's ERROR-then-recover path is its observed contract.
+
+The vmnetcfg admission check also rejects a `macaddress` which cannot serve as a source address (every multicast address and the broadcast address carry the individual/group bit). Unlike the other checks this one is deliberately stricter than the helper controller: it registers such a binding without a complaint, and the reservation then silently consumes the pool capacity because no guest interface can ever hold that macaddress. The check cannot reject a controller-created binding, since the macaddress of a vm interface is assigned through kubemacpool, which does not hand out multicast addresses.
+
+The kubevirt-ip-helper controllers key the lease ownership on the `vmname` of the vmnetcfg spec and the DHCP allocator keys its lease map on the macaddress alone, so two objects carrying the same vm and macaddress are indistinguishable to them - on any network: contradictory specs of such objects oscillate the one lease between them on every resync while both report status OK. The vmnetcfg admission check rejects the second object at admission time. It deliberately only covers the same-vmname case: a different vmname claiming the macaddress of another vm stays admissible and is refused by the controller with an ERROR status. The vmnetcfg admission entry uses failurePolicy Ignore so an admission outage never blocks the controller's own vmnetcfg writes, and it carries no namespace selector so the objects of every namespace are guarded.
+
+### Building the webhook container
+
+The webhook lives in the same repository and is built from the Dockerfile.webhook file, for example:
+
+```SH
+[docker|podman] build -f Dockerfile.webhook -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest .
+```
+
+Then push it to the remote container registry target, for example:
+
+```SH
+[docker|podman] push <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest
+```
+
+### Deploying the webhook container
+
+Use the webhook-deployment.yaml template which is located in the deployments directory, for example:
+
+```SH
+kubectl create -f deployments/webhook-deployment.yaml
+```
+
+### Webhook logging
+
+By default only the startup, error and warning logs are enabled. More logging can be enabled by changing the LOGLEVEL environment setting in the kubevirt-ip-helper-webhook deployment. The supported loglevels are INFO, DEBUG and TRACE.
+
 # License
 
 Copyright (c) 2025 Joey Loman <joey@binbash.org>
