@@ -8,7 +8,7 @@ ADD / /src
 WORKDIR /src
 RUN go build -o kubevirt-ip-helper-webhook ./cmd/kubevirt-ip-helper-webhook
 FROM docker.io/alpine:3.23
-RUN adduser -S -D -H -h /app kubevirt-ip-helper-webhook
+RUN adduser -S -D -h /app kubevirt-ip-helper-webhook
 USER kubevirt-ip-helper-webhook
 COPY --from=builder /src/kubevirt-ip-helper-webhook /app/
 WORKDIR /app
