@@ -42,10 +42,10 @@ The following components need to be installed/configured to use the kubevirt-ip-
 
 ## Creating the Kubernetes Custom Resource Definitions (CRDs)
 
-Execute the crd yaml file which is located in the template directory, for example:
+Execute the crd yaml files which are located in the crds directory of the Helm chart, for example:
 
 ```SH
-kubectl create -f deployments/crds.yaml
+kubectl create -f deployments/charts/kubevirt-ip-helper/crds/
 ```
 
 ## Building the container
@@ -83,6 +83,72 @@ spec:
 ```
 
 > **_NOTE:_** Make sure to replace the \<NETWORKATTACHMENTDEFINITION_NAME> and \<NAMESPACE> placeholders.
+
+## Deploying with the Helm chart
+
+The Helm chart in `deployments/charts/kubevirt-ip-helper` deploys both the kubevirt-ip-helper controller
+and the kubevirt-ip-helper-webhook, including their RBAC, services and a ServiceMonitor.
+
+The webhook binary hardcodes its service name and namespace (`kubevirt-ip-helper-webhook` in
+`kubevirt-ip-helper`) when it registers its ValidatingWebhookConfiguration, so install the chart with
+the release name `kubevirt-ip-helper` into a namespace named `kubevirt-ip-helper`:
+
+```SH
+kubectl create namespace kubevirt-ip-helper
+helm install kubevirt-ip-helper deployments/charts/kubevirt-ip-helper \
+  --namespace kubevirt-ip-helper \
+  --skip-crds \
+  -f my-values.yaml
+```
+
+The chart ships the CRDs in its `crds/` directory. Helm only installs them on a fresh install and
+never upgrades or deletes them, so if the CRDs already exist in the cluster pass `--skip-crds`
+(as above) or pre-apply them with `kubectl create -f deployments/charts/kubevirt-ip-helper/crds/`.
+
+Create a values file to point the chart at your environment, for example:
+
+```YAML
+kubevirtiphelper:
+  image:
+    repository: <DOCKER_REGISTRY_URI>/kubevirt-ip-helper
+    tag: "<IMAGE_TAG>"
+  imagePullSecrets:
+    - name: <REGISTRY_PULL_SECRET>
+  podAnnotations:
+    k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"<NETWORKATTACHMENTDEFINITION_NAME>","namespace":"<NAMESPACE>" }]'
+
+webhook:
+  image:
+    repository: <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook
+    tag: "<IMAGE_TAG>"
+  imagePullSecrets:
+    - name: <REGISTRY_PULL_SECRET>
+```
+
+> **_NOTE:_** Make sure to replace the \<DOCKER_REGISTRY_URI>, \<IMAGE_TAG>, \<REGISTRY_PULL_SECRET>,
+> \<NETWORKATTACHMENTDEFINITION_NAME> and \<NAMESPACE> placeholders. The `podAnnotations` value must
+> reference your existing Multus NetworkAttachmentDefinitions: the controller serves DHCP on the
+> attached interfaces (`bindinterface` of the IPPools) and the pod needs one interface per IPPool,
+> since the controller registers only one IPPool per bindinterface.
+
+The ValidatingWebhookConfiguration `kubevirt-ip-helper-validator` is created at runtime by the
+webhook itself and is not owned by the Helm release. Delete it before tearing the deployment down
+(a normal `helm upgrade` keeps a serving webhook pod and does not need this):
+
+```SH
+kubectl delete validatingwebhookconfiguration kubevirt-ip-helper-validator
+```
+
+The IPPool deletion webhook entry uses failurePolicy Fail, so while the webhook pods are down the
+deletion of any IPPool would otherwise be rejected. After the release is (re)installed the webhook
+recreates the configuration and reuses its serving certificate from the
+`kubevirt-ip-helper-webhook-tls` secret.
+
+When the chart replaces an older deployment, the controller's leader lease (`kubevirt-ip-helper-lock`)
+is still held by the identity of a removed pod: the new leader is only elected after the lease
+expires (60 seconds by default), and the pools and DHCP services are (re)registered from that moment.
+The pods run and report Running before that; the leader pod is recognizable by its
+`kubevirtiphelper/leader: active` label, which the metrics service also selects on.
 
 ## Usage
 
