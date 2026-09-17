@@ -21,7 +21,7 @@ func TestEnqueueVirtualMachineDeleteDerivesTombstoneCleanup(t *testing.T) {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	defer queue.ShutDown()
 
-	handler := &EventHandler{scope: vmTestScope("default", "net-a"), reconcileMu: &sync.Mutex{}}
+	handler := &EventHandler{scope: vmTestScope("default", "net-a"), reconcileMu: &sync.Mutex{}, staticIPReleases: newStaticIPReleases()}
 
 	// a tombstone with a live payload names the object from the object
 	handler.enqueueVirtualMachineDelete(queue, cache.DeletedFinalStateUnknown{

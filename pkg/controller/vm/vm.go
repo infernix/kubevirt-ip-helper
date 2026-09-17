@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -25,11 +26,19 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 	if vm.DeletionTimestamp != nil {
 		return nil
 	}
+
+	// the releases of the requests this vm removed or changed are applied
+	// by the projection below. A reconciliation which did not reach its spec
+	// commit records them again, so the rate-limited retry and the resync
+	// replay them instead of losing them with their drained entries
+	releaseNics := c.staticIPReleases.drain(releaseKey(vm))
 	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(c.ctx, vm.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return c.createVirtualMachineNetworkConfigObject(vm)
+			return c.createVirtualMachineNetworkConfigObject(vm, releaseNics)
 		} else {
+			c.staticIPReleases.record(releaseKey(vm), releaseNics)
+
 			return
 		}
 	}
@@ -45,14 +54,16 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 	// and the resync converge once the object is gone, and the retried
 	// sync creates the replacement's own object
 	if vmnetcfg.ObjectMeta.DeletionTimestamp != nil {
+		c.staticIPReleases.record(releaseKey(vm), releaseNics)
+
 		return fmt.Errorf("(vm.handleVirtualMachineObjectChange) [%s/%s] the VirtualMachineNetworkConfig object is being deleted, deferring the sync until it is gone",
 			vm.Namespace, vm.Name)
 	}
 
-	return c.updateVirtualMachineNetworkConfigObject(vm, vmnetcfg)
+	return c.updateVirtualMachineNetworkConfigObject(vm, vmnetcfg, releaseNics)
 }
 
-func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
+func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine, releaseNics map[string]bool) (err error) {
 	if vm.DeletionTimestamp != nil {
 		return nil
 	}
@@ -67,8 +78,14 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	newVmNetCfg.ObjectMeta.Finalizers = finalizers
 	newVmNetCfg.Spec.VMName = vm.ObjectMeta.Name
 
-	netCfgs, err := c.getNetworkConfigs(vm, nil)
+	// the releases of this vm's changed or removed requests are applied by
+	// the fresh object itself: a created object carries no stored address to
+	// carry over, and a create which finds the object already there hands
+	// the releases over to the update projection
+	netCfgs, _, err := c.getNetworkConfigs(vm, nil, releaseNics)
 	if err != nil {
+		c.staticIPReleases.record(releaseKey(vm), releaseNics)
+
 		return
 	}
 	if len(netCfgs) < 1 {
@@ -85,9 +102,11 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 		if getErr != nil {
 			return getErr
 		}
-		return c.updateVirtualMachineNetworkConfigObject(vm, current)
+		return c.updateVirtualMachineNetworkConfigObject(vm, current, releaseNics)
 	}
 	if err != nil {
+		c.staticIPReleases.record(releaseKey(vm), releaseNics)
+
 		return fmt.Errorf("(vm.createVirtualMachineNetworkConfig) [%s/%s] cannot create VirtualMachineNetworkConfig object for vm: %s",
 			vm.Namespace, vm.Name, err.Error())
 	}
@@ -98,14 +117,26 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	return
 }
 
-func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine, vmnetcfg *kihv1.VirtualMachineNetworkConfig) error {
+func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine, vmnetcfg *kihv1.VirtualMachineNetworkConfig, releaseNics map[string]bool) (err error) {
 	if vmnetcfg.DeletionTimestamp != nil || vm.DeletionTimestamp != nil {
 		return fmt.Errorf("cannot project NICs onto deleting VM or VMNetCfg %s/%s", vm.Namespace, vm.Name)
 	}
 	if vmnetcfg.Spec.VMName != vm.Name {
 		return fmt.Errorf("VMNetCfg %s/%s belongs to VM %q", vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName)
 	}
-	desired, err := c.getNetworkConfigs(vm, nil)
+
+	// the drained releases are applied by the projection of this
+	// reconciliation: a projection which did not reach its spec commit
+	// records them again, so the rate-limited retry replays the release
+	// instead of losing it with its entry
+	applied := false
+	defer func() {
+		if !applied {
+			c.staticIPReleases.record(releaseKey(vm), releaseNics)
+		}
+	}()
+
+	desired, released, err := c.getNetworkConfigs(vm, nil, releaseNics)
 	if err != nil {
 		return err
 	}
@@ -134,6 +165,10 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 		}
 	}
 	if len(desired) == 0 && len(removed) == 0 {
+		// no own-scope interface is projected: no stored address is
+		// left to release either
+		applied = true
+
 		return nil
 	}
 	if err := c.commitProjection(vmnetcfg, false, func(current *kihv1.VirtualMachineNetworkConfig) error {
@@ -141,8 +176,14 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 			return err
 		}
 		// Preserve the latest allocated IP, including an allocation committed
-		// by the NIC controller after the projection's original read.
+		// by the NIC controller after the projection's original read. A row
+		// this projection decided (a static ip request or a released
+		// request) keeps its address: the stored one must neither
+		// overwrite the request nor resurrect the released address.
 		for i := range desired {
+			if desired[i].IPAddress != "" || released[networkConfigKey(current.Namespace, desired[i].NetworkName, desired[i].MACAddress)] {
+				continue
+			}
 			desired[i].IPAddress = ""
 			for _, nic := range current.Spec.NetworkConfig {
 				if networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress) == networkConfigKey(current.Namespace, desired[i].NetworkName, desired[i].MACAddress) {
@@ -156,6 +197,11 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	}); err != nil {
 		return err
 	}
+	// the spec projection committed the released rows: their stored address
+	// is durable as released now, so the entries are dropped and a later
+	// resync carries the freshly allocated dynamic address over instead of
+	// clearing it again
+	applied = true
 	if len(removed) == 0 {
 		return nil
 	}
@@ -181,6 +227,65 @@ type networkConfigIdentity struct {
 
 func networkConfigKey(namespace, network, mac string) networkConfigIdentity {
 	return networkConfigIdentity{network: util.QualifyNetworkName(namespace, network), mac: util.CanonicalHWAddr(mac)}
+}
+
+// staticIPReleases records the interfaces of a virtual machine whose static
+// ip request was removed or changed since the last projection: the stored row
+// address of such an interface is released by the projection of the next
+// reconciliation. The state is in-memory only, like the pending ledger
+// unwinds of the vmnetcfg controller: the annotation of the vm is the durable
+// record of its requests, so a release which was lost with a process restart
+// leaves the stored address served (no breakage) until the next annotation
+// change or interface removal. The mutex guards the map: the update handler of
+// the vm informer records while the reconciler drains.
+type staticIPReleases struct {
+	mutex sync.Mutex
+	nics  map[string]map[string]bool
+}
+
+func newStaticIPReleases() *staticIPReleases {
+	return &staticIPReleases{}
+}
+
+// record remembers the interfaces whose request was removed or changed: the
+// projection of the next reconciliation must not carry their stored address
+// over.
+func (r *staticIPReleases) record(key string, nics map[string]bool) {
+	if len(nics) == 0 {
+		return
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	recorded := r.nics[key]
+	if recorded == nil {
+		recorded = make(map[string]bool, len(nics))
+		if r.nics == nil {
+			r.nics = make(map[string]map[string]bool)
+		}
+		r.nics[key] = recorded
+	}
+	for nicName := range nics {
+		recorded[nicName] = true
+	}
+}
+
+// drain takes the recorded interfaces of a virtual machine: the projection
+// which drains them applies their release exactly once, while a projection
+// which did not reach its spec commit records them again for its retry.
+func (r *staticIPReleases) drain(key string) map[string]bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	drained := r.nics[key]
+	delete(r.nics, key)
+
+	return drained
+}
+
+// releaseKey names the recorded releases of a virtual machine: the event
+// handler and the projection address the same object by namespace/name.
+func releaseKey(vm *kubevirtV1.VirtualMachine) string {
+	return vm.Namespace + "/" + vm.Name
 }
 
 // verifyProjectionRows fences cleanup acknowledgements against changed owned
@@ -406,9 +511,15 @@ func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, 
 	return obj, true, nil
 }
 
-func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig) (netCfgs []kihv1.NetworkConfig, err error) {
+// getNetworkConfigs projects the own-scope interfaces of a virtual machine
+// onto their rows. A static ip annotation entry wins over the stored row of
+// its own interface, while a stored address is carried over for an interface
+// whose request was neither removed nor changed. The identities of the released
+// requests are returned so the projection of an existing object does not carry
+// their stored address over.
+func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig, releaseNics map[string]bool) (netCfgs []kihv1.NetworkConfig, released map[networkConfigIdentity]bool, err error) {
 	if vm.Spec.Template == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// make sure it also stays compatible with Harvester
 	var harvesterMacs map[string]string
@@ -417,6 +528,32 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 			if err := json.Unmarshal([]byte(macAnnotation), &harvesterMacs); err != nil {
 				log.Warnf("(vm.getNetworkConfigs) [%s/%s] failed to parse harvesterhci.io/mac-address annotation: %s",
 					vm.Namespace, vm.Name, err)
+			}
+		}
+	}
+
+	// the static ip annotation is fail-soft on the controller side: the
+	// admission check rejects a malformed request, while a hand-edited vm
+	// keeps projecting its other interfaces instead of wedging on it
+	staticIPs, staticIPErr := util.ParseStaticIPAnnotation(vm.ObjectMeta.Annotations)
+	if staticIPErr != nil {
+		log.Warnf("(vm.getNetworkConfigs) [%s/%s] ignoring the static ip annotation: %s",
+			vm.Namespace, vm.Name, staticIPErr)
+		c.metrics.UpdateLogStatus("warning")
+	}
+	if len(staticIPs) != 0 {
+		// a request which names no interface of this vm can never be
+		// honored: admission rejects it, while a hand-edited vm keeps
+		// projecting the interfaces it does have
+		interfaces := make(map[string]bool, len(vm.Spec.Template.Spec.Domain.Devices.Interfaces))
+		for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
+			interfaces[nic.Name] = true
+		}
+		for nicName := range staticIPs {
+			if !interfaces[nicName] {
+				log.Warnf("(vm.getNetworkConfigs) [%s/%s] the static ip annotation names interface %s which the vm does not have, ignoring it",
+					vm.Namespace, vm.Name, nicName)
+				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 	}
@@ -463,7 +600,7 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 						if c.dhcp.CheckLease(nic.MacAddress) {
 							lease := c.dhcp.GetLease(nic.MacAddress)
 							if lease.Reference != fmt.Sprintf("%s/%s", vm.Namespace, vm.Name) {
-								return netCfgs, fmt.Errorf("hwaddr %s belongs to %s instead of %s/%s, skipping vmnetcfg actions",
+								return netCfgs, released, fmt.Errorf("hwaddr %s belongs to %s instead of %s/%s, skipping vmnetcfg actions",
 									nic.MacAddress, lease.Reference, vm.Namespace, vm.Name)
 							}
 						}
@@ -476,6 +613,23 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 							if networkConfigKey(vm.Namespace, oldnet.NetworkName, oldnet.MACAddress) == networkConfigKey(vm.Namespace, netCfg.NetworkName, nic.MacAddress) {
 								netCfg.IPAddress = oldnet.IPAddress
 							}
+						}
+
+						// the annotation wins over the stored row of its own
+						// interface: the row requests exactly the address the
+						// vm asks for
+						if ipAddress, requested := staticIPs[net.Name]; requested {
+							netCfg.IPAddress = ipAddress
+						}
+						// a request which was removed or changed releases the
+						// stored address of this interface: the row is projected
+						// without it, so the vmnetcfg controller frees the old
+						// address and serves a fresh one
+						if releaseNics[net.Name] {
+							if released == nil {
+								released = make(map[networkConfigIdentity]bool)
+							}
+							released[networkConfigKey(vm.Namespace, netCfg.NetworkName, nic.MacAddress)] = true
 						}
 
 						netCfgs = append(netCfgs, netCfg)
