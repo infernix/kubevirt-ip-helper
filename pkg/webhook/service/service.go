@@ -183,10 +183,17 @@ func parseAllocationRef(ref string) (namespace string, vmName string, hwAddr str
 	return owner[:slash], owner[slash+1:], hw.String(), true
 }
 
-// allocationOwnerIndex indexes the (namespace/vmname, canonical macaddress)
-// pairs of the live VirtualMachineNetworkConfig objects: the owner key maps
-// each canonical macaddress to the name of an object recording it.
-type allocationOwnerIndex map[string]map[string]string
+// allocationOwnerKey identifies one network binding. An empty network in the
+// index records an ambiguous live reference and blocks deletion conservatively
+// for that owner and MAC on every network.
+type allocationOwnerKey struct {
+	namespace string
+	vmName    string
+	network   string
+	hwAddr    string
+}
+
+type allocationOwnerIndex map[allocationOwnerKey]string
 
 func buildAllocationOwnerIndex(list *kihv1.VirtualMachineNetworkConfigList) allocationOwnerIndex {
 	index := allocationOwnerIndex{}
@@ -195,8 +202,6 @@ func buildAllocationOwnerIndex(list *kihv1.VirtualMachineNetworkConfigList) allo
 		if obj.Spec.VMName == "" {
 			continue
 		}
-
-		owner := fmt.Sprintf("%s/%s", obj.Namespace, obj.Spec.VMName)
 
 		for _, nc := range obj.Spec.NetworkConfig {
 			if nc.MACAddress == "" {
@@ -208,12 +213,14 @@ func buildAllocationOwnerIndex(list *kihv1.VirtualMachineNetworkConfigList) allo
 				continue
 			}
 
-			if index[owner] == nil {
-				index[owner] = map[string]string{}
+			key := allocationOwnerKey{
+				namespace: obj.Namespace,
+				vmName:    obj.Spec.VMName,
+				network:   util.QualifyNetworkName(obj.Namespace, nc.NetworkName),
+				hwAddr:    hw.String(),
 			}
-
-			if _, exists := index[owner][hw.String()]; !exists {
-				index[owner][hw.String()] = obj.Name
+			if _, exists := index[key]; !exists {
+				index[key] = obj.Name
 			}
 		}
 	}
@@ -223,17 +230,17 @@ func buildAllocationOwnerIndex(list *kihv1.VirtualMachineNetworkConfigList) allo
 
 // evaluateIPPoolRecords splits the allocation records of an IPPool into the
 // ones which block its deletion and the orphaned ones which do not. a
-// record blocks when its owner tuple is backed by a live
-// VirtualMachineNetworkConfig of the index, when the index is unavailable,
-// or when its reference cannot be parsed; only a parseable record whose
-// owner has no live object stops blocking. the returned slices are ordered
-// by the ip address so the denial message is deterministic.
-func evaluateIPPoolRecords(allocated map[string]string, index allocationOwnerIndex, indexAvailable bool) (blocking []string, orphaned []string) {
+// record blocks when its owner/network/MAC tuple is backed by a live
+// VirtualMachineNetworkConfig, when the index is unavailable, or when its
+// owner or network is ambiguous. Only a provably orphaned record stops
+// blocking. The returned slices are ordered by IP for deterministic denials.
+func evaluateIPPoolRecords(allocated map[string]string, network string, index allocationOwnerIndex, indexAvailable bool) (blocking []string, orphaned []string) {
 	ips := make([]string, 0, len(allocated))
 	for ip := range allocated {
 		ips = append(ips, ip)
 	}
 	sort.Strings(ips)
+	network = util.QualifyNetworkName("", network)
 
 	for _, ip := range ips {
 		ref := allocated[ip]
@@ -254,8 +261,23 @@ func evaluateIPPoolRecords(allocated map[string]string, index allocationOwnerInd
 			continue
 		}
 
-		if objName, live := index[namespace+"/"+vmName][hwAddr]; live {
+		if network == "" {
+			blocking = append(blocking, fmt.Sprintf("ip %s is allocated to %q (ambiguous pool network)", ip, ref))
+
+			continue
+		}
+
+		key := allocationOwnerKey{namespace: namespace, vmName: vmName, network: network, hwAddr: hwAddr}
+
+		if objName, live := index[key]; live {
 			blocking = append(blocking, fmt.Sprintf("ip %s is allocated to %s (VirtualMachineNetworkConfig %s/%s)", ip, ref, namespace, objName))
+
+			continue
+		}
+
+		key.network = ""
+		if objName, ambiguous := index[key]; ambiguous {
+			blocking = append(blocking, fmt.Sprintf("ip %s is allocated to %s (VirtualMachineNetworkConfig %s/%s has an ambiguous network)", ip, ref, namespace, objName))
 
 			continue
 		}
@@ -277,7 +299,8 @@ func evaluateIPPoolRecords(allocated map[string]string, index allocationOwnerInd
 // the lookup errs toward blocking: a failed cluster-wide list keeps every
 // record blocking (the gate is then exactly the old one), and an unparseable
 // reference can never be proven orphaned either. only a record whose
-// (namespace, vmname, macaddress) matches no live object stops blocking.
+// (namespace, vmname, canonical network, canonical macaddress) matches no
+// live object stops blocking.
 func (h *Handler) validateIPPool(ctx context.Context, ar *admissionv1.AdmissionReview, pool *kihv1.IPPool) *admissionv1.AdmissionResponse {
 	allow := &admissionv1.AdmissionResponse{
 		UID:     ar.Request.UID,
@@ -298,7 +321,7 @@ func (h *Handler) validateIPPool(ctx context.Context, ar *admissionv1.AdmissionR
 		}
 	}
 
-	blocking, orphaned := evaluateIPPoolRecords(pool.Status.IPv4.Allocated, index, indexAvailable)
+	blocking, orphaned := evaluateIPPoolRecords(pool.Status.IPv4.Allocated, pool.Spec.NetworkName, index, indexAvailable)
 
 	if len(blocking) > 0 {
 		log.Warnf("(service.validateIPPool) denying the deletion of IPPool %s: %s", pool.Name, strings.Join(blocking, "; "))
@@ -349,7 +372,7 @@ func findRecordedTuple(obj *kihv1.VirtualMachineNetworkConfig, list *kihv1.Virtu
 			for _, onc := range other.Spec.NetworkConfig {
 				if util.CanonicalHWAddr(onc.MACAddress) == macAddress {
 					msg := fmt.Sprintf(
-						"vmname %s is already recorded with macaddress %s by VirtualMachineNetworkConfig %s/%s (network %s): a macaddress is served once, so two objects of the same vm and macaddress are not admitted because their contradictory specs oscillate the allocation",
+						"vmname %s is already recorded with macaddress %s by VirtualMachineNetworkConfig %s/%s (network %s): distinct objects cannot claim the same vm and macaddress, regardless of network",
 						obj.Spec.VMName, nc.MACAddress, other.Namespace, other.Name, onc.NetworkName,
 					)
 
@@ -450,17 +473,18 @@ func (h *Handler) validateVmNetCfgIPAddresses(ctx context.Context, obj *kihv1.Vi
 
 	poolByNetwork := map[string]*kihv1.IPPool{}
 	for i := range pools.Items {
-		if pools.Items[i].Spec.NetworkName == "" {
+		network := util.QualifyNetworkName("", pools.Items[i].Spec.NetworkName)
+		if network == "" {
 			continue
 		}
 
-		if _, exists := poolByNetwork[pools.Items[i].Spec.NetworkName]; !exists {
-			poolByNetwork[pools.Items[i].Spec.NetworkName] = &pools.Items[i]
+		if _, exists := poolByNetwork[network]; !exists {
+			poolByNetwork[network] = &pools.Items[i]
 		}
 	}
 
 	for _, nc := range obj.Spec.NetworkConfig {
-		if msg := checkNICIPAddress(nc, poolByNetwork[nc.NetworkName]); msg != nil {
+		if msg := checkNICIPAddress(nc, poolByNetwork[util.QualifyNetworkName(obj.Namespace, nc.NetworkName)]); msg != nil {
 			return msg
 		}
 	}
@@ -504,6 +528,30 @@ func checkNICIPAddress(nc kihv1.NetworkConfig, pool *kihv1.IPPool) (denied *stri
 	return nil
 }
 
+// changedNetworkConfigs subtracts complete stored rows as a multiset, rather
+// than matching by position or canonical identity. Reorders and removals need
+// no validation; each extra duplicate or modified row does. Changing the VM
+// owner invalidates every remaining row's previous admission.
+func changedNetworkConfigs(obj, old *kihv1.VirtualMachineNetworkConfig) []kihv1.NetworkConfig {
+	if obj.Spec.VMName != old.Spec.VMName {
+		return obj.Spec.NetworkConfig
+	}
+
+	remaining := make(map[kihv1.NetworkConfig]int, len(old.Spec.NetworkConfig))
+	for _, nc := range old.Spec.NetworkConfig {
+		remaining[nc]++
+	}
+	var changed []kihv1.NetworkConfig
+	for _, nc := range obj.Spec.NetworkConfig {
+		if remaining[nc] > 0 {
+			remaining[nc]--
+		} else {
+			changed = append(changed, nc)
+		}
+	}
+	return changed
+}
+
 // validateVmNetCfg rejects a VirtualMachineNetworkConfig which records a
 // (vmname, macaddress) pair that another object of the same namespace
 // already records. the controllers of the kubevirt-ip-helper key the lease
@@ -527,13 +575,26 @@ func (h *Handler) validateVmNetCfg(ctx context.Context, ar *admissionv1.Admissio
 	}
 
 	obj := &kihv1.VirtualMachineNetworkConfig{}
-	if err := json.Unmarshal(ar.Request.Object.Raw, &obj); err != nil {
+	if err := json.Unmarshal(ar.Request.Object.Raw, obj); err != nil {
 		log.Errorf("cannot unmarshal json to vmnetcfg: %s", err)
 
 		return allow
 	}
 
 	if obj.Name == "" || obj.Spec.VMName == "" {
+		return allow
+	}
+
+	if ar.Request.Operation == admissionv1.Update {
+		old := &kihv1.VirtualMachineNetworkConfig{}
+		if err := json.Unmarshal(ar.Request.OldObject.Raw, old); err != nil {
+			// Without a usable old object no row can be proven unchanged.
+			log.Errorf("cannot unmarshal old vmnetcfg, validating every row: %s", err)
+		} else {
+			obj.Spec.NetworkConfig = changedNetworkConfigs(obj, old)
+		}
+	}
+	if len(obj.Spec.NetworkConfig) == 0 {
 		return allow
 	}
 

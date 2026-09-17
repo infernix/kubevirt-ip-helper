@@ -48,9 +48,9 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
 
-	oldPool := testPool("pool-gap", "net-gap", 60)
+	oldPool := testPool("pool-gap", "infra/net-gap", 60)
 	oldPool.Spec.IPv4Config.NTP = []string{"192.168.1.1"}
-	newPool := testPool("pool-gap", "net-gap", 120)
+	newPool := testPool("pool-gap", "infra/net-gap", 120)
 	// a hostname entry makes the replacement resolve before it is
 	// installed, and the blocked resolver parks the reload there
 	newPool.Spec.IPv4Config.NTP = []string{"gap-ntp.invalid"}
@@ -67,7 +67,7 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 	// the live registration of the old options, as a serving era holds it
 	if err := controller.dhcp.AddPool(
 		context.Background(),
-		"net-gap",
+		"infra/net-gap",
 		"192.168.1.1",
 		"255.255.255.0",
 		"192.168.1.1",
@@ -95,10 +95,10 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 	// registered with the old options - the pre-fix code had already
 	// deleted it at this point, and every request of the window was
 	// nacked against the pool-absent registry
-	if !controller.dhcp.CheckPool("net-gap") {
+	if !controller.dhcp.CheckPool("infra/net-gap") {
 		t.Fatal("the reload unregistered the serving pool while the replacement resolves")
 	}
-	if pool := controller.dhcp.GetPool("net-gap"); pool.LeaseTime != 60 {
+	if pool := controller.dhcp.GetPool("infra/net-gap"); pool.LeaseTime != 60 {
 		t.Fatalf("serving lease time = %d while the replacement resolves, want the old 60", pool.LeaseTime)
 	}
 
@@ -109,10 +109,10 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 
 	// the replacement is published now: the same network serves the new
 	// options and the cache carries the updated object
-	if pool := controller.dhcp.GetPool("net-gap"); pool.LeaseTime != 120 {
+	if pool := controller.dhcp.GetPool("infra/net-gap"); pool.LeaseTime != 120 {
 		t.Errorf("serving lease time = %d after the reload, want the new 120", pool.LeaseTime)
 	}
-	got, err := cacheAllocator.Get("pool", "net-gap")
+	got, err := cacheAllocator.Get("pool", "infra/net-gap")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestRejectedReplacementKeepsTheServingPool(t *testing.T) {
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, nil)
 	if err := controller.dhcp.AddPool(
 		context.Background(),
-		"net-gap2",
+		"infra/net-gap2",
 		"192.168.1.1",
 		"255.255.255.0",
 		"192.168.1.1",
@@ -151,7 +151,7 @@ func TestRejectedReplacementKeepsTheServingPool(t *testing.T) {
 
 	// the projection defect passes the subnet checks of the reload but is
 	// rejected by AddPool's own validation
-	rejected := testPool("pool-gap2", "net-gap2", 120)
+	rejected := testPool("pool-gap2", "infra/net-gap2", 120)
 	rejected.Spec.IPv4Config.DNS = []string{"dns.example.invalid"}
 
 	if err := controller.createOrUpdateDHCPPool(rejected); err == nil {
@@ -160,10 +160,10 @@ func TestRejectedReplacementKeepsTheServingPool(t *testing.T) {
 
 	// the rejected replacement must leave the serving configuration
 	// untouched: the network keeps its registered pool and its options
-	if !controller.dhcp.CheckPool("net-gap2") {
+	if !controller.dhcp.CheckPool("infra/net-gap2") {
 		t.Fatal("the rejected replacement unregistered the serving pool")
 	}
-	pool := controller.dhcp.GetPool("net-gap2")
+	pool := controller.dhcp.GetPool("infra/net-gap2")
 	if pool.LeaseTime != 60 {
 		t.Errorf("serving lease time = %d after the rejected replacement, want the old 60", pool.LeaseTime)
 	}

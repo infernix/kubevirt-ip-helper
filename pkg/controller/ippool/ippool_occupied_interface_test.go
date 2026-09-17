@@ -77,13 +77,13 @@ func TestUpdateRejectsTheOccupiedBindInterface(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 	removals := recordNicRemovals(t)
 
-	poolA := ippoolBehaviorNewTestPool("pool-a", "net-a")
+	poolA := ippoolBehaviorNewTestPool("pool-a", "infra/net-a")
 	poolA.Spec.BindInterface = "eth-a"
-	poolB := ippoolBehaviorNewTestPool("pool-b", "net-b")
+	poolB := ippoolBehaviorNewTestPool("pool-b", "infra/net-b")
 	poolB.Spec.BindInterface = "eth-b"
 
-	occupiedInterfaceSeedPool(t, d, "net-a", "eth-a")
-	occupiedInterfaceSeedPool(t, d, "net-b", "eth-b")
+	occupiedInterfaceSeedPool(t, d, "infra/net-a", "eth-a")
+	occupiedInterfaceSeedPool(t, d, "infra/net-b", "eth-b")
 	if err := ca.Add(poolA); err != nil {
 		t.Fatalf("caching pool a: %s", err.Error())
 	}
@@ -102,7 +102,7 @@ func TestUpdateRejectsTheOccupiedBindInterface(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if !d.CheckPool("net-a") || !d.CheckPool("net-b") {
+	if !d.CheckPool("infra/net-a") || !d.CheckPool("infra/net-b") {
 		t.Error("the rejected update removed a serving dhcp pool")
 	}
 	if !ca.Check(poolA) || !ca.Check(poolB) {
@@ -121,13 +121,13 @@ func TestUpdateAcceptsTheMoveToAFreeInterface(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 	removals := recordNicRemovals(t)
 
-	poolA := ippoolBehaviorNewTestPool("pool-a", "net-a")
+	poolA := ippoolBehaviorNewTestPool("pool-a", "infra/net-a")
 	poolA.Spec.BindInterface = "eth-a"
-	poolB := ippoolBehaviorNewTestPool("pool-b", "net-b")
+	poolB := ippoolBehaviorNewTestPool("pool-b", "infra/net-b")
 	poolB.Spec.BindInterface = "eth-b"
 
-	occupiedInterfaceSeedPool(t, d, "net-a", "eth-a")
-	occupiedInterfaceSeedPool(t, d, "net-b", "eth-b")
+	occupiedInterfaceSeedPool(t, d, "infra/net-a", "eth-a")
+	occupiedInterfaceSeedPool(t, d, "infra/net-b", "eth-b")
 	if err := ca.Add(poolA); err != nil {
 		t.Fatalf("caching pool a: %s", err.Error())
 	}
@@ -147,10 +147,10 @@ func TestUpdateAcceptsTheMoveToAFreeInterface(t *testing.T) {
 	// the pool registry entry survives the restart path: dhcp.Stop tears
 	// the listener down and the application reinitialization unregisters
 	// the pool itself, so the registration stays observable until then
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Error("the restart path unregistered the moving pool ahead of the reinitialization")
 	}
-	if !d.CheckPool("net-b") {
+	if !d.CheckPool("infra/net-b") {
 		t.Error("the restart of pool a removed pool b's listener")
 	}
 	if len(*removals) != 1 || (*removals)[0] != "eth-a/10.10.10.1/24" {
@@ -168,13 +168,13 @@ func TestUpdateMovesTheNetworkOnTheSameInterface(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 	removals := recordNicRemovals(t)
 
-	poolA := ippoolBehaviorNewTestPool("pool-a", "net-a")
+	poolA := ippoolBehaviorNewTestPool("pool-a", "infra/net-a")
 	poolA.Spec.BindInterface = "eth-a"
-	poolB := ippoolBehaviorNewTestPool("pool-b", "net-b")
+	poolB := ippoolBehaviorNewTestPool("pool-b", "infra/net-b")
 	poolB.Spec.BindInterface = "eth-b"
 
-	occupiedInterfaceSeedPool(t, d, "net-a", "eth-a")
-	occupiedInterfaceSeedPool(t, d, "net-b", "eth-b")
+	occupiedInterfaceSeedPool(t, d, "infra/net-a", "eth-a")
+	occupiedInterfaceSeedPool(t, d, "infra/net-b", "eth-b")
 	if err := ca.Add(poolA); err != nil {
 		t.Fatalf("caching pool a: %s", err.Error())
 	}
@@ -183,7 +183,7 @@ func TestUpdateMovesTheNetworkOnTheSameInterface(t *testing.T) {
 	}
 
 	edited := poolA.DeepCopy()
-	edited.Spec.NetworkName = "net-c"
+	edited.Spec.NetworkName = "infra/net-c"
 
 	if err := c.handleIPPoolObjectChange(*poolA, edited); err != nil {
 		t.Fatalf("the networkname move on the pool's own interface must proceed: %s", err)
@@ -194,10 +194,10 @@ func TestUpdateMovesTheNetworkOnTheSameInterface(t *testing.T) {
 	// the pool registry entry survives the restart path: dhcp.Stop tears
 	// the listener down and the application reinitialization unregisters
 	// the pool itself, so the registration stays observable until then
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Error("the restart path unregistered the moving pool ahead of the reinitialization")
 	}
-	if !d.CheckPool("net-b") {
+	if !d.CheckPool("infra/net-b") {
 		t.Error("the restart of pool a removed pool b's listener")
 	}
 	if len(*removals) != 1 || (*removals)[0] != "eth-a/10.10.10.1/24" {

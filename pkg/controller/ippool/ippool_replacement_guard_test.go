@@ -22,30 +22,30 @@ func TestSyncDeleteSkipsCleanupForSameNameReplacement(t *testing.T) {
 	controller, cache := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
 	// the replacement's live registration
-	pool := testPool("pool-d", "net-d", 60)
+	pool := testPool("pool-d", "infra/net-d", 60)
 	pool.ObjectMeta.UID = "replacement-uid"
 	if err := cache.Add(pool); err != nil {
 		t.Fatalf("seeding the replacement's cache entry: %v", err)
 	}
-	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("seeding the replacement's subnet: %v", err)
 	}
-	controller.registeredPools = map[string]string{"pool-d": "net-d"}
+	controller.registeredPools = map[string]string{"pool-d": "infra/net-d"}
 
 	// the deleted generation's tombstone: same name and networkname, a
 	// different uid
-	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-d", poolUID: "deleted-uid"}
+	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "infra/net-d", poolUID: "deleted-uid"}
 	if err := controller.sync(deleted); err != nil {
 		t.Fatalf("the stale delete sync failed: %v", err)
 	}
 
-	if _, err := cache.Get("pool", "net-d"); err != nil {
+	if _, err := cache.Get("pool", "infra/net-d"); err != nil {
 		t.Errorf("the replacement's cache entry was removed by the stale delete: %v", err)
 	}
-	if net, live := controller.registeredPools["pool-d"]; !live || net != "net-d" {
+	if net, live := controller.registeredPools["pool-d"]; !live || net != "infra/net-d" {
 		t.Errorf("the replacement's registration record was removed by the stale delete: registeredPools[pool-d] = %q, live=%v", net, live)
 	}
-	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err == nil {
+	if err := controller.ipam.NewSubnet("infra/net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err == nil {
 		t.Error("the replacement's ipam subnet was deleted by the stale delete")
 	}
 }
@@ -60,28 +60,28 @@ func TestSyncDeleteWithMatchingUidTearsDownLiveRegistration(t *testing.T) {
 	startupGate := newTestGate("pool-d")
 	controller, cache := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	pool := testPool("pool-d", "net-d", 60)
+	pool := testPool("pool-d", "infra/net-d", 60)
 	pool.ObjectMeta.UID = "live-uid"
 	if err := cache.Add(pool); err != nil {
 		t.Fatalf("seeding the live registration: %v", err)
 	}
-	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("seeding the subnet: %v", err)
 	}
-	controller.registeredPools = map[string]string{"pool-d": "net-d"}
+	controller.registeredPools = map[string]string{"pool-d": "infra/net-d"}
 
-	own := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-d", poolUID: "live-uid"}
+	own := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "infra/net-d", poolUID: "live-uid"}
 	if err := controller.sync(own); err != nil {
 		t.Fatalf("the delete sync failed: %v", err)
 	}
 
-	if _, err := cache.Get("pool", "net-d"); err == nil {
+	if _, err := cache.Get("pool", "infra/net-d"); err == nil {
 		t.Error("the live registration survived its own delete")
 	}
 	if _, live := controller.registeredPools["pool-d"]; live {
 		t.Error("the registration record survived its own delete")
 	}
-	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Errorf("the ipam subnet survived its own delete: %v", err)
 	}
 }
@@ -95,22 +95,22 @@ func TestSyncDeleteWithUnknownUidTearsDownLiveRegistration(t *testing.T) {
 	startupGate := newTestGate("pool-d")
 	controller, cache := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	pool := testPool("pool-d", "net-d", 60)
+	pool := testPool("pool-d", "infra/net-d", 60)
 	pool.ObjectMeta.UID = "live-uid"
 	if err := cache.Add(pool); err != nil {
 		t.Fatalf("seeding the live registration: %v", err)
 	}
-	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("seeding the subnet: %v", err)
 	}
-	controller.registeredPools = map[string]string{"pool-d": "net-d"}
+	controller.registeredPools = map[string]string{"pool-d": "infra/net-d"}
 
-	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-d", poolUID: ""}
+	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "infra/net-d", poolUID: ""}
 	if err := controller.sync(deleted); err != nil {
 		t.Fatalf("the delete sync failed: %v", err)
 	}
 
-	if _, err := cache.Get("pool", "net-d"); err == nil {
+	if _, err := cache.Get("pool", "infra/net-d"); err == nil {
 		t.Error("the live registration survived a deletion with an unidentifiable generation")
 	}
 }
@@ -126,28 +126,28 @@ func TestSyncRenamedPoolDeleteSkipsCleanupForSameNameReplacement(t *testing.T) {
 
 	// the replacement registered under the NEW networkname while the old
 	// generation's delete was in flight
-	replacement := testPool("pool-d", "net-new", 60)
+	replacement := testPool("pool-d", "infra/net-new", 60)
 	replacement.ObjectMeta.UID = "replacement-uid"
 	if err := cache.Add(replacement); err != nil {
 		t.Fatalf("seeding the replacement's cache entry: %v", err)
 	}
-	if err := controller.ipam.NewSubnet("net-new", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-new", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("seeding the replacement's subnet: %v", err)
 	}
-	controller.registeredPools = map[string]string{"pool-d": "net-new"}
+	controller.registeredPools = map[string]string{"pool-d": "infra/net-new"}
 
 	// the old generation's delete: its recorded networkname differs from
 	// the replacement's, so the renamed-pool path resolves the live
 	// registration
-	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-old", poolUID: "deleted-uid"}
+	deleted := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "infra/net-old", poolUID: "deleted-uid"}
 	if err := controller.sync(deleted); err != nil {
 		t.Fatalf("the stale delete sync failed: %v", err)
 	}
 
-	if _, err := cache.Get("pool", "net-new"); err != nil {
+	if _, err := cache.Get("pool", "infra/net-new"); err != nil {
 		t.Errorf("the replacement's cache entry was removed by the stale renamed-pool delete: %v", err)
 	}
-	if err := controller.ipam.NewSubnet("net-new", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err == nil {
+	if err := controller.ipam.NewSubnet("infra/net-new", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err == nil {
 		t.Error("the replacement's ipam subnet was deleted by the stale renamed-pool delete")
 	}
 }

@@ -47,11 +47,11 @@ import (
 // the current claimant reclaims its own recorded address, and a fresh
 // allocation never receives it.
 func TestRegistrationFailsOnTheSwappedClaimant(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
-	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "net-a")
+	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a")
 	binding.UID = "uid-1"
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{binding}
 
@@ -65,7 +65,7 @@ func TestRegistrationFailsOnTheSwappedClaimant(t *testing.T) {
 		rs.vmnetcfgs[0].Spec.VMName = "vm-b"
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when the recorded claimant changed while the pool was unpublished")
@@ -73,7 +73,7 @@ func TestRegistrationFailsOnTheSwappedClaimant(t *testing.T) {
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the failure precedes the publication)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 
@@ -83,19 +83,19 @@ func TestRegistrationFailsOnTheSwappedClaimant(t *testing.T) {
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used after the retry = %d, want 1", used)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
 		t.Errorf("the snapshot identity must stay rejected as a foreign owner, got err %v", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
 		t.Errorf("the current claimant must reclaim its own recorded address: %s", err)
 	}
 
 	// the pool's range holds exactly the recorded address, so a fresh
 	// allocation can only take it if the protection missed the claim
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("a fresh allocation must never receive the recorded address, got ip %q", ip)
 	}
 }
@@ -108,11 +108,11 @@ func TestRegistrationFailsOnTheSwappedClaimant(t *testing.T) {
 // retried sweep attributes the pin to the object which now records the
 // nic.
 func TestRegistrationFailsOnTheReplacedClaimantObject(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
-	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "net-a")
+	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a")
 	binding.UID = "uid-1"
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{binding}
 
@@ -125,7 +125,7 @@ func TestRegistrationFailsOnTheReplacedClaimantObject(t *testing.T) {
 		rs.vmnetcfgs[0].UID = "uid-2"
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when the recorded claimant object was replaced while the pool was unpublished")
@@ -133,7 +133,7 @@ func TestRegistrationFailsOnTheReplacedClaimantObject(t *testing.T) {
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the failure precedes the publication)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 
@@ -143,10 +143,10 @@ func TestRegistrationFailsOnTheReplacedClaimantObject(t *testing.T) {
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used after the retry = %d, want 1", used)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); err != nil {
 		t.Errorf("the recreated claimant must reclaim its own recorded address: %s", err)
 	}
 }
@@ -165,7 +165,7 @@ func TestRegistrationFailsOnTheReplacedClaimantObject(t *testing.T) {
 // restoring binding of the current vm reclaims its own recorded
 // address.
 func TestRegistrationReattributesTheLedgerRecordOfTheSwappedClaimant(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef("default", "vm-a", "02:00:00:00:00:10"),
 	}
@@ -173,12 +173,12 @@ func TestRegistrationReattributesTheLedgerRecordOfTheSwappedClaimant(t *testing.
 	c, rs, _ := recoveryNewController(t, stored)
 	// the vmname edit landed before the registration: every read sees
 	// the settled state, and the persisted record is stale against it
-	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "net-a")
+	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a")
 	binding.UID = "uid-1"
 	binding.Spec.VMName = "vm-b"
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{binding}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
@@ -188,13 +188,13 @@ func TestRegistrationReattributesTheLedgerRecordOfTheSwappedClaimant(t *testing.
 		t.Errorf("republished ledger entry = %q (present %t), want the re-attributed %q",
 			got, ok, util.AllocationRef("default", "vm-b", "02:00:00:00:00:10"))
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
 		t.Errorf("the recorded identity must stay rejected as a foreign owner, got err %v", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
 		t.Errorf("the current claimant must reclaim its own recorded address: %s", err)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("a fresh allocation must never receive the recorded address, got ip %q", ip)
 	}
 }
@@ -207,13 +207,13 @@ func TestRegistrationReattributesTheLedgerRecordOfTheSwappedClaimant(t *testing.
 // the registration must fail before any publication, and the retried
 // registration re-attributes the record to the current claimant.
 func TestRegistrationFailsOnTheSwappedClaimantOfALedgerRecord(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef("default", "vm-a", "02:00:00:00:00:10"),
 	}
 
 	c, rs, _ := recoveryNewController(t, stored)
-	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "net-a")
+	binding := recoveryNewVMNetCfg("default", "vm-a", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a")
 	binding.UID = "uid-1"
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{binding}
 
@@ -228,7 +228,7 @@ func TestRegistrationFailsOnTheSwappedClaimantOfALedgerRecord(t *testing.T) {
 		rs.vmnetcfgs[0].Spec.VMName = "vm-b"
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when the claimant of a ledger-recorded address changed while the pool was unpublished")
@@ -236,7 +236,7 @@ func TestRegistrationFailsOnTheSwappedClaimantOfALedgerRecord(t *testing.T) {
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the failure precedes the publication)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 
@@ -250,10 +250,10 @@ func TestRegistrationFailsOnTheSwappedClaimantOfALedgerRecord(t *testing.T) {
 		t.Errorf("republished ledger entry = %q (present %t), want the re-attributed %q",
 			got, ok, util.AllocationRef("default", "vm-b", "02:00:00:00:00:10"))
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-a", "02:00:00:00:00:10")); !errors.Is(err, ipam.ErrIPForeignOwner) {
 		t.Errorf("the recorded identity must stay rejected as a foreign owner, got err %v", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-b", "02:00:00:00:00:10")); err != nil {
 		t.Errorf("the current claimant must reclaim its own recorded address: %s", err)
 	}
 }

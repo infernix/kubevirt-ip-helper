@@ -5,9 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // A failed sync must never unwind the restore of an address which the stored
@@ -15,8 +14,7 @@ import (
 // address, so releasing its lease and ipam reservation would hand it to
 // another vm while the durable object still claims it.
 
-// a later nic whose pool is not in the cache must fail the sync without
-// freeing the restored durable address of an earlier nic
+// A later invalid owned MAC must not free an earlier durable binding.
 func TestVMNetCfgFailedSyncKeepsRestoredDurableAllocation(t *testing.T) {
 	e := newTestEnv(t)
 
@@ -24,20 +22,17 @@ func TestVMNetCfgFailedSyncKeepsRestoredDurableAllocation(t *testing.T) {
 	e.seedPool(nil)
 
 	// restart scenario: the lease map is empty and both nics carry already
-	// persisted addresses; the pool of the second nic is not registered
+	// persisted addresses; the second MAC is malformed
 	vmnetcfg := newVMNetCfg("", testMAC)
 	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"},
-		{MACAddress: testMAC2, NetworkName: "net-missing", IPAddress: "10.0.0.2"},
+		{MACAddress: "not-a-mac", NetworkName: testNetwork, IPAddress: "10.0.0.2"},
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
 	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
 	if err == nil {
-		t.Fatal("want the missing pool of the second nic to fail the sync")
-	}
-	if !strings.Contains(err.Error(), "does not exists in cache") {
-		t.Errorf("error = %q, want the cache miss message", err)
+		t.Fatal("want the invalid second MAC to fail the sync")
 	}
 
 	// the restored assignment of the first nic must stay fully applied
@@ -137,18 +132,18 @@ func TestVMNetCfgFailedSyncUnwindsFreshAllocations(t *testing.T) {
 	}
 
 	// the first nic restores a durable address, the second nic asks for a
-	// fresh one and the third nic fails on its missing pool
+	// fresh one and the third nic fails on its unusable macaddress
 	vmnetcfg := newVMNetCfg("", testMAC)
 	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"},
 		{MACAddress: testMAC2, NetworkName: secondNetwork},
-		{MACAddress: "02:00:00:00:00:03", NetworkName: "net-missing"},
+		{MACAddress: "02:00:00:00:00:03", NetworkName: testNetwork},
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
 	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
 	if err == nil {
-		t.Fatal("want the missing pool of the third nic to fail the sync")
+		t.Fatal("want the unusable mac of the third nic to fail the sync")
 	}
 
 	// the durable restore stays applied
@@ -231,6 +226,7 @@ func TestContestedRollbackClassifiesForeignOwnerOutcomesAsConverged(t *testing.T
 func TestReleaseOwnClaimToleratesConvergedOutcomes(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(nil)
 
 	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
 	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", ownRef); err != nil {

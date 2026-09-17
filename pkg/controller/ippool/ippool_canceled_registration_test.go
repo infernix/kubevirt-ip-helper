@@ -18,8 +18,8 @@ func TestCanceledEraReloadKeepsTheServingPool(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
 
-	oldPool := testPool("pool-cancel", "net-cancel", 60)
-	newPool := testPool("pool-cancel", "net-cancel", 120)
+	oldPool := testPool("pool-cancel", "infra/net-cancel", 60)
+	newPool := testPool("pool-cancel", "infra/net-cancel", 120)
 
 	controller, cacheAllocator := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, nil)
 	if err := cacheAllocator.Add(oldPool); err != nil {
@@ -27,7 +27,7 @@ func TestCanceledEraReloadKeepsTheServingPool(t *testing.T) {
 	}
 	if err := controller.dhcp.AddPool(
 		context.Background(),
-		"net-cancel",
+		"infra/net-cancel",
 		"192.168.1.1",
 		"255.255.255.0",
 		"192.168.1.1",
@@ -54,10 +54,10 @@ func TestCanceledEraReloadKeepsTheServingPool(t *testing.T) {
 
 	// the serving pool keeps its registered options and the cache keeps
 	// the previous object: nothing partial was published
-	if pool := controller.dhcp.GetPool("net-cancel"); pool.LeaseTime != 60 {
+	if pool := controller.dhcp.GetPool("infra/net-cancel"); pool.LeaseTime != 60 {
 		t.Errorf("serving lease time = %d after the canceled reload, want the old 60", pool.LeaseTime)
 	}
-	got, getErr := cacheAllocator.Get("pool", "net-cancel")
+	got, getErr := cacheAllocator.Get("pool", "infra/net-cancel")
 	if getErr != nil {
 		t.Fatalf("pool missing from cache: %v", getErr)
 	}

@@ -23,7 +23,7 @@ func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
 	startupGate := newTestGate("ippool-x")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "net-x"}); err != nil {
+	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "infra/net-x"}); err != nil {
 		t.Fatalf("the delete sync failed: %s", err)
 	}
 	if startupGate.Settled() != 1 {
@@ -102,14 +102,14 @@ func TestSubnetRegistrationErrorClassification(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		got := subnetRegistrationError("net-x", tc.err)
+		got := subnetRegistrationError("infra/net-x", tc.err)
 		if isUnregistrable := errors.Is(got, ErrPoolUnregistrable); isUnregistrable != tc.wantUnregistrable {
 			t.Errorf("%s: errors.Is(ErrPoolUnregistrable) = %v, want %v (%v)", tc.name, isUnregistrable, tc.wantUnregistrable, got)
 		}
 		if !strings.Contains(got.Error(), tc.wantText) {
 			t.Errorf("%s: error = %q, want text %q", tc.name, got.Error(), tc.wantText)
 		}
-		if !strings.Contains(got.Error(), "net-x") {
+		if !strings.Contains(got.Error(), "infra/net-x") {
 			t.Errorf("%s: error = %q, want the network name", tc.name, got.Error())
 		}
 	}

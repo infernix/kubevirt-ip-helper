@@ -56,9 +56,12 @@ func recordNicAdds(t *testing.T) *[]string {
 // state and no nic change.
 func TestRegisterIPPoolRejectsInRangeServerIP(t *testing.T) {
 	c, ipam, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+	// the strict identity contract serves only the pool whose
+	// spec.networkname is the scope's qualified namespace/name
+	c.scope = testNetworkScope("infra/net-infra")
 	adds := recordNicAdds(t)
 
-	pool := infrastructureAddressTestPool("pool-infra", "net-infra")
+	pool := infrastructureAddressTestPool("pool-infra", "infra/net-infra")
 	pool.Spec.IPv4Config.ServerIP = "10.10.10.30"
 
 	cleanup, err := c.registerIPPool(pool)
@@ -90,9 +93,10 @@ func TestRegisterIPPoolRejectsInRangeServerIP(t *testing.T) {
 // is rejected the same way.
 func TestRegisterIPPoolRejectsInRangeRouter(t *testing.T) {
 	c, ipam, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+	c.scope = testNetworkScope("infra/net-infra")
 	stubNicMutation(t)
 
-	pool := infrastructureAddressTestPool("pool-infra", "net-infra")
+	pool := infrastructureAddressTestPool("pool-infra", "infra/net-infra")
 	pool.Spec.IPv4Config.Router = "10.10.10.40"
 
 	cleanup, err := c.registerIPPool(pool)
@@ -123,7 +127,7 @@ func TestRegisterIPPoolRejectsInRangeRouter(t *testing.T) {
 func TestRegisterIPPoolExcludesTheInRangeServerIP(t *testing.T) {
 	stubNicMutation(t)
 
-	stored := infrastructureAddressTestPool("pool-infra", "net-infra")
+	stored := infrastructureAddressTestPool("pool-infra", "infra/net-infra")
 	stored.Spec.IPv4Config.Pool = kihv1.Pool{
 		Start:   "10.10.10.10",
 		End:     "10.10.10.12",
@@ -135,6 +139,7 @@ func TestRegisterIPPoolExcludesTheInRangeServerIP(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c, ipam, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
+	c.scope = testNetworkScope("infra/net-infra")
 	c.runListener = func(networkName string, nic string) error {
 		return nil
 	}
@@ -178,10 +183,11 @@ func TestRegisterIPPoolExcludesTheInRangeServerIP(t *testing.T) {
 // running, the listener keeps serving and no nic address is released.
 func TestUpdateRejectsMovingTheServerIPIntoTheRange(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+	c.scope = testNetworkScope("infra/net-infra")
 	removals := recordNicRemovals(t)
 
-	pool := infrastructureAddressTestPool("pool-infra", "net-infra")
-	occupiedInterfaceSeedPool(t, d, "net-infra", "eth-test")
+	pool := infrastructureAddressTestPool("pool-infra", "infra/net-infra")
+	occupiedInterfaceSeedPool(t, d, "infra/net-infra", "eth-test")
 	if err := ca.Add(pool); err != nil {
 		t.Fatalf("caching the pool: %s", err.Error())
 	}
@@ -197,7 +203,7 @@ func TestUpdateRejectsMovingTheServerIPIntoTheRange(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if !d.CheckPool("net-infra") {
+	if !d.CheckPool("infra/net-infra") {
 		t.Error("the rejected update removed a serving dhcp pool")
 	}
 	if !ca.Check(pool) {
@@ -212,10 +218,11 @@ func TestUpdateRejectsMovingTheServerIPIntoTheRange(t *testing.T) {
 // same preflight, so an in-range router edit is refused the same way.
 func TestUpdateRejectsMovingTheRouterIntoTheRange(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+	c.scope = testNetworkScope("infra/net-infra")
 	removals := recordNicRemovals(t)
 
-	pool := infrastructureAddressTestPool("pool-infra", "net-infra")
-	occupiedInterfaceSeedPool(t, d, "net-infra", "eth-test")
+	pool := infrastructureAddressTestPool("pool-infra", "infra/net-infra")
+	occupiedInterfaceSeedPool(t, d, "infra/net-infra", "eth-test")
 	if err := ca.Add(pool); err != nil {
 		t.Fatalf("caching the pool: %s", err.Error())
 	}
@@ -229,7 +236,7 @@ func TestUpdateRejectsMovingTheRouterIntoTheRange(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if !d.CheckPool("net-infra") {
+	if !d.CheckPool("infra/net-infra") {
 		t.Error("the rejected update removed a serving dhcp pool")
 	}
 	if len(*removals) != 0 {

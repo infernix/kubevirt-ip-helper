@@ -38,7 +38,7 @@ import (
 // projection and an ignored new one are both observable in the allocator
 // and the republished ledger.
 func replacementNewPool(uid string, exclude []string) *kihv1.IPPool {
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Start = "10.0.0.2"
 	pool.Spec.IPv4Config.Pool.End = "10.0.0.6"
 	pool.Spec.IPv4Config.Pool.Exclude = exclude
@@ -86,15 +86,15 @@ func TestRegistrationAbortsWhenThePoolIsReplacedBeforeTheStatusRebuild(t *testin
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the aborted attempt must not write the old projection into the successor's status)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 	// the failed attempt was torn down: none of the half-applied old
 	// projection stays installed or reserved
-	if c.dhcp.CheckPool("net-a") {
+	if c.dhcp.CheckPool("infra/net-a") {
 		t.Error("the dhcp pool of the aborted registration must be torn down")
 	}
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the exclude pin of the old projection must not survive the abort)", used)
 	}
 
@@ -117,7 +117,7 @@ func TestRegistrationAbortsWhenThePoolIsReplacedBeforeTheStatusRebuild(t *testin
 	// addresses out in map order
 	handed := map[string]bool{}
 	for i := range 4 {
-		ip, ipErr := c.ipam.GetIP("net-a", "")
+		ip, ipErr := c.ipam.GetIP("infra/net-a", "")
 		if ipErr != nil {
 			t.Fatalf("fresh allocation %d: %s", i, ipErr)
 		}
@@ -131,7 +131,7 @@ func TestRegistrationAbortsWhenThePoolIsReplacedBeforeTheStatusRebuild(t *testin
 	}
 
 	// the published cache carries the successor's projection
-	published, pubErr := c.cache.Get("pool", "net-a")
+	published, pubErr := c.cache.Get("pool", "infra/net-a")
 	if pubErr != nil {
 		t.Fatalf("the retried registration must publish the successor: %s", pubErr)
 	}
@@ -179,15 +179,15 @@ func TestRegistrationAbortsWhenThePoolIsReplacedBeforeItsClaimsAreProtected(t *t
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the aborted attempt must not write the old projection into the successor's status)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 	// the half-applied registration (the nic address, the dhcp pool, the
 	// subnet and the old exclude pin) was torn down with the attempt
-	if c.dhcp.CheckPool("net-a") {
+	if c.dhcp.CheckPool("infra/net-a") {
 		t.Error("the dhcp pool of the aborted registration must be torn down")
 	}
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the exclude pin of the old projection must not survive the abort)", used)
 	}
 
@@ -200,10 +200,10 @@ func TestRegistrationAbortsWhenThePoolIsReplacedBeforeItsClaimsAreProtected(t *t
 	if _, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.3"]; republished {
 		t.Error("the exclude entry of the replaced pool must not be written into the successor's ledger")
 	}
-	if ip, err := c.ipam.GetIP("net-a", "10.0.0.4"); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", "10.0.0.4"); err == nil {
 		t.Errorf("the successor's excluded address must stay unallocatable, got %q", ip)
 	}
-	if _, err := c.ipam.GetIP("net-a", "10.0.0.3"); err != nil {
+	if _, err := c.ipam.GetIP("infra/net-a", "10.0.0.3"); err != nil {
 		t.Errorf("the exclude entry of the replaced pool must not strand one of the successor's addresses: %s", err)
 	}
 }

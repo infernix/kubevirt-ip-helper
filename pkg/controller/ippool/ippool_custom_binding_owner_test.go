@@ -47,7 +47,7 @@ func customOwnerRef() string {
 // record of the scenario: the range holds exactly the recorded address,
 // so a dropped record is observable as a fresh allocation receiving it.
 func customOwnerNewStoredPool() *kihv1.IPPool {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		customOwnerIP: customOwnerRef(),
 	}
@@ -59,7 +59,7 @@ func customOwnerNewStoredPool() *kihv1.IPPool {
 // recorded address: its object name differs from the vm its spec
 // attributes the nic to, like a manually created binding.
 func customOwnerNewClaimant() *kihv1.VirtualMachineNetworkConfig {
-	claimant := recoveryNewVMNetCfg(customOwnerNamespace, "custom-binding", customOwnerIP, customOwnerMAC, "net-a")
+	claimant := recoveryNewVMNetCfg(customOwnerNamespace, "custom-binding", customOwnerIP, customOwnerMAC, "infra/net-a")
 	claimant.Spec.VMName = customOwnerVMName
 	claimant.UID = "uid-claimant"
 
@@ -70,7 +70,7 @@ func customOwnerNewClaimant() *kihv1.VirtualMachineNetworkConfig {
 // the recorded vm but belongs to another vm and records none of its
 // claim.
 func customOwnerNewDecoy() *kihv1.VirtualMachineNetworkConfig {
-	decoy := recoveryNewVMNetCfg(customOwnerNamespace, customOwnerVMName, "10.9.9.9", "02:00:00:00:00:99", "net-b")
+	decoy := recoveryNewVMNetCfg(customOwnerNamespace, customOwnerVMName, "10.9.9.9", "02:00:00:00:00:99", "infra/net-b")
 	decoy.Spec.VMName = "vm-y"
 	decoy.UID = "uid-decoy"
 
@@ -81,7 +81,7 @@ func customOwnerNewDecoy() *kihv1.VirtualMachineNetworkConfig {
 // spec both) which no longer records the claim: the positive removal the
 // ownerGone verdict of the name-addressed object must keep answering.
 func customOwnerNewMoved() *kihv1.VirtualMachineNetworkConfig {
-	moved := recoveryNewVMNetCfg(customOwnerNamespace, customOwnerVMName, "10.9.9.9", customOwnerMAC, "net-b")
+	moved := recoveryNewVMNetCfg(customOwnerNamespace, customOwnerVMName, "10.9.9.9", customOwnerMAC, "infra/net-b")
 	moved.UID = "uid-moved"
 
 	return moved
@@ -93,7 +93,7 @@ func customOwnerNewMoved() *kihv1.VirtualMachineNetworkConfig {
 // custom-binding, crossed with the liveness of the binding, the vm and a
 // second binding literally named after the vm.
 func TestVerifyLedgerOwnerResolvesTheRecordedOwnerAmongTheActualBindings(t *testing.T) {
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	cases := []struct {
 		name string
@@ -238,7 +238,7 @@ func TestRegistrationKeepsTheLedgerRecordOfALiveVMBehindASameNamedDecoyBinding(t
 		return true, nil
 	}
 
-	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "net-a")); err != nil {
+	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "infra/net-a")); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -248,13 +248,13 @@ func TestRegistrationKeepsTheLedgerRecordOfALiveVMBehindASameNamedDecoyBinding(t
 	if ref, republished := rs.lastBody.Status.IPv4.Allocated[customOwnerIP]; !republished || ref != customOwnerRef() {
 		t.Errorf("republished ledger entry = %q (found %t), want the canonical record %q of the live vm", ref, republished, customOwnerRef())
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the record of the live vm keeps its pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the recorded address of the live vm must stay unavailable to a fresh allocation, got %q", ip)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", customOwnerIP, customOwnerRef()); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", customOwnerIP, customOwnerRef()); err != nil {
 		t.Errorf("the recreated binding of the live vm must reclaim its recorded address: %s", err)
 	}
 }
@@ -275,24 +275,24 @@ func TestRegistrationResolvesTheCustomNamedClaimantAmongTheActualBindings(t *tes
 		return false, nil
 	}
 
-	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "net-a")); err != nil {
+	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "infra/net-a")); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
 	if ref, republished := rs.lastBody.Status.IPv4.Allocated[customOwnerIP]; !republished || ref != customOwnerRef() {
 		t.Errorf("republished ledger entry = %q (found %t), want the canonical record %q of the live claimant", ref, republished, customOwnerRef())
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the live claim keeps its pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got %q", ip)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", customOwnerIP, customOwnerRef()); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", customOwnerIP, customOwnerRef()); err != nil {
 		t.Errorf("the custom-named claimant must reclaim its recorded address through the identity of its spec.vmname: %s", err)
 	}
 	decoyRef := util.AllocationRef(customOwnerNamespace, "vm-y", customOwnerMAC)
-	if _, err := c.ipam.ReclaimIP("net-a", customOwnerIP, decoyRef); !errors.Is(err, ipam.ErrIPForeignOwner) {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", customOwnerIP, decoyRef); !errors.Is(err, ipam.ErrIPForeignOwner) {
 		t.Errorf("the vm of the decoy binding must stay rejected as a foreign owner of the recorded address, got err %v", err)
 	}
 }
@@ -309,17 +309,17 @@ func TestRegistrationKeepsTheRecordOfALiveCustomNamedClaimantWhoseVMIsGone(t *te
 		return false, nil
 	}
 
-	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "net-a")); err != nil {
+	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "infra/net-a")); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
 	if ref, republished := rs.lastBody.Status.IPv4.Allocated[customOwnerIP]; !republished || ref != customOwnerRef() {
 		t.Errorf("republished ledger entry = %q (found %t), want the canonical record %q of the live claimant", ref, republished, customOwnerRef())
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the live claim keeps its pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got %q", ip)
 	}
 }
@@ -336,17 +336,17 @@ func TestRegistrationDropsTheRecordOfADeadClaimantBehindASameNamedDecoyBinding(t
 		return false, nil
 	}
 
-	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "net-a")); err != nil {
+	if err := recoveryRegistrationSteps(t, c, recoveryNewPool("pool1", "infra/net-a")); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
 	if _, republished := rs.lastBody.Status.IPv4.Allocated[customOwnerIP]; republished {
 		t.Error("the record of the dead claimant must not be republished")
 	}
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the dead claim pins nothing)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err != nil || ip != customOwnerIP {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err != nil || ip != customOwnerIP {
 		t.Errorf("the address of the dead claim must return to the fresh allocations, got ip %q err %v", ip, err)
 	}
 }
