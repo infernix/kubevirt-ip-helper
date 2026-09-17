@@ -344,7 +344,19 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 		return
 	}
 	if len(c.scope.FilterSpec(obj.Namespace, obj.Spec.NetworkConfig)) == 0 && len(c.scope.FilterStatus(obj.Namespace, obj.Status.NetworkConfig)) == 0 {
-		return nil
+		if len(obj.Spec.NetworkConfig) != 0 || len(obj.Status.NetworkConfig) != 0 {
+			return nil
+		}
+		managed := false
+		for _, finalizer := range obj.Finalizers {
+			if finalizer == "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup" {
+				managed = true
+				break
+			}
+		}
+		if !managed {
+			return nil
+		}
 	}
 	if obj.Spec.VMName != vmName {
 		return fmt.Errorf("VMNetCfg %s/%s belongs to VM %q", obj.Namespace, obj.Name, obj.Spec.VMName)

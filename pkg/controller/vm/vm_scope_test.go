@@ -434,3 +434,65 @@ func TestScopedProjectionResolvesRemovedStatusOnlyBindingFromOwnedLedger(t *test
 		t.Fatal("status-only cleanup must remove exactly its own durable reservation")
 	}
 }
+
+func TestScopedLastNICRemovalDeletesEmptyConfigWithParent(t *testing.T) {
+	for _, scenario := range []string{"parent-deleted", "different-parent", "UID-replaced", "unmanaged"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, f := vmBehaviorNewTestController(t)
+			c.indexer = newTestIndexer()
+			vm := multusVM("ns1", "vm1", "a", "default/net-a", "02:00:00:00:00:01")
+			key := "ns1/vm1"
+			if err := c.indexer.Add(vm); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.sync(Event{key: key, action: ADD, vmNamespace: "ns1", vmName: "vm1"}); err != nil {
+				t.Fatal(err)
+			}
+			created := f.storedVMNetCfg(key)
+			if created == nil || len(created.Spec.NetworkConfig) != 1 || len(created.Finalizers) != 1 {
+				t.Fatalf("normal projection did not create managed binding: %#v", created)
+			}
+			emptyVM := testVM("ns1", "vm1")
+			if err := c.indexer.Update(emptyVM); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.sync(Event{key: key, action: UPDATE, vmNamespace: "ns1", vmName: "vm1"}); err != nil {
+				t.Fatal(err)
+			}
+			empty := f.storedVMNetCfg(key)
+			if empty == nil || len(empty.Spec.NetworkConfig)+len(empty.Status.NetworkConfig) != 0 || empty.DeletionTimestamp != nil {
+				t.Fatalf("last-NIC projection did not leave expected empty live binding: %#v", empty)
+			}
+			f.mu.Lock()
+			switch scenario {
+			case "different-parent":
+				f.vmnetcfgs[key].Spec.VMName = "another-vm"
+			case "UID-replaced":
+				f.vmnetcfgGetUIDOverride = "stale-uid"
+			case "unmanaged":
+				f.vmnetcfgs[key].Finalizers = nil
+			}
+			f.mu.Unlock()
+			before := f.storedVMNetCfg(key)
+			if err := c.indexer.Delete(emptyVM); err != nil {
+				t.Fatal(err)
+			}
+			err := c.sync(Event{key: key, action: DELETE, vmNamespace: "ns1", vmName: "vm1"})
+			if scenario == "different-parent" || scenario == "UID-replaced" {
+				if err == nil {
+					t.Fatal("parent/UID mismatch must reject deletion")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			got := f.storedVMNetCfg(key)
+			if scenario == "parent-deleted" {
+				if got != nil && got.DeletionTimestamp == nil {
+					t.Fatalf("parent DELETE stranded empty managed config: %#v", got)
+				}
+			} else if !reflect.DeepEqual(got, before) {
+				t.Fatalf("parent DELETE changed an unowned or replaced config: %#v", got)
+			}
+		})
+	}
+}
