@@ -511,13 +511,25 @@ webhook_ready() {
   service="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get service "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
   endpoints="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
   pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook -o json)" || return 1
+  # This version serves four entries: the ippool deletion gate, the vmnetcfg
+  # duplicate and range guards, the ippool spec guard, and the virtualmachine
+  # static ip guard. The static ip entry is identified by name, path and rules
+  # rather than by count alone, because the static ip phase below submits a
+  # virtualmachine to the real admission path and needs exactly that entry.
   jq -e -n --argjson config "${config}" --argjson service "${service}" \
     --argjson endpoints "${endpoints}" --argjson pods "${pods}" \
-    --arg name "${KIH_WEBHOOK_SERVICE}" --arg ns "${KIH_HELPER_NAMESPACE}" '
-      ($config.webhooks | length == 3)
+    --arg name "${KIH_WEBHOOK_SERVICE}" --arg ns "${KIH_HELPER_NAMESPACE}" \
+    --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_HELPER_NAMESPACE}.svc" '
+      ($config.webhooks | length == 4)
       and all($config.webhooks[]; .clientConfig.service.name == $name
         and .clientConfig.service.namespace == $ns and .clientConfig.service.port == 8080
         and (.clientConfig.caBundle | length > 0))
+      and any($config.webhooks[];
+        .name == $vmname and .clientConfig.service.path == "/validate-vm"
+        and (.rules | length == 1)
+        and .rules[0].apiGroups == ["kubevirt.io"]
+        and .rules[0].resources == ["virtualmachines"]
+        and ([.rules[0].operations[]] | sort == ["CREATE", "UPDATE"]))
       and $service.spec.selector.app == "kubevirt-ip-helper-webhook"
       and ($service.spec.selector | has("kubevirtiphelper/network") | not)
       and any($service.spec.ports[]; .port == 8080 and .targetPort == 8443)
@@ -2420,6 +2432,122 @@ EOF
     > "${E2E_ARTIFACTS_DIR}/14-multipool-group.txt"
 }
 
+# The static ip request is a json object keyed by the interface name of the vm
+# spec, so it travels on the VirtualMachine object itself: admission validates it
+# against the durable IPPool ledger, and the vm controller projects it into the
+# networkconfig row of that interface, where the ordinary claim path reserves
+# exactly the requested address for this vm and mac. The scenario reuses the
+# ordinary guest name, MAC and rendered template after the core guest has been
+# deleted, so the request cannot inherit a reservation of the previous phase. It
+# asks for the last address of the configured range, a deterministic non-first
+# address: a helper which ignored the annotation and served its first free address
+# would answer ${KIH_IPPOOL_START} instead, and the boot helper compares both
+# the DHCP ACK and the guest's installed address with the requested one.
+KIH_STATIC_IP_ANNOTATION="kubevirtiphelper.k8s.binbash.org/static-ip"
+STATIC_IP_RESERVATION="${KIH_IPPOOL_END}"
+STATIC_IP_TAKEN_VM="static-ip-taken-vm"
+STATIC_IP_TAKEN_MAC="02:00:00:00:00:21"
+
+# The request is the annotation of the VirtualMachine metadata, next to the
+# ordinary metadata of the rendered guest template.
+render_static_ip_vm() { # <name> <mac> <address> <output>
+  local name="$1" mac="$2" address="$3" output="$4"
+  render_halted_vm "${name}" "${mac}" "${output}"
+  sed -i "/^  namespace: ${KIH_WORKLOAD_NAMESPACE}$/a\\
+  annotations:\\
+    ${KIH_STATIC_IP_ANNOTATION}: '{\"${KIH_HELPER_INTERFACE}\":\"${address}\"}'" "${output}"
+}
+
+# The reused name has to be free before the request: a reservation which
+# survived the core phase could serve the requested address without the
+# annotation having requested it.
+static_ip_start_clean() {
+  vm_absent_named "${KIH_VM_NAME}" &&
+    vmnetcfg_absent_named "${KIH_VM_NAME}" &&
+    pool_initialized
+}
+
+# The halted reservation has to hold exactly the requested address, and its
+# durable ledger entry has to name this vm and mac: an address anywhere in the
+# range, or an ownerless claim, would not prove the annotation was honoured.
+# named_reservation_kept also validates that the published counters and the
+# allocation map agree with each other.
+static_ip_reserved() {
+  [ "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null)" = "${STATIC_IP_RESERVATION}" ] &&
+    vmi_absent &&
+    named_reservation_kept "${KIH_VM_NAME}" "${KIH_VM_MAC}"
+}
+
+# A denied request must leave the served reservation, its ledger entry and the
+# pool accounting untouched: it must not consume a second address.
+static_ip_reservation_kept() {
+  # The guest serves this reservation by now, so the VMI exists: assert the
+  # requested address, its owner ledger and the accounting, not the halted state
+  # the pre-boot wait already proved.
+  [ "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null)" = "${STATIC_IP_RESERVATION}" ] &&
+    named_reservation_kept "${KIH_VM_NAME}" "${KIH_VM_MAC}" &&
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 1 10
+}
+
+# The denial has to be the static ip entry's own decision and name the occupied
+# address and its owner: a transport, schema, range or other webhook failure is
+# not admission proof. admission_rejects saves the explicit denial in
+# ${manifest}.admission.txt, which is read back here.
+static_ip_taken_denied() { # <manifest>
+  local manifest="$1" response
+  admission_rejects "${manifest}" || return 1
+  response="$(cat "${manifest}.admission.txt")" || return 1
+  [[ "${response}" == *"${KIH_WEBHOOK_SERVICE}-vm.${KIH_HELPER_NAMESPACE}.svc"* ]] || return 1
+  [[ "${response}" == *"the static ip address ${STATIC_IP_RESERVATION} of interface ${KIH_HELPER_INTERFACE} is already allocated to ${KIH_WORKLOAD_NAMESPACE}/${KIH_VM_NAME} [${KIH_VM_MAC}]"* ]]
+}
+
+run_static_ip_checks() {
+  local deadline manifest taken_manifest
+  deadline=$((SECONDS + 600))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the static ip annotation of ${KIH_VM_NAME}"
+  assert_case STATIC-IP-NAME-FREE \
+    "the reused VM name, its reservation and the pool are free before the request" \
+    static_ip_start_clean
+  manifest="${E2E_ARTIFACTS_DIR}/static-ip-vm.yaml"
+  render_static_ip_vm "${KIH_VM_NAME}" "${KIH_VM_MAC}" "${STATIC_IP_RESERVATION}" "${manifest}"
+  assert_case STATIC-IP-REQUEST-RENDERED \
+    "the rendered guest requests exactly ${STATIC_IP_RESERVATION} on ${KIH_HELPER_INTERFACE}" \
+    grep -qF "${KIH_STATIC_IP_ANNOTATION}: '{\"${KIH_HELPER_INTERFACE}\":\"${STATIC_IP_RESERVATION}\"}'" \
+    "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline STATIC-IP-EXACT-RESERVATION "${deadline}" 120 \
+    "the halted guest holds exactly the requested ${STATIC_IP_RESERVATION} with its owner ledger" \
+    static_ip_reserved
+  RESERVED_IP="${STATIC_IP_RESERVATION}"
+  start_guest_and_assert static-ip "${deadline}"
+  capture_checkpoint 27-static-ip-reserved \
+    "static ip ${STATIC_IP_RESERVATION} reached the guest through DHCP"
+  taken_manifest="${E2E_ARTIFACTS_DIR}/static-ip-taken-vm.yaml"
+  render_static_ip_vm "${STATIC_IP_TAKEN_VM}" "${STATIC_IP_TAKEN_MAC}" \
+    "${STATIC_IP_RESERVATION}" "${taken_manifest}"
+  assert_case STATIC-IP-TAKEN-DENIED \
+    "admission denies a second VM the recorded address and names its owner" \
+    static_ip_taken_denied "${taken_manifest}"
+  assert_case STATIC-IP-RESERVATION-KEPT \
+    "the denied request leaves the served reservation and its accounting unchanged" \
+    static_ip_reservation_kept
+  stop_guest static-ip "${deadline}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true
+  wait_before_deadline STATIC-IP-CLEANED "${deadline}" 120 \
+    "the static reservation releases its VMNetCfg and returns the empty pool" \
+    cleanup_complete
+  wait_before_deadline STATIC-IP-METRICS-CLEANED "${deadline}" 60 \
+    "the static reservation leaves no VM metric behind" metric_vm_absent
+  capture_checkpoint 29-static-ip-cleaned \
+    "static ip ${STATIC_IP_RESERVATION} released with the empty pool"
+  guard_case STATIC-IP-DEADLINE "static ip scenarios completed within their own deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+}
+
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
   local image_id webhook_image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
@@ -2745,6 +2873,7 @@ main() {
   wait_for CORE-METRICS-AFTER-CLEANUP 60 "cleanup updates IPPool metrics" metric_pool_equals 0 11
   wait_for CORE-VM-METRIC-REMOVED 60 "cleanup removes VM metric" metric_vm_absent
   capture_checkpoint 10-cleanup "VM deletion released ${RESERVED_IP} and its metric"
+  run_static_ip_checks
 
   case "${E2E_GROUP}" in
     all)
