@@ -10,11 +10,14 @@ import (
 	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 )
 
 func vmnetcfg(namespace string, name string, vmName string, nics ...kihv1.NetworkConfig) *kihv1.VirtualMachineNetworkConfig {
@@ -656,5 +659,175 @@ func TestIPv4BroadcastAndRangeLen(t *testing.T) {
 	end, _ = netip.ParseAddr("10.21.255.254")
 	if got := ipv4RangeLen(start, end); got != 131070 {
 		t.Fatalf("rangeLen of the oversized range = %d, want 131070", got)
+	}
+}
+
+// staticIPNic describes one interface of a test virtualmachine: its name,
+// its macaddress and the network entry which carries the same name. a pod
+// network carries no networkname.
+type staticIPNic struct {
+	name    string
+	mac     string
+	network string
+	multus  bool
+}
+
+// staticIPVM builds a virtualmachine whose interfaces and networks mirror
+// the given nics. a non-empty annotation value is carried as the static ip
+// annotation of the vm.
+func staticIPVM(namespace string, name string, annotation string, nics ...staticIPNic) *kubevirtv1.VirtualMachine {
+	vm := &kubevirtv1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Spec: kubevirtv1.VirtualMachineSpec{
+			Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{},
+		},
+	}
+
+	if annotation != "" {
+		vm.ObjectMeta.Annotations = map[string]string{util.StaticIPAnnotationName: annotation}
+	}
+
+	for _, nic := range nics {
+		vm.Spec.Template.Spec.Domain.Devices.Interfaces = append(vm.Spec.Template.Spec.Domain.Devices.Interfaces,
+			kubevirtv1.Interface{Name: nic.name, MacAddress: nic.mac})
+
+		network := kubevirtv1.Network{Name: nic.name}
+		if nic.multus {
+			network.NetworkSource = kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: nic.network}}
+		} else {
+			network.NetworkSource = kubevirtv1.NetworkSource{Pod: &kubevirtv1.PodNetwork{}}
+		}
+
+		vm.Spec.Template.Spec.Networks = append(vm.Spec.Template.Spec.Networks, network)
+	}
+
+	return vm
+}
+
+func virtualMachineReview(t *testing.T, operation admissionv1.Operation, obj, old *kubevirtv1.VirtualMachine) *admissionv1.AdmissionReview {
+	t.Helper()
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &admissionv1.AdmissionRequest{
+		UID:       "admission-test",
+		Operation: operation,
+		Namespace: obj.Namespace,
+		Name:      obj.Name,
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+	if old != nil {
+		request.OldObject.Raw, err = json.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &admissionv1.AdmissionReview{Request: request}
+}
+
+// TestValidateVirtualMachineStaticIPs covers the static ip annotation guard:
+// a request the IPPool of its interface can serve is admitted, and every
+// request it cannot serve for this vm is denied at admission. the pool of a
+// vm which changed its macaddress and the unprovable internal failures of a
+// pool fail open, exactly like the vmnetcfg checks.
+func TestValidateVirtualMachineStaticIPs(t *testing.T) {
+	pools := &kihv1.IPPoolList{Items: []kihv1.IPPool{
+		*testPool("pool-a", "tenant/net-a", "192.168.11.100", "192.168.11.166"),
+		*testPool("pool-b", "tenant/net-b", "192.168.11.100", "192.168.11.166"),
+		*testPool("pool-broken", "tenant/net-broken", "192.168.11.x", "192.168.11.166"),
+	}}
+	pools.Items[0].Status.IPv4.Allocated = map[string]string{
+		"192.168.11.130": "other/vm-1 [02:00:00:00:00:01]",
+		"192.168.11.140": "tenant/vm [02:00:00:00:00:01]",
+		"192.168.11.150": "garbage",
+	}
+	pools.Items[1].Spec.IPv4Config.Pool.Exclude = []string{"192.168.11.120"}
+	pools.Items[1].Status.IPv4.Allocated = map[string]string{"192.168.11.121": kihipam.ExcludedOwner}
+
+	nicA := staticIPNic{name: "net-a", mac: "02:00:00:00:00:01", network: "net-a", multus: true}
+	nicB := staticIPNic{name: "net-b", mac: "02:00:00:00:00:02", network: "tenant/net-b", multus: true}
+	nicBroken := staticIPNic{name: "net-broken", mac: "02:00:00:00:00:03", network: "tenant/net-broken", multus: true}
+	nicPod := staticIPNic{name: "pod-net", mac: "02:00:00:00:00:04"}
+	nicNameless := staticIPNic{name: "nameless", mac: "02:00:00:00:00:05", multus: true}
+
+	emptyValue := staticIPVM("tenant", "vm", "", nicA)
+	emptyValue.ObjectMeta.Annotations = map[string]string{util.StaticIPAnnotationName: ""}
+
+	networkless := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110"}`, nicA)
+	networkless.Spec.Template.Spec.Networks = nil
+
+	templateless := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110"}`, nicA)
+	templateless.Spec.Template = nil
+
+	changedMAC := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.140"}`,
+		staticIPNic{name: "net-a", mac: "02:00:00:00:00:0a", network: "net-a", multus: true})
+	unchanged := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.140"}`, nicA)
+
+	h := admissionTestHandler(t, pools, &kihv1.VirtualMachineNetworkConfigList{}, false)
+	tests := []struct {
+		name      string
+		operation admissionv1.Operation
+		old       *kubevirtv1.VirtualMachine
+		obj       *kubevirtv1.VirtualMachine
+		allowed   bool
+		wantSub   string
+	}{
+		{"a free address", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110"}`, nicA), true, ""},
+		{"an address outside the pool range", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.200"}`, nicA), false, "is not between the pool range"},
+		{"the subnet broadcast address", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.255"}`, nicA), false, "is the broadcast address"},
+		{"an excluded address", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-b":"192.168.11.120"}`, nicB), false, "is excluded by the pool range"},
+		{"a reserved exclude", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-b":"192.168.11.121"}`, nicB), false, "is a reserved exclude"},
+		{"an address of another vm", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.130"}`, nicA), false, "is already allocated to other/vm-1"},
+		{"an unparseable owner fails open", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.150"}`, nicA), true, ""},
+		{"a pool range which does not parse fails open", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-broken":"192.168.11.110"}`, nicBroken), true, ""},
+		{"the same vm keeps its address after a macaddress change", admissionv1.Update, unchanged, changedMAC, true, ""},
+		{"an unchanged update", admissionv1.Update, unchanged, unchanged, true, ""},
+		{"the same address on two interfaces", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110","net-b":"192.168.11.110"}`, nicA, nicB), false, "on both interfaces"},
+		{"a network without a pool", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-d":"192.168.11.110"}`, staticIPNic{name: "net-d", mac: "02:00:00:00:00:06", network: "tenant/net-d", multus: true}), false, "no IPPool serves its network"},
+		{"an interface the vm does not define", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-x":"192.168.11.110"}`, nicA), false, "which the vm does not define"},
+		{"a network which is not multus", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"pod-net":"192.168.11.110"}`, nicPod), false, "is not a multus network"},
+		{"a multus network without a networkname", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"nameless":"192.168.11.110"}`, nicNameless), false, "carries no networkname"},
+		{"an interface without a network", admissionv1.Create, nil, networkless, false, "has no network in spec.template.spec.networks"},
+		{"a template without interfaces", admissionv1.Create, nil, templateless, false, "defines no interfaces"},
+		{"a malformed annotation", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":}`, nicA), false, "does not parse as a json object"},
+		{"an annotation which is not a json object", admissionv1.Create, nil, staticIPVM("tenant", "vm", `192.168.11.110`, nicA), false, "does not parse as a json object"},
+		{"an unparseable address", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"not-an-address"}`, nicA), false, "is not an ipv4 address"},
+		{"an ipv6 address", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{"net-a":"fd10::1"}`, nicA), false, "is not an ipv4 address"},
+		{"a vm without the annotation", admissionv1.Create, nil, staticIPVM("tenant", "vm", "", nicA), true, ""},
+		{"an annotation without addresses", admissionv1.Create, nil, staticIPVM("tenant", "vm", `{}`, nicA), true, ""},
+		{"an annotation without a value", admissionv1.Create, nil, emptyValue, true, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := h.validateVirtualMachine(virtualMachineReview(t, tt.operation, tt.obj, tt.old))
+
+			if response.Allowed != tt.allowed {
+				t.Fatalf("allowed=%v, want %v: %+v", response.Allowed, tt.allowed, response.Result)
+			}
+
+			if tt.wantSub != "" && (response.Result == nil || !strings.Contains(response.Result.Message, tt.wantSub)) {
+				t.Fatalf("message %+v does not contain %q", response.Result, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidateVirtualMachineStaticIPsFailOpen covers the fail-open policy of
+// the static ip guard: an unavailable IPPool list admits the vm, exactly like
+// the vmnetcfg checks, because the controller's own claim stays the
+// authoritative guard.
+func TestValidateVirtualMachineStaticIPsFailOpen(t *testing.T) {
+	h := admissionTestHandler(t, &kihv1.IPPoolList{}, &kihv1.VirtualMachineNetworkConfigList{}, true)
+	vm := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110"}`,
+		staticIPNic{name: "net-a", mac: "02:00:00:00:00:01", network: "tenant/net-a", multus: true})
+
+	response := h.validateVirtualMachine(virtualMachineReview(t, admissionv1.Create, vm, nil))
+	if !response.Allowed {
+		t.Fatalf("an unavailable IPPool list must fail open: %+v", response.Result)
 	}
 }

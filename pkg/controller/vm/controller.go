@@ -34,6 +34,13 @@ type Controller struct {
 	kihClientset *kihclientset.Clientset
 	scope        util.NetworkScope
 	reconcileMu  *sync.Mutex
+
+	// staticIPReleases records the interfaces whose static ip request was
+	// removed or changed since the last projection: the projection of the
+	// next reconciliation releases their stored address. The vm event
+	// handler records while the reconciler drains, so the state is shared
+	// with the handler and guarded by its own mutex
+	staticIPReleases *staticIPReleases
 }
 
 func NewController(
@@ -48,6 +55,7 @@ func NewController(
 	kihClientset *kihclientset.Clientset,
 	scope util.NetworkScope,
 	reconcileMu *sync.Mutex,
+	staticIPReleases *staticIPReleases,
 ) *Controller {
 	// the API calls of a reconciliation run under the era context: a
 	// canceled era (application reinit or shutdown) aborts in-flight
@@ -57,17 +65,18 @@ func NewController(
 	}
 
 	return &Controller{
-		ctx:          ctx,
-		informer:     informer,
-		indexer:      indexer,
-		queue:        queue,
-		cache:        cache,
-		ipam:         ipam,
-		dhcp:         dhcp,
-		metrics:      metrics,
-		kihClientset: kihClientset,
-		scope:        scope,
-		reconcileMu:  reconcileMu,
+		ctx:              ctx,
+		informer:         informer,
+		indexer:          indexer,
+		queue:            queue,
+		cache:            cache,
+		ipam:             ipam,
+		dhcp:             dhcp,
+		metrics:          metrics,
+		kihClientset:     kihClientset,
+		scope:            scope,
+		reconcileMu:      reconcileMu,
+		staticIPReleases: staticIPReleases,
 	}
 }
 

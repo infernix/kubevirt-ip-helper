@@ -88,6 +88,7 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		kihClientset,
 		vmTestScope("default", "net-a"),
 		&sync.Mutex{},
+		newStaticIPReleases(),
 	)
 	t.Cleanup(queue.ShutDown)
 

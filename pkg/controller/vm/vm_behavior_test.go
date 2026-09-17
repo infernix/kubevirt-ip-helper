@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
@@ -63,14 +64,15 @@ func vmBehaviorNewTestController(t *testing.T) (*Controller, *fakeAPI) {
 	}
 
 	return &Controller{
-		ctx:          context.Background(),
-		cache:        kihcache.NewCacheAllocator(),
-		ipam:         ipam.NewIPAllocator(),
-		dhcp:         dhcp.NewDHCPAllocator(),
-		metrics:      metrics.NewMetricsAllocator(),
-		kihClientset: cs,
-		scope:        vmTestScope("default", "net-a"),
-		reconcileMu:  &sync.Mutex{},
+		ctx:              context.Background(),
+		cache:            kihcache.NewCacheAllocator(),
+		ipam:             ipam.NewIPAllocator(),
+		dhcp:             dhcp.NewDHCPAllocator(),
+		metrics:          metrics.NewMetricsAllocator(),
+		kihClientset:     cs,
+		scope:            vmTestScope("default", "net-a"),
+		reconcileMu:      &sync.Mutex{},
+		staticIPReleases: newStaticIPReleases(),
 	}, f
 }
 
@@ -536,7 +538,7 @@ func TestGetNetworkConfigsFiltersNonMultusAndUnmatched(t *testing.T) {
 		{Name: "unused", NetworkSource: kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: "default/net-b"}}}, // no matching interface -> skipped
 	}
 
-	got, err := c.getNetworkConfigs(vm, nil)
+	got, _, err := c.getNetworkConfigs(vm, nil, nil)
 	if err != nil {
 		t.Fatalf("getNetworkConfigs: %v", err)
 	}
@@ -553,7 +555,7 @@ func TestGetNetworkConfigsUsesExplicitMacAddress(t *testing.T) {
 
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
-	got, err := c.getNetworkConfigs(vm, nil)
+	got, _, err := c.getNetworkConfigs(vm, nil, nil)
 	if err != nil {
 		t.Fatalf("getNetworkConfigs: %v", err)
 	}
@@ -570,7 +572,7 @@ func TestGetNetworkConfigsUsesHarvesterMacAddress(t *testing.T) {
 		"harvesterhci.io/mac-address": `{"net1":"aa:bb:cc:11:22:33"}`,
 	}
 
-	got, err := c.getNetworkConfigs(vm, nil)
+	got, _, err := c.getNetworkConfigs(vm, nil, nil)
 	if err != nil {
 		t.Fatalf("getNetworkConfigs: %v", err)
 	}
@@ -601,7 +603,7 @@ func TestGetNetworkConfigsSkipsWhenNoMacAvailable(t *testing.T) {
 	}
 
 	for name, vm := range cases {
-		got, err := c.getNetworkConfigs(vm, nil)
+		got, _, err := c.getNetworkConfigs(vm, nil, nil)
 		if err != nil {
 			t.Fatalf("%s: getNetworkConfigs: %v", name, err)
 		}
@@ -617,7 +619,7 @@ func TestGetNetworkConfigsPreservesIPFromExistingConfig(t *testing.T) {
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 	cur := []kihv1.NetworkConfig{testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.42")}
 
-	got, err := c.getNetworkConfigs(vm, cur)
+	got, _, err := c.getNetworkConfigs(vm, cur, nil)
 	if err != nil {
 		t.Fatalf("getNetworkConfigs: %v", err)
 	}
@@ -632,7 +634,7 @@ func TestGetNetworkConfigsRejectsForeignDHCPLease(t *testing.T) {
 
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
-	_, err := c.getNetworkConfigs(vm, nil)
+	_, _, err := c.getNetworkConfigs(vm, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "belongs to") {
 		t.Fatalf("expected lease ownership error, got %v", err)
 	}
@@ -644,7 +646,7 @@ func TestGetNetworkConfigsAcceptsOwnDHCPLease(t *testing.T) {
 
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
-	got, err := c.getNetworkConfigs(vm, nil)
+	got, _, err := c.getNetworkConfigs(vm, nil, nil)
 	if err != nil {
 		t.Fatalf("getNetworkConfigs: %v", err)
 	}
@@ -839,7 +841,7 @@ func TestCreateVirtualMachineNetworkConfigObjectSkipsWithoutNetworks(t *testing.
 
 	vm := testVM("ns1", "vm1") // no interfaces at all
 
-	if err := c.createVirtualMachineNetworkConfigObject(vm); err != nil {
+	if err := c.createVirtualMachineNetworkConfigObject(vm, nil); err != nil {
 		t.Fatalf("createVirtualMachineNetworkConfigObject: %v", err)
 	}
 	if n := len(f.requestsFor(http.MethodPost, "/virtualmachinenetworkconfigs")); n != 0 {
@@ -853,7 +855,7 @@ func TestCreateVirtualMachineNetworkConfigObjectPropagatesConfigError(t *testing
 
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
-	err := c.createVirtualMachineNetworkConfigObject(vm)
+	err := c.createVirtualMachineNetworkConfigObject(vm, nil)
 	if err == nil || !strings.Contains(err.Error(), "belongs to") {
 		t.Fatalf("expected lease ownership error, got %v", err)
 	}
@@ -869,7 +871,7 @@ func TestCreateVirtualMachineNetworkConfigObjectPropagatesCreateError(t *testing
 
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
-	err := c.createVirtualMachineNetworkConfigObject(vm)
+	err := c.createVirtualMachineNetworkConfigObject(vm, nil)
 	if err == nil || !strings.Contains(err.Error(), "cannot create VirtualMachineNetworkConfig object for vm") {
 		t.Fatalf("expected wrapped create error, got %v", err)
 	}
@@ -896,7 +898,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectIdempotent(t *testing.T) {
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
 	existing := f.storedVMNetCfg("ns1/vm1")
-	if err := c.updateVirtualMachineNetworkConfigObject(vm, existing); err != nil {
+	if err := c.updateVirtualMachineNetworkConfigObject(vm, existing, nil); err != nil {
 		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1")); n != 0 {
@@ -904,6 +906,37 @@ func TestUpdateVirtualMachineNetworkConfigObjectIdempotent(t *testing.T) {
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
 		t.Errorf("expected no pool status update when nothing changed, got %d", n)
+	}
+
+	// a vm without the annotation keeps the allocated address of its
+	// interface: the projection carries it over and issues no write
+	unannotated := vmStaticIPAnnotatedVM("ns1", "vm1", "")
+
+	existing = f.storedVMNetCfg("ns1/vm1")
+	if err := c.updateVirtualMachineNetworkConfigObject(unannotated, existing, nil); err != nil {
+		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1")); n != 0 {
+		t.Errorf("expected no update for an unchanged row, got %d", n)
+	}
+	stored := f.storedVMNetCfg("ns1/vm1")
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0] != testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.42") {
+		t.Errorf("expected the allocated address to be preserved, got %+v", stored.Spec.NetworkConfig)
+	}
+
+	// the annotation requests exactly the stored address: the projection is
+	// idempotent and issues no write either
+	annotated := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.42"}`)
+
+	existing = f.storedVMNetCfg("ns1/vm1")
+	if err := c.updateVirtualMachineNetworkConfigObject(annotated, existing, nil); err != nil {
+		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1")); n != 0 {
+		t.Errorf("expected no update when the request matches the row, got %d", n)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
+		t.Errorf("expected no pool status update when the request matches the row, got %d", n)
 	}
 }
 
@@ -921,7 +954,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectPropagatesConfigError(t *testing
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:01")
 
 	existing := f.storedVMNetCfg("ns1/vm1")
-	err := c.updateVirtualMachineNetworkConfigObject(vm, existing)
+	err := c.updateVirtualMachineNetworkConfigObject(vm, existing, nil)
 	if err == nil || !strings.Contains(err.Error(), "belongs to") {
 		t.Fatalf("expected lease ownership error, got %v", err)
 	}
@@ -958,7 +991,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectPropagatesUpdateError(t *testing
 	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:02")
 
 	existing := f.storedVMNetCfg("ns1/vm1")
-	err := c.updateVirtualMachineNetworkConfigObject(vm, existing)
+	err := c.updateVirtualMachineNetworkConfigObject(vm, existing, nil)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("expected the injected VMNetCfg API failure after successful cleanup, got %v", err)
 	}
@@ -1714,7 +1747,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectKeepsMatchingInterface(t *testin
 	)
 
 	existing := f.storedVMNetCfg("ns1/vm1")
-	if err := c.updateVirtualMachineNetworkConfigObject(vm, existing); err != nil {
+	if err := c.updateVirtualMachineNetworkConfigObject(vm, existing, nil); err != nil {
 		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
 	}
 
@@ -1767,7 +1800,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectRemovesAllInterfaces(t *testing.
 	storePool(t, c, f, "pool-a", networkName, map[string]string{oldIP: "ns1/vm1 [" + oldMAC + "]"})
 
 	existing := f.storedVMNetCfg("ns1/vm1")
-	if err := c.updateVirtualMachineNetworkConfigObject(testVM("ns1", "vm1"), existing); err != nil {
+	if err := c.updateVirtualMachineNetworkConfigObject(testVM("ns1", "vm1"), existing, nil); err != nil {
 		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
 	}
 
@@ -2131,5 +2164,436 @@ func TestCleanupNetworkInterfaceFailsClosedWhenListFails(t *testing.T) {
 	}
 	if used := c.ipam.Used(networkName); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (no release on an unverifiable pool)", used)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// static ip annotation: projection, precedence and release
+// ---------------------------------------------------------------------------
+
+// vmStaticIPAnnotationCapture captures the warning messages the projection
+// logs while the test runs.
+func vmStaticIPAnnotationCapture(t *testing.T) *[]string {
+	t.Helper()
+
+	oldLevel := log.GetLevel()
+	oldHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	warnings := &[]string{}
+	log.AddHook(vmBehaviorLogHookFunc(func(entry *log.Entry) error {
+		if entry.Level == log.WarnLevel {
+			*warnings = append(*warnings, entry.Message)
+		}
+		return nil
+	}))
+	log.SetLevel(log.DebugLevel)
+
+	t.Cleanup(func() {
+		log.SetLevel(oldLevel)
+		log.StandardLogger().ReplaceHooks(oldHooks)
+	})
+
+	return warnings
+}
+
+func vmStaticIPAnnotationCaptured(warnings []string, fragment string) bool {
+	for _, message := range warnings {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// vmStaticIPAnnotatedVM builds the vm of the static ip annotation tests: a
+// single multus interface of the own network.
+func vmStaticIPAnnotatedVM(namespace, name, annotations string) *kubevirtv1.VirtualMachine {
+	vm := multusVM(namespace, name, "net1", "default/net-a", "aa:bb:cc:00:00:01")
+	if annotations != "" {
+		vm.ObjectMeta.Annotations = map[string]string{util.StaticIPAnnotationName: annotations}
+	}
+
+	return vm
+}
+
+// vmStaticIPStoredVMNetCfg stores a vmnetcfg object whose single row
+// records ip for the mac of the test vm.
+func vmStaticIPStoredVMNetCfg(f *fakeAPI, namespace, name, mac, ip string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vmnetcfgs[namespace+"/"+name] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{
+			VMName:        name,
+			NetworkConfig: []kihv1.NetworkConfig{testNetCfg(mac, "default/net-a", ip)},
+		},
+	}
+}
+
+// vmStaticIPLastUpdateBody decodes the last spec update of the fake api.
+func vmStaticIPLastUpdateBody(t *testing.T, f *fakeAPI) kihv1.VirtualMachineNetworkConfig {
+	t.Helper()
+
+	updates := f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1")
+	if len(updates) == 0 {
+		t.Fatal("expected a vmnetcfg update")
+	}
+	var updated kihv1.VirtualMachineNetworkConfig
+	if err := json.Unmarshal(updates[len(updates)-1].body, &updated); err != nil {
+		t.Fatalf("decoding update body: %v", err)
+	}
+
+	return updated
+}
+
+// TestGetNetworkConfigsHonoursStaticIPAnnotation: a requested address is
+// projected onto the row of its own interface, so the vmnetcfg
+// controller claims exactly the address the vm asks for.
+func TestGetNetworkConfigsHonoursStaticIPAnnotation(t *testing.T) {
+	c, _ := vmBehaviorNewTestController(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.50"}`)
+
+	got, released, err := c.getNetworkConfigs(vm, nil, nil)
+	if err != nil {
+		t.Fatalf("getNetworkConfigs: %v", err)
+	}
+	if len(got) != 1 || got[0] != testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.50") {
+		t.Fatalf("expected the requested address, got %+v", got)
+	}
+	if len(released) != 0 {
+		t.Errorf("released = %v, want no release without a removed request", released)
+	}
+}
+
+// TestCreateVirtualMachineNetworkConfigObjectHonoursStaticIPAnnotation: a vm
+// created with the annotation is projected with the requested address, so its
+// first claim is exactly that address.
+func TestCreateVirtualMachineNetworkConfigObjectHonoursStaticIPAnnotation(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.50"}`)
+
+	if err := c.createVirtualMachineNetworkConfigObject(vm, nil); err != nil {
+		t.Fatalf("createVirtualMachineNetworkConfigObject: %v", err)
+	}
+
+	created := f.storedVMNetCfg("ns1/vm1")
+	if created == nil {
+		t.Fatal("expected the vmnetcfg object to be created")
+	}
+	if len(created.Spec.NetworkConfig) != 1 || created.Spec.NetworkConfig[0] != testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.50") {
+		t.Errorf("expected the requested address, got %+v", created.Spec.NetworkConfig)
+	}
+}
+
+// TestCreateVirtualMachineNetworkConfigObjectAppliesPendingRelease: a create
+// which follows a removed request projects the fresh row without the address of
+// the removed request (a created object has no stored address to carry over).
+func TestCreateVirtualMachineNetworkConfigObjectAppliesPendingRelease(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", "")
+
+	if err := c.createVirtualMachineNetworkConfigObject(vm, map[string]bool{"net1": true}); err != nil {
+		t.Fatalf("createVirtualMachineNetworkConfigObject: %v", err)
+	}
+
+	created := f.storedVMNetCfg("ns1/vm1")
+	if created == nil {
+		t.Fatal("expected the vmnetcfg object to be created")
+	}
+	if len(created.Spec.NetworkConfig) != 1 || created.Spec.NetworkConfig[0] != testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "") {
+		t.Errorf("expected the released row, got %+v", created.Spec.NetworkConfig)
+	}
+}
+
+// TestGetNetworkConfigsStaticIPAnnotationWinsOverStoredRow: the request wins
+// over the address a row of the same interface already records, so a changed
+// request is projected instead of serving the stored address forever.
+func TestGetNetworkConfigsStaticIPAnnotationWinsOverStoredRow(t *testing.T) {
+	c, _ := vmBehaviorNewTestController(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.50"}`)
+	cur := []kihv1.NetworkConfig{testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.42")}
+
+	got, _, err := c.getNetworkConfigs(vm, cur, nil)
+	if err != nil {
+		t.Fatalf("getNetworkConfigs: %v", err)
+	}
+	if len(got) != 1 || got[0].IPAddress != "10.0.0.50" {
+		t.Fatalf("expected the requested address to win over the stored row, got %+v", got)
+	}
+}
+
+// TestGetNetworkConfigsMalformedStaticIPAnnotationIsIgnored: a malformed
+// annotation is ignored with a warning (admission rejects it, while a
+// hand-edited vm must keep projecting its interfaces) and the stored rows of
+// the other interfaces are carried over.
+func TestGetNetworkConfigsMalformedStaticIPAnnotationIsIgnored(t *testing.T) {
+	c, _ := vmBehaviorNewTestController(t)
+	warnings := vmStaticIPAnnotationCapture(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `not json`)
+	vmScopeAddNIC(vm, "net2", "default/net-a", "aa:bb:cc:00:00:02")
+	cur := []kihv1.NetworkConfig{
+		testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "10.0.0.42"),
+		testNetCfg("aa:bb:cc:00:00:02", "default/net-a", "10.0.0.43"),
+	}
+
+	got, released, err := c.getNetworkConfigs(vm, cur, nil)
+	if err != nil {
+		t.Fatalf("a malformed annotation must not fail the projection: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected both interfaces to project, got %+v", got)
+	}
+	if got[0].IPAddress != "10.0.0.42" || got[1].IPAddress != "10.0.0.43" {
+		t.Errorf("expected the stored rows to be carried over, got %+v", got)
+	}
+	if len(released) != 0 {
+		t.Errorf("released = %v, want no release for a malformed annotation", released)
+	}
+	if !vmStaticIPAnnotationCaptured(*warnings, "ignoring the static ip annotation") {
+		t.Errorf("warnings = %v, want the ignored annotation to be logged", *warnings)
+	}
+}
+
+// TestGetNetworkConfigsUnknownStaticIPAnnotationInterfaceIsIgnored: an entry
+// which names no interface of the vm keeps the other interfaces projecting
+// and is logged.
+func TestGetNetworkConfigsUnknownStaticIPAnnotationInterfaceIsIgnored(t *testing.T) {
+	c, _ := vmBehaviorNewTestController(t)
+	warnings := vmStaticIPAnnotationCapture(t)
+
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"othernet":"10.0.0.50"}`)
+
+	got, _, err := c.getNetworkConfigs(vm, nil, nil)
+	if err != nil {
+		t.Fatalf("an unknown interface name must not fail the projection: %v", err)
+	}
+	if len(got) != 1 || got[0].IPAddress != "" {
+		t.Fatalf("expected the interface to project without a request, got %+v", got)
+	}
+	if !vmStaticIPAnnotationCaptured(*warnings, "names interface othernet which the vm does not have") {
+		t.Errorf("warnings = %v, want the unknown interface to be logged", *warnings)
+	}
+}
+
+// TestGetNetworkConfigsReportsReleasedStaticIPRequests: the projection
+// reports the identities of the interfaces whose request was removed or
+// changed, so the update path clears their stored address.
+func TestGetNetworkConfigsReportsReleasedStaticIPRequests(t *testing.T) {
+	c, _ := vmBehaviorNewTestController(t)
+	releasedKey := networkConfigKey("ns1", "default/net-a", "aa:bb:cc:00:00:01")
+
+	// the request was removed: the row is projected without an address
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", "")
+
+	got, released, err := c.getNetworkConfigs(vm, nil, map[string]bool{"net1": true})
+	if err != nil {
+		t.Fatalf("getNetworkConfigs: %v", err)
+	}
+	if len(got) != 1 || got[0].IPAddress != "" {
+		t.Fatalf("expected the released row to be projected without an address, got %+v", got)
+	}
+	if len(released) != 1 || !released[releasedKey] {
+		t.Fatalf("released = %v, want the identity of the removed request", released)
+	}
+
+	// the request changed: the new address is projected and released
+	vm = vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.60"}`)
+
+	got, released, err = c.getNetworkConfigs(vm, nil, map[string]bool{"net1": true})
+	if err != nil {
+		t.Fatalf("getNetworkConfigs: %v", err)
+	}
+	if len(got) != 1 || got[0].IPAddress != "10.0.0.60" {
+		t.Fatalf("expected the changed request to be projected, got %+v", got)
+	}
+	if len(released) != 1 || !released[releasedKey] {
+		t.Fatalf("released = %v, want the identity of the changed request", released)
+	}
+}
+
+// TestUpdateVirtualMachineNetworkConfigObjectStaticIPAnnotationWinsOverStoredRow:
+// the update path projects the requested address even though the row of the
+// same interface records another one, so a changed request is claimed
+// instead of serving the stored address forever.
+func TestUpdateVirtualMachineNetworkConfigObjectStaticIPAnnotationWinsOverStoredRow(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.50"}`)
+	vmStaticIPStoredVMNetCfg(f, "ns1", "vm1", mac, "10.0.0.42")
+
+	existing := f.storedVMNetCfg("ns1/vm1")
+	if err := c.updateVirtualMachineNetworkConfigObject(vm, existing, nil); err != nil {
+		t.Fatalf("updateVirtualMachineNetworkConfigObject: %v", err)
+	}
+
+	updated := vmStaticIPLastUpdateBody(t, f)
+	if len(updated.Spec.NetworkConfig) != 1 || updated.Spec.NetworkConfig[0] != testNetCfg(mac, "default/net-a", "10.0.0.50") {
+		t.Errorf("expected the requested address to be projected, got %+v", updated.Spec.NetworkConfig)
+	}
+}
+
+// TestHandleVirtualMachineObjectChangeReleasesRemovedStaticIPAnnotationOnce:
+// removing the annotation releases the stored address of its interface once
+// (the vmnetcfg controller frees the claim, the lease and the ledger record
+// and serves a fresh address, like TestVMNetCfgRequestedIPTransition covers
+// the changed request), and a resync carries the freshly allocated dynamic
+// address over instead of clearing it again.
+func TestHandleVirtualMachineObjectChangeReleasesRemovedStaticIPAnnotationOnce(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", "")
+	vmStaticIPStoredVMNetCfg(f, "ns1", "vm1", mac, "10.0.0.42")
+
+	// the event handler recorded the removed request
+	c.staticIPReleases.record(releaseKey(vm), map[string]bool{"net1": true})
+
+	if err := c.handleVirtualMachineObjectChange(vm); err != nil {
+		t.Fatalf("handleVirtualMachineObjectChange: %v", err)
+	}
+
+	updated := vmStaticIPLastUpdateBody(t, f)
+	if len(updated.Spec.NetworkConfig) != 1 || updated.Spec.NetworkConfig[0] != testNetCfg(mac, "default/net-a", "") {
+		t.Errorf("expected the released row to be projected, got %+v", updated.Spec.NetworkConfig)
+	}
+
+	// the release is applied exactly once: a resync finds no entry
+	if pending := c.staticIPReleases.drain(releaseKey(vm)); len(pending) != 0 {
+		t.Errorf("pending releases = %v, want the release applied exactly once", pending)
+	}
+
+	// the vmnetcfg controller serves a fresh dynamic address
+	f.mu.Lock()
+	f.vmnetcfgs["ns1/vm1"].Spec.NetworkConfig[0].IPAddress = "10.0.0.77"
+	f.mu.Unlock()
+
+	if err := c.handleVirtualMachineObjectChange(vm); err != nil {
+		t.Fatalf("handleVirtualMachineObjectChange (resync): %v", err)
+	}
+
+	// the resync carries the freshly allocated dynamic address over: the
+	// row is preserved and the resync issues no further write
+	if updates := f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1"); len(updates) != 1 {
+		t.Errorf("expected no update from the resync, got %d updates", len(updates))
+	}
+	stored := f.storedVMNetCfg("ns1/vm1")
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0] != testNetCfg(mac, "default/net-a", "10.0.0.77") {
+		t.Errorf("expected the resync to carry the dynamic address over, got %+v", stored.Spec.NetworkConfig)
+	}
+}
+
+// TestHandleVirtualMachineObjectChangeChangedStaticIPAnnotationReleasesTheOldAddress:
+// a changed request is projected with the new address while the vmnetcfg
+// controller releases the address of the previous request through its
+// existing transition (TestVMNetCfgRequestedIPTransition).
+func TestHandleVirtualMachineObjectChangeChangedStaticIPAnnotationReleasesTheOldAddress(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	vm := vmStaticIPAnnotatedVM("ns1", "vm1", `{"net1":"10.0.0.60"}`)
+	vmStaticIPStoredVMNetCfg(f, "ns1", "vm1", mac, "10.0.0.42")
+
+	// the event handler recorded the changed request
+	c.staticIPReleases.record(releaseKey(vm), map[string]bool{"net1": true})
+
+	if err := c.handleVirtualMachineObjectChange(vm); err != nil {
+		t.Fatalf("handleVirtualMachineObjectChange: %v", err)
+	}
+
+	updated := vmStaticIPLastUpdateBody(t, f)
+	if len(updated.Spec.NetworkConfig) != 1 || updated.Spec.NetworkConfig[0] != testNetCfg(mac, "default/net-a", "10.0.0.60") {
+		t.Errorf("expected the new requested address to be projected, got %+v", updated.Spec.NetworkConfig)
+	}
+	if pending := c.staticIPReleases.drain(releaseKey(vm)); len(pending) != 0 {
+		t.Errorf("pending releases = %v, want the changed request applied exactly once", pending)
+	}
+}
+
+// TestEnqueueVirtualMachineUpdateRecordsStaticIPReleases: the update handler
+// records the interfaces whose request was removed or changed and enqueues the
+// reconciliation, so the projection releases their stored address. An
+// unchanged or malformed annotation records nothing, so a resync cannot clear
+// a dynamically allocated address.
+func TestEnqueueVirtualMachineUpdateRecordsStaticIPReleases(t *testing.T) {
+	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	defer queue.ShutDown()
+
+	handler := &EventHandler{scope: vmTestScope("default", "net-a"), reconcileMu: &sync.Mutex{}, staticIPReleases: newStaticIPReleases()}
+
+	annotated := func(annotations string) *kubevirtv1.VirtualMachine {
+		return vmStaticIPAnnotatedVM("tenant-a", "vm-old", annotations)
+	}
+	nextEvent := func() Event {
+		t.Helper()
+
+		if queue.Len() != 1 {
+			t.Fatalf("queue length = %d, want 1 for the enqueued reconciliation", queue.Len())
+		}
+		item, _ := queue.Get()
+		queue.Done(item)
+
+		return item.(Event)
+	}
+
+	// a removed request is recorded and the reconciliation is enqueued
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), annotated(""))
+	if event := nextEvent(); event.action != UPDATE || event.key != "tenant-a/vm-old" ||
+		event.vmName != "vm-old" || event.vmNamespace != "tenant-a" {
+		t.Errorf("event = %+v, want the update of the observed vm", event)
+	}
+	released := handler.staticIPReleases.drain("tenant-a/vm-old")
+	if len(released) != 1 || !released["net1"] {
+		t.Errorf("released = %v, want the removed request recorded", released)
+	}
+
+	// a changed request is recorded as well
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), annotated(`{"net1":"10.0.0.60"}`))
+	nextEvent()
+	released = handler.staticIPReleases.drain("tenant-a/vm-old")
+	if len(released) != 1 || !released["net1"] {
+		t.Errorf("released = %v, want the changed request recorded", released)
+	}
+
+	// a changed request of one interface and a new request of another
+	// records only the changed one (a new request releases nothing)
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), annotated(`{"net1":"10.0.0.70","net2":"10.0.0.60"}`))
+	nextEvent()
+	released = handler.staticIPReleases.drain("tenant-a/vm-old")
+	if len(released) != 1 || !released["net1"] {
+		t.Errorf("released = %v, want only the changed request recorded", released)
+	}
+
+	// an unchanged request records nothing (no churn on a resync)
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), annotated(`{"net1":"10.0.0.50"}`))
+	nextEvent()
+	if released := handler.staticIPReleases.drain("tenant-a/vm-old"); len(released) != 0 {
+		t.Errorf("released = %v, want no release for an unchanged request", released)
+	}
+
+	// a vm without the annotation records nothing
+	handler.enqueueVirtualMachineUpdate(queue, annotated(""), annotated(""))
+	nextEvent()
+	if released := handler.staticIPReleases.drain("tenant-a/vm-old"); len(released) != 0 {
+		t.Errorf("released = %v, want no release without the annotation", released)
+	}
+
+	// a malformed annotation does not look like a removal of the previous
+	// request: the projection ignores it
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), annotated(`not json`))
+	nextEvent()
+	if released := handler.staticIPReleases.drain("tenant-a/vm-old"); len(released) != 0 {
+		t.Errorf("released = %v, want no release for a malformed annotation", released)
+	}
+
+	// an update whose payload is no longer a virtual machine stays dropped
+	handler.enqueueVirtualMachineUpdate(queue, annotated(`{"net1":"10.0.0.50"}`), &kubevirtv1.VirtualMachineInstance{})
+	if queue.Len() != 0 {
+		t.Errorf("queue length = %d, want 0: foreign objects must stay dropped", queue.Len())
 	}
 }
