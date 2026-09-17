@@ -22,7 +22,7 @@
 # Schema stamped into normalized.json and every comparison file. A prior run whose
 # aggregate carries an older or missing schemaVersion is not compared: it is
 # reported as incompatible instead of being read with guesses.
-EVIDENCE_SCHEMA_VERSION=1
+EVIDENCE_SCHEMA_VERSION=2
 
 # What each checkpoint writes:
 #   raw.json                     every captured Kubernetes document, keyed by group
@@ -691,6 +691,11 @@ _evidence_normalize() { # <dir> <id>
     # Events are kept as raw evidence only: their payload is a message with a
     # counter and timestamps, which would add noise to every object comparison
     # without describing object state.
+    #
+    # An EndpointSlice describes its routing in top-level endpoints, ports and
+    # addressType fields, so a payload-only change is invisible to a record
+    # holding metadata/spec/status alone. The captured array order is
+    # preserved: sorting endpoints is a separate semantic decision.
     {schemaVersion: $schema, checkpoint: $id,
      objects:
        [to_entries[]
@@ -698,7 +703,13 @@ _evidence_normalize() { # <dir> <id>
         | select(.value != null)
         | .key as $group
         | (.value | expand)[]
-        | record($group)]
+        | . as $obj
+        | record($group)
+          + (if ($obj.kind // "") == "EndpointSlice"
+             then {endpoints: ($obj.endpoints // []),
+                   ports: ($obj.ports // []),
+                   addressType: ($obj.addressType // "")}
+             else {} end)]
        | sort_by([.resource, .namespace, .name])}
   ' "${dir}/raw.json" > "${dir}/normalized.json.tmp" 2> "${dir}/.normalize.err" || {
     _evidence_fail "normalize" "cannot build normalized.json: $(tr '\n' ' ' < "${dir}/.normalize.err")"
