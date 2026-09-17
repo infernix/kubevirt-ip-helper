@@ -2162,7 +2162,7 @@ main() {
   resolve_runtime
   report_case_pass "runtime ${RUNTIME}, kubectl, GNU timeout, and jq available"
   report_case_start CORE-IMAGE-BUILT "helper image ${E2E_IMAGE} built from ${ROOT_DIR}"
-  "${RUNTIME}" build -t "${E2E_IMAGE}" "${ROOT_DIR}"
+  "${RUNTIME}" build -f "${ROOT_DIR}/build/Dockerfile" -t "${E2E_IMAGE}" "${ROOT_DIR}"
   image_record="$("${RUNTIME}" image inspect "${E2E_IMAGE}")"
   image_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")
     | select(test("^[0-9a-f]{64}$"))' <<< "${image_record}")"
