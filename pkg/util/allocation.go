@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"unicode"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -29,9 +30,15 @@ func AllocationRef(namespace string, vmName string, hwAddr string) string {
 // colon form whatever spelling the reference carries (net.ParseMAC accepts
 // the dash and uppercase spellings of older revisions and hand-edited
 // status), so a consumer never splits one logical owner in two by
-// comparing the returned hardware address verbatim. references which do
-// not parse at all are reported as unparseable (ok=false) and must be
-// treated as unprotectable claims.
+// comparing the returned hardware address verbatim.
+//
+// the accepted grammar is exactly "namespace/vmname [macaddress]": one
+// owner separator, nonempty components, no bracket or whitespace inside the
+// owner, a closing bracket and a mac address net.ParseMAC accepts. a
+// reference outside that grammar is reported as unparseable (ok=false) and
+// stays a live claim for every consumer: the pool registration pins such an
+// address conservatively instead of releasing it, and the deletion gate
+// blocks on it rather than proving it orphaned.
 func ParseAllocationRef(ref string) (namespace string, vmName string, hwAddr string, ok bool) {
 	const ownerSeparator = " ["
 
@@ -43,10 +50,14 @@ func ParseAllocationRef(ref string) (namespace string, vmName string, hwAddr str
 	mac := ref[ownerSep+len(ownerSeparator) : len(ref)-1]
 	owner := ref[:ownerSep]
 
-	slashSep := strings.Index(owner, "/")
-	if slashSep < 0 {
+	// exactly one separator, and an owner without brackets or whitespace:
+	// an owner this helper never wrote must not be attributed to a
+	// namespace/vmname pair the index then fails to find
+	if strings.Count(owner, "/") != 1 || strings.ContainsAny(owner, "[]") || strings.ContainsFunc(owner, unicode.IsSpace) {
 		return "", "", "", false
 	}
+
+	slashSep := strings.Index(owner, "/")
 
 	namespace = owner[:slashSep]
 	vmName = owner[slashSep+1:]
@@ -56,7 +67,7 @@ func ParseAllocationRef(ref string) (namespace string, vmName string, hwAddr str
 	}
 
 	// only a valid mac address may act as the owner identity, so garbage
-	// reference tails from hand-edited status are unprotectable
+	// reference tails from hand-edited status stay unattributable
 	parsed, err := net.ParseMAC(mac)
 	if err != nil {
 		return "", "", "", false

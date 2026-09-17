@@ -30,12 +30,25 @@ func TestParseAllocationRefRejectsGarbage(t *testing.T) {
 		"EXCLUDED",
 		"USED",
 		"no-slash",
+		"vmname [02:00:00:00:00:01]",
+		"default/vm-1",
 		"/missing-namespace [02:00:00:00:00:01]",
 		"default/ [02:00:00:00:00:01]",
 		"default/vm []",
 		"default/vm [not a mac!]",
 		"default/vm [02:00:00:00:00:01",
 		"bracket-open-only [abc",
+		// exactly one owner separator
+		"default/extra/owner [02:00:00:00:00:01]",
+		// no brackets or whitespace inside the owner
+		"default/[vm] [02:00:00:00:00:01]",
+		"default/vm name [02:00:00:00:00:01]",
+		"default/vm\tname [02:00:00:00:00:01]",
+		"default/vm\u00a0name [02:00:00:00:00:01]",
+		"default/vm\u2003name [02:00:00:00:00:01]",
+		"default/vm\nname [02:00:00:00:00:01]",
+		// a trailing tail after the closing bracket
+		"default/vm [02:00:00:00:00:01] extra",
 	} {
 		if _, _, _, ok := ParseAllocationRef(ref); ok {
 			t.Errorf("ParseAllocationRef(%q) = ok, want rejection", ref)
@@ -50,12 +63,16 @@ func TestParseAllocationRefCanonicalizesTheMac(t *testing.T) {
 	// two (net.ParseMAC accepts the dash and uppercase spellings of
 	// older revisions and hand-edited status)
 	cases := []struct {
-		ref  string
-		want string
+		ref    string
+		wantNS string
+		want   string
 	}{
-		{"default/vm-test [02-00-00-00-00-01]", "02:00:00:00:00:01"},
-		{"default/vm-test [02:00:00:00:00:01]", "02:00:00:00:00:01"},
-		{"default/vm-test [02:AA:BB:CC:DD:01]", "02:aa:bb:cc:dd:01"},
+		{"default/vm-test [02-00-00-00-00-01]", "default", "02:00:00:00:00:01"},
+		{"default/vm-test [02:00:00:00:00:01]", "default", "02:00:00:00:00:01"},
+		{"default/vm-test [02:AA:BB:CC:DD:01]", "default", "02:aa:bb:cc:dd:01"},
+		// the owner text is not normalized: an uppercase owner of an
+		// older revision keeps its spelling
+		{"DEFAULT/vm-test [02:AA:BB:CC:DD:01]", "DEFAULT", "02:aa:bb:cc:dd:01"},
 	}
 	for _, tc := range cases {
 		ns, vm, hw, ok := ParseAllocationRef(tc.ref)
@@ -63,8 +80,8 @@ func TestParseAllocationRefCanonicalizesTheMac(t *testing.T) {
 			t.Errorf("ParseAllocationRef(%q) rejected a parseable legacy spelling", tc.ref)
 			continue
 		}
-		if ns != "default" || vm != "vm-test" || hw != tc.want {
-			t.Errorf("ParseAllocationRef(%q) = %q/%q/%q, want default/vm-test/%s", tc.ref, ns, vm, hw, tc.want)
+		if ns != tc.wantNS || vm != "vm-test" || hw != tc.want {
+			t.Errorf("ParseAllocationRef(%q) = %q/%q/%q, want %s/vm-test/%s", tc.ref, ns, vm, hw, tc.wantNS, tc.want)
 		}
 	}
 }

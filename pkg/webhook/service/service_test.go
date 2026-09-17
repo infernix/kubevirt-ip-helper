@@ -256,38 +256,6 @@ func TestValidateIPPoolGlobalDeletionGate(t *testing.T) {
 	}
 }
 
-func TestParseAllocationRef(t *testing.T) {
-	tests := []struct {
-		name      string
-		ref       string
-		namespace string
-		vmName    string
-		hwAddr    string
-		ok        bool
-	}{
-		{"canonical reference", "default/cirros-vm1 [02:7b:d9:84:8f:e5]", "default", "cirros-vm1", "02:7b:d9:84:8f:e5", true},
-		{"dash spelling is canonicalized", "default/vm-1 [02-7b-d9-84-8f-e5]", "default", "vm-1", "02:7b:d9:84:8f:e5", true},
-		{"uppercase spelling is canonicalized", "DEFAULT/vm-1 [02:7B:D9:84:8F:E5]", "DEFAULT", "vm-1", "02:7b:d9:84:8f:e5", true},
-		{"reference without a macaddress", "default/vm-1", "", "", "", false},
-		{"reference with an unparseable macaddress", "default/vm-1 [not-a-mac]", "", "", "", false},
-		{"owner without a namespace", "vmname [02:7b:d9:84:8f:e5]", "", "", "", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			namespace, vmName, hwAddr, ok := parseAllocationRef(tt.ref)
-
-			if ok != tt.ok {
-				t.Fatalf("ok = %v, want %v", ok, tt.ok)
-			}
-
-			if namespace != tt.namespace || vmName != tt.vmName || hwAddr != tt.hwAddr {
-				t.Fatalf("parsed (%q, %q, %q), want (%q, %q, %q)", namespace, vmName, hwAddr, tt.namespace, tt.vmName, tt.hwAddr)
-			}
-		})
-	}
-}
-
 func TestIPPoolRecordsNetworkOwnership(t *testing.T) {
 	const mac = "02:7b:d9:84:8f:e5"
 	tests := []struct {
@@ -357,19 +325,41 @@ func TestEvaluateIPPoolRecords(t *testing.T) {
 		"192.168.10.99":  "default/gone-vm [02:00:00:00:00:33]",
 		"192.168.10.100": "EXCLUDED",
 		"192.168.10.101": "unparseable",
+		// references outside the accepted owner grammar: a permissive
+		// parse would attribute them to an owner the index cannot find
+		// and call them orphaned, so they must stay blocking
+		"192.168.10.102": "default/ [02:00:00:00:00:44]",
+		"192.168.10.103": "default/gone vm [02:00:00:00:00:45]",
+		"192.168.10.104": "default/gone/extra [02:00:00:00:00:46]",
+		"192.168.10.105": "default/[gone] [02:00:00:00:00:47]",
+		"192.168.10.106": "default/gone [02:00:00:00:00:48",
 	}
 
 	blocking, orphaned := evaluateIPPoolRecords(allocated, "default/net-a", index, true)
 
-	if len(blocking) != 2 {
-		t.Fatalf("blocking = %v, want exactly the live and the unparseable records", blocking)
+	if len(blocking) != 7 {
+		t.Fatalf("blocking = %v, want exactly the live and the six malformed records", blocking)
 	}
 
 	if !strings.Contains(blocking[0], "192.168.10.101") {
 		t.Fatalf("the unparseable record must block and be reported first (sorted by ip): %v", blocking)
 	}
 
-	if !strings.Contains(blocking[1], "192.168.10.63") || !strings.Contains(blocking[1], "default/cirros-vm1") {
+	for _, ip := range []string{"192.168.10.102", "192.168.10.103", "192.168.10.104", "192.168.10.105", "192.168.10.106"} {
+		blocked := false
+
+		for _, entry := range blocking {
+			if strings.Contains(entry, ip) && strings.Contains(entry, "unparseable reference") {
+				blocked = true
+			}
+		}
+
+		if !blocked {
+			t.Fatalf("the malformed record of ip %s must block as unparseable: %v", ip, blocking)
+		}
+	}
+
+	if !strings.Contains(blocking[6], "192.168.10.63") || !strings.Contains(blocking[6], "VirtualMachineNetworkConfig default/cirros-vm1") {
 		t.Fatalf("the live record must block and name its recording object: %v", blocking)
 	}
 
@@ -380,7 +370,7 @@ func TestEvaluateIPPoolRecords(t *testing.T) {
 	// an unavailable index keeps every non-EXCLUDED record blocking
 	blocking, orphaned = evaluateIPPoolRecords(allocated, "default/net-a", index, false)
 
-	if len(blocking) != 3 || len(orphaned) != 0 {
+	if len(blocking) != 8 || len(orphaned) != 0 {
 		t.Fatalf("with an unavailable index every record must block: blocking=%v orphaned=%v", blocking, orphaned)
 	}
 

@@ -159,32 +159,6 @@ func (h *Handler) listAllVirtualMachineNetworkConfigs(ctx context.Context) (list
 	return
 }
 
-// parseAllocationRef splits an allocation reference of the IPPool status
-// ("namespace/vmname [macaddress]", the spelling the helper persists)
-// into its components. the macaddress is canonicalized through net.ParseMAC
-// so the dash and uppercase spellings of older revisions and hand-edited
-// status match the live objects. references which do not parse report
-// ok=false and must be treated as unprovably orphaned.
-func parseAllocationRef(ref string) (namespace string, vmName string, hwAddr string, ok bool) {
-	sep := strings.LastIndex(ref, " [")
-	if sep < 0 {
-		return "", "", "", false
-	}
-
-	hw, err := net.ParseMAC(strings.TrimSuffix(ref[sep+2:], "]"))
-	if err != nil {
-		return "", "", "", false
-	}
-
-	owner := ref[:sep]
-	slash := strings.Index(owner, "/")
-	if slash < 0 {
-		return "", "", "", false
-	}
-
-	return owner[:slash], owner[slash+1:], hw.String(), true
-}
-
 // allocationOwnerKey identifies one network binding. An empty network in the
 // index records an ambiguous live reference and blocks deletion conservatively
 // for that owner and MAC on every network.
@@ -256,7 +230,7 @@ func evaluateIPPoolRecords(allocated map[string]string, network string, index al
 			continue
 		}
 
-		namespace, vmName, hwAddr, ok := parseAllocationRef(ref)
+		namespace, vmName, hwAddr, ok := util.ParseAllocationRef(ref)
 		if !ok {
 			blocking = append(blocking, fmt.Sprintf("ip %s is allocated to the unparseable reference %q", ip, ref))
 
