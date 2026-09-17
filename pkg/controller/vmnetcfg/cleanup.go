@@ -70,7 +70,6 @@ func (c *Controller) recoverBindings(obj *kihv1.VirtualMachineNetworkConfig, onl
 	}
 	macs := make(map[string]bool)
 	tuples := make(map[kihv1.NetworkConfig]bool)
-	var otherConfigMACs map[string]bool
 	if onlyMAC != "" {
 		// a single-nic recovery already starts with its only permissible
 		// key: no spec or status row can add another one
@@ -93,30 +92,6 @@ func (c *Controller) recoverBindings(obj *kihv1.VirtualMachineNetworkConfig, onl
 				continue
 			}
 			if !macs[mac] {
-				// A ledger reference names the VM and MAC, not this config.
-				// Disjoint-MAC configs may share Spec.VMName, so an unknown
-				// MAC must be attributed against fresh namespace-wide state.
-				if otherConfigMACs == nil {
-					configs, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(obj.Namespace).List(c.ctx, metav1.ListOptions{})
-					if err != nil {
-						return fmt.Errorf("cannot attribute unrecorded reservation %s: %w", owner, err)
-					}
-					otherConfigMACs = make(map[string]bool)
-					for _, other := range configs.Items {
-						if other.Name == obj.Name && other.UID == obj.UID {
-							continue
-						}
-						for _, row := range c.scope.FilterSpec(other.Namespace, other.Spec.NetworkConfig) {
-							otherConfigMACs[util.CanonicalHWAddr(row.MACAddress)] = true
-						}
-						for _, row := range c.scope.FilterStatus(other.Namespace, other.Status.NetworkConfig) {
-							otherConfigMACs[util.CanonicalHWAddr(row.MACAddress)] = true
-						}
-					}
-				}
-				if otherConfigMACs[mac] {
-					continue
-				}
 				if lease := c.dhcp.GetLease(mac); lease.ClientIP != nil && lease.PoolName == c.scope.NetworkName() && lease.Reference != obj.Namespace+"/"+obj.Spec.VMName {
 					continue
 				}
@@ -141,7 +116,32 @@ func (c *Controller) recoverBindings(obj *kihv1.VirtualMachineNetworkConfig, onl
 			tuples[kihv1.NetworkConfig{MACAddress: mac, NetworkName: c.scope.NetworkName(), IPAddress: ip}] = true
 		}
 	}
+	// Ledger and local owner strings identify a VM/MAC, not a config. Even
+	// a MAC still in our status can have transferred after spec acknowledgement.
+	// Attribute every recovered tuple before releasing any of its state.
+	if len(tuples) == 0 {
+		return nil
+	}
+	configs, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(obj.Namespace).List(c.ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("cannot attribute recovered reservations: %w", err)
+	}
+	otherConfigMACs := make(map[string]bool)
+	for _, other := range configs.Items {
+		if (other.Name == obj.Name && other.UID == obj.UID) || other.Spec.VMName != obj.Spec.VMName {
+			continue
+		}
+		for _, row := range c.scope.FilterSpec(other.Namespace, other.Spec.NetworkConfig) {
+			otherConfigMACs[util.CanonicalHWAddr(row.MACAddress)] = true
+		}
+		for _, row := range c.scope.FilterStatus(other.Namespace, other.Status.NetworkConfig) {
+			otherConfigMACs[util.CanonicalHWAddr(row.MACAddress)] = true
+		}
+	}
 	for tuple := range tuples {
+		if otherConfigMACs[tuple.MACAddress] {
+			continue
+		}
 		if err := c.cleanupNetworkInterface(obj, &tuple, true); err != nil {
 			return err
 		}
