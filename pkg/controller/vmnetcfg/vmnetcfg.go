@@ -248,6 +248,9 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	}
 
 	if len(vmnetcfg.Spec.NetworkConfig) == 0 && len(vmnetcfg.Status.NetworkConfig) == 0 {
+		// A globally empty managed config can outlive its VM after last-NIC
+		// removal. Use the full object so foreign-only configs stay excluded.
+		c.sweepOrphanedBinding(base)
 		return restoreErr
 	}
 	// Status-only rows are outstanding cleanup, not successful assignments.
@@ -1282,7 +1285,8 @@ func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkC
 	if c.verifyVM == nil || vmnetcfg.Spec.VMName == "" {
 		return false
 	}
-	if len(c.scope.FilterSpec(vmnetcfg.Namespace, vmnetcfg.Spec.NetworkConfig)) == 0 && len(c.scope.FilterStatus(vmnetcfg.Namespace, vmnetcfg.Status.NetworkConfig)) == 0 {
+	if len(vmnetcfg.Spec.NetworkConfig)+len(vmnetcfg.Status.NetworkConfig) != 0 &&
+		len(c.scope.FilterSpec(vmnetcfg.Namespace, vmnetcfg.Spec.NetworkConfig)) == 0 && len(c.scope.FilterStatus(vmnetcfg.Namespace, vmnetcfg.Status.NetworkConfig)) == 0 {
 		return false
 	}
 

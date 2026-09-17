@@ -262,6 +262,101 @@ func TestVMNetCfgOrphanSweepNeverDestroysAReplacement(t *testing.T) {
 	}
 }
 
+func TestVMNetCfgEmptyManagedOrphanRecoversOnResync(t *testing.T) {
+	e := newTestEnv(t)
+	obj := newOrphanVMNetCfg()
+	obj.Spec.NetworkConfig = nil
+	e.seedVMNetCfg(obj)
+	if err := e.indexer.Add(obj); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{key: testNamespace + "/" + testVMNetCfgName, action: UPDATE}
+	parentExists := true
+	var verificationErr error
+	e.controller.verifyVM = func(namespace, name string) (bool, error) {
+		if namespace != obj.Namespace || name != obj.Spec.VMName {
+			t.Fatalf("wrong parent queried: %s/%s", namespace, name)
+		}
+		return parentExists, verificationErr
+	}
+	// A live parent and an uncertain parent both retain the empty config.
+	for _, parentError := range []error{nil, errors.New("temporary parent read failure")} {
+		verificationErr = parentError
+		if err := e.controller.sync(event); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.getStoredVMNetCfg(); got.DeletionTimestamp != nil {
+			t.Fatal("unverified orphan was deleted")
+		}
+		parentExists = false
+	}
+	verificationErr = nil
+	e.api.vmnetcfgDeleteStatus = http.StatusInternalServerError
+	if err := e.controller.sync(event); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.getStoredVMNetCfg(); got.DeletionTimestamp != nil {
+		t.Fatal("failed delete unexpectedly succeeded")
+	}
+	e.api.vmnetcfgDeleteStatus = 0
+	if err := e.controller.sync(event); err != nil {
+		t.Fatal(err)
+	}
+	deleting := e.getStoredVMNetCfg()
+	if deleting.DeletionTimestamp == nil {
+		t.Fatal("normal resync stranded the empty managed orphan")
+	}
+	if err := e.indexer.Update(deleting); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.controller.sync(event); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.getStoredVMNetCfg(); len(got.Finalizers) != 0 {
+		t.Fatalf("empty orphan cleanup retained finalizers: %v", got.Finalizers)
+	}
+}
+
+func TestVMNetCfgEmptyOrphanSweepPreservesUnownedAndReplacementConfigs(t *testing.T) {
+	for _, scenario := range []string{"manual", "foreign-spec", "foreign-status", "UID-replaced"} {
+		t.Run(scenario, func(t *testing.T) {
+			e := newTestEnv(t)
+			obj := newOrphanVMNetCfg()
+			obj.Spec.NetworkConfig = nil
+			switch scenario {
+			case "manual":
+				obj.Finalizers = nil
+			case "foreign-spec":
+				obj.Spec.NetworkConfig = []kihv1.NetworkConfig{{NetworkName: "default/foreign", MACAddress: testMAC}}
+			case "foreign-status":
+				obj.Status.NetworkConfig = []kihv1.NetworkConfigStatus{{NetworkName: "default/foreign", MACAddress: testMAC}}
+			}
+			e.seedVMNetCfg(obj)
+			if err := e.indexer.Add(obj); err != nil {
+				t.Fatal(err)
+			}
+			e.controller.verifyVM = func(_, _ string) (bool, error) {
+				if scenario == "UID-replaced" {
+					e.api.mu.Lock()
+					e.api.vmnetcfgs[testNamespace+"/"+testVMNetCfgName].UID = "successor"
+					e.api.mu.Unlock()
+				}
+				return false, nil
+			}
+			if err := e.controller.sync(Event{key: testNamespace + "/" + testVMNetCfgName, action: UPDATE}); err != nil {
+				t.Fatal(err)
+			}
+			got := e.getStoredVMNetCfg()
+			if got.DeletionTimestamp != nil {
+				t.Fatalf("orphan sweep deleted %s config: %#v", scenario, got)
+			}
+			if scenario == "UID-replaced" && got.UID != "successor" {
+				t.Fatalf("replacement UID changed: %s", got.UID)
+			}
+		})
+	}
+}
+
 // a failed delete must not wedge the binding either: the sweep stays
 // best-effort, the regular reconciliation proceeds and the next resync
 // retries the delete.
