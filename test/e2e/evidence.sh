@@ -331,9 +331,13 @@ _evidence_object_captures() { # <dir>
   _evidence_group "${dir}" workloads \
     -n "${KIH_WORKLOAD_NAMESPACE}" get pods -o json || rc=1
   # The guest observer script is delivered through this Secret, so the checkpoint
-  # records the object the guest actually executed.
+  # records the object the guest actually executed. The list is field-selected
+  # server-side: unrelated workload Secrets stay out of the archived evidence,
+  # while the plural List envelope keeps the pre-create checkpoints successful
+  # with an empty list.
   _evidence_group "${dir}" guest-userdata \
-    -n "${KIH_WORKLOAD_NAMESPACE}" get secrets -o json || rc=1
+    -n "${KIH_WORKLOAD_NAMESPACE}" get secrets \
+    --field-selector "metadata.name=${KIH_GUEST_USERDATA_SECRET}" -o json || rc=1
   if [ "${allow_custom_api}" -eq 1 ]; then
     # The helper CRDs are intentionally absent at the first bootstrap checkpoint.
     EVIDENCE_ALLOW_MISSING_API=1 _evidence_group "${dir}" ippools \
