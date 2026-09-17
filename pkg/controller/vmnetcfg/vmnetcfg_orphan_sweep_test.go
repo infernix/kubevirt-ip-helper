@@ -228,19 +228,21 @@ func TestVMNetCfgOrphanSweepNeverDestroysAReplacement(t *testing.T) {
 	seedStrandedBindingState(e)
 
 	e.controller.verifyVM = func(namespace string, name string) (bool, error) {
+		e.api.mu.Lock()
+		stored := e.api.vmnetcfgs[testNamespace+"/"+testVMNetCfgName]
+		stored.UID = "9999-8888-7777"
+		bumpResourceVersion(stored)
+		e.api.mu.Unlock()
 		return false, nil
 	}
 
-	// the delivered object predates a replacement write: its uid differs
-	// from the stored object's uid
+	// The replacement lands after the entrypoint's fresh read, inside VM
+	// verification, so the delete must still enforce its UID precondition.
 	vmnetcfg := newOrphanVMNetCfg()
 	e.seedVMNetCfg(vmnetcfg)
-	stored := e.getStoredVMNetCfg()
-	stored.UID = "9999-8888-7777"
-	e.seedVMNetCfg(stored)
 
-	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
-		t.Fatalf("the rejected delete must not fail the sync: %s", err)
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err == nil {
+		t.Fatal("replacement must invalidate the old owned decision")
 	}
 
 	// the precondition mismatch was rejected with a conflict: the stored
