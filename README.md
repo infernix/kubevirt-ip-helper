@@ -357,6 +357,67 @@ helpers preserve other networks' spec/status rows. During deletion each helper
 drains its own rows; the shared cleanup finalizer is removed only after both
 arrays are empty.
 
+### Requesting a static IP with an annotation
+
+A VM can request a specific address for one of its interfaces with the
+`kubevirtiphelper.k8s.binbash.org/static-ip` annotation. Its value is a json
+object which maps the interface name to the requested ipv4 address, the same key
+space the `harvesterhci.io/mac-address` annotation already uses:
+
+```YAML
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: example-vm
+  namespace: tenant-a
+  annotations:
+    kubevirtiphelper.k8s.binbash.org/static-ip: '{"nic-a":"172.16.0.50"}'
+spec:
+  template:
+    spec:
+      domain:
+        devices:
+          interfaces:
+            - name: nic-a
+              macAddress: "02:00:00:00:01:01"
+              bridge: {}
+      networks:
+        - name: nic-a
+          multus:
+            networkName: kubevirt-ip-helper/management
+```
+
+The annotation belongs on the VirtualMachine's own `metadata.annotations`, not on
+`spec.template.metadata.annotations`. Every key must be the `name` of a
+`spec.template.spec.domain.devices.interfaces[]` entry of that VM, and the
+matching `networks[]` entry must be a Multus network served by an IPPool. The
+requested address is reserved if it is available: it wins over an address already
+recorded for that interface in the VMNetCfg object, and removing the annotation
+releases the address and returns the interface to a dynamic address. That release is
+driven by the helper's reconcile of the removal, so a helper restart in between
+keeps the stored address served until the next annotation change or NIC removal. A
+VM without the annotation keeps its previous behavior exactly.
+
+Admission rejects a VM whose annotation is malformed, names no interface of
+that VM, names an interface whose `networks[]` entry is missing, not Multus or has
+an empty `networkName`, names an interface whose network has no IPPool, or
+requests an address which the IPPool serving that interface's network cannot
+serve: an address outside the allocation range, an exclude entry, the subnet's
+broadcast address, an address already claimed by another VM, or the same address
+for two interfaces of that VM. Unlike a plain VMNetCfg row, this check also
+rejects a NIC whose network has no pool: the annotation is an explicit request,
+so the intended VM-before-pool ordering is unavailable with it. Admission decides
+against the durable IPPool reservation status only, never the helper's in-memory
+lease state, so two VMs admitted in the same moment can still request the same free
+address; the interface of the loser then records a sticky ERROR status at reconcile
+until the address is freed. A VM without the annotation is never rejected by this
+check. Each helper honors the entries for the interfaces it serves, and an entry for
+a NIC on a network another helper serves is silently left to that helper, with no
+warning and no projection here. The pre-existing CR field
+`spec.networkconfig[].ipaddress` keeps its claim-or-ERROR behavior: it is claimed
+for its VM and MAC, or refused by the owning helper with an ERROR status, unchanged
+by this annotation.
+
 ### Status information
 
 Status information about the IP reservations are kept in the status fields in the ippool objects and in the vmnetcfg objects.
@@ -397,7 +458,10 @@ Metrics are exported on port 8080. The optional shared ServiceMonitor is in
 
 The kubevirt-ip-helper-webhook prevents deleting IPPools still in use and rejects
 VirtualMachineNetworkConfig objects which duplicate a `(vmname, canonical MAC)`
-claim from another object in the same namespace, regardless of network.
+claim from another object in the same namespace, regardless of network. It also
+rejects a VirtualMachine whose `kubevirtiphelper.k8s.binbash.org/static-ip`
+annotation requests an address the IPPool serving that interface's network cannot
+serve.
 
 The IPPool deletion gate matches each allocation record against VMNetCfg spec
 references using namespace, VM name, canonical network and canonical MAC,
@@ -418,9 +482,25 @@ MAC stays admissible and is refused by the owning helper with an ERROR status.
 A VMNetCfg with an empty `metadata.name` or `spec.vmname` is admitted without
 row validation. CREATE validates all claimed rows; main-resource UPDATE only added
 or modified rows against OldObject, preserving unchanged foreign rows, and a
-`spec.vmname` change revalidates every row. The entry uses
-`failurePolicy: Ignore` and no namespace selector, so an admission outage never
-blocks controller writes.
+`spec.vmname` change revalidates every row.
+
+The vm admission check validates the `kubevirtiphelper.k8s.binbash.org/static-ip`
+annotation against the VM's own interfaces and the IPPool serving their networks.
+It rejects a value which is not a json object of interface name to ipv4 address, a
+key which names no interface of that VM, an interface whose `networks[]` entry is
+missing, not Multus, or has an empty `networkName`, a NIC whose network has no
+IPPool, an address outside that pool's allocation range, an exclude entry, the
+subnet's broadcast address, an address the pool's durable `status.ipv4.allocated`
+records for another VM or as `EXCLUDED`, and the same address requested by two
+interfaces of that VM. An address the VM itself already holds is admitted: the
+record is matched on namespace and vmname only, so a VM which changed its
+macaddress keeps its address. The check reads the durable pool status and never the
+helper's in-memory lease state, so two VMs admitted in the same moment can both
+pass, and the interface of the loser then records an ERROR status at reconcile. It
+fails open where it cannot decide at all: a failed pool list or an unparseable pool
+range admits the VM, leaving the helper controller authoritative. The VM rule
+uses `failurePolicy: Ignore` and no namespace selector, like the VMNetCfg entry, so
+an admission outage never blocks controller writes or VM creation.
 
 ### Building the webhook container
 

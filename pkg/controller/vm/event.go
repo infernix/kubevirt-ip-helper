@@ -54,6 +54,12 @@ type EventHandler struct {
 	kcli           kubecli.KubevirtClient
 	scope          util.NetworkScope
 	reconcileMu    *sync.Mutex
+
+	// staticIPReleases records the interfaces whose static ip request was
+	// removed or changed between the observed updates: the vm controller
+	// releases their stored address at the next reconciliation. It is
+	// shared with the controller of this era and guarded by its own mutex
+	staticIPReleases *staticIPReleases
 }
 
 type Event struct {
@@ -78,18 +84,19 @@ func NewEventHandler(
 	reconcileMu *sync.Mutex,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:            ctx,
-		ipam:           ipam,
-		dhcp:           dhcp,
-		metrics:        metrics,
-		cache:          cache,
-		kubeConfig:     kubeConfig,
-		kubeContext:    kubeContext,
-		kubeRestConfig: kubeRestConfig,
-		kihClientset:   kihClientset,
-		kcli:           kcli,
-		scope:          scope,
-		reconcileMu:    reconcileMu,
+		ctx:              ctx,
+		ipam:             ipam,
+		dhcp:             dhcp,
+		metrics:          metrics,
+		cache:            cache,
+		kubeConfig:       kubeConfig,
+		kubeContext:      kubeContext,
+		kubeRestConfig:   kubeRestConfig,
+		kihClientset:     kihClientset,
+		kcli:             kcli,
+		scope:            scope,
+		reconcileMu:      reconcileMu,
+		staticIPReleases: newStaticIPReleases(),
 	}
 }
 
@@ -171,22 +178,14 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(new)
-			if err == nil {
-				queue.Add(Event{
-					key:         key,
-					action:      UPDATE,
-					vmName:      new.(*kubevirtv1.VirtualMachine).GetName(),
-					vmNamespace: new.(*kubevirtv1.VirtualMachine).GetNamespace(),
-				})
-			}
+			e.enqueueVirtualMachineUpdate(queue, old, new)
 		},
 		DeleteFunc: func(obj interface{}) {
 			e.enqueueVirtualMachineDelete(queue, obj)
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.scope, e.reconcileMu)
+	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.scope, e.reconcileMu, e.staticIPReleases)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after
@@ -206,6 +205,78 @@ func (e *EventHandler) EventListener() (err error) {
 		<-done
 		return
 	}
+}
+
+// enqueueVirtualMachineUpdate records the static ip requests an update
+// removed or changed and enqueues the reconciliation of the virtual machine:
+// the projection must not carry the stored address of such an interface over,
+// so the vmnetcfg controller releases it. An update whose payload is no
+// longer a VirtualMachine (a stale final state) does not come from this
+// informer and stays dropped, like the delete handler's foreign objects.
+func (e *EventHandler) enqueueVirtualMachineUpdate(queue workqueue.RateLimitingInterface, old interface{}, new interface{}) {
+	virtualMachine, isVM := new.(*kubevirtv1.VirtualMachine)
+	if !isVM {
+		return
+	}
+
+	key, err := cache.MetaNamespaceKeyFunc(virtualMachine)
+	if err != nil {
+		return
+	}
+
+	e.recordStaticIPReleases(key, old, virtualMachine)
+
+	queue.Add(Event{
+		key:         key,
+		action:      UPDATE,
+		vmName:      virtualMachine.GetName(),
+		vmNamespace: virtualMachine.GetNamespace(),
+	})
+}
+
+// recordStaticIPReleases records the interfaces whose static ip request was
+// removed or changed since the observed update: the projection of the next
+// reconciliation releases their stored address. A malformed annotation is
+// ignored, mirroring the fail-soft projection of the vm controller: the
+// admission check rejects it, while a hand-edited vm keeps serving the
+// address it holds.
+func (e *EventHandler) recordStaticIPReleases(key string, old interface{}, new *kubevirtv1.VirtualMachine) {
+	oldVM, isVM := old.(*kubevirtv1.VirtualMachine)
+	if !isVM {
+		return
+	}
+
+	oldIPs, oldErr := util.ParseStaticIPAnnotation(oldVM.ObjectMeta.Annotations)
+	if oldErr != nil {
+		log.Warnf("(vm.EventListener) [%s] ignoring the previous static ip annotation: %s", key, oldErr)
+
+		oldIPs = nil
+	}
+	newIPs, newErr := util.ParseStaticIPAnnotation(new.ObjectMeta.Annotations)
+	if newErr != nil {
+		// the projection ignores a malformed annotation, so it must not
+		// look like a removal of every previous request
+		log.Warnf("(vm.EventListener) [%s] ignoring the static ip annotation: %s", key, newErr)
+
+		return
+	}
+
+	var released map[string]bool
+	for nicName, oldIP := range oldIPs {
+		if newIP, requested := newIPs[nicName]; !requested || newIP != oldIP {
+			if released == nil {
+				released = make(map[string]bool)
+			}
+			released[nicName] = true
+		}
+	}
+	if len(released) == 0 {
+		return
+	}
+
+	log.Infof("(vm.EventListener) [%s] the static ip request of %d interface(s) was removed or changed, releasing their addresses at the next reconciliation",
+		key, len(released))
+	e.staticIPReleases.record(key, released)
 }
 
 // enqueueVirtualMachineDelete derives the cleanup event for a deleted

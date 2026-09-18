@@ -84,13 +84,14 @@ func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
 }
 
 // desiredWebhooks builds every admission entry this version serves: the
-// ippool deletion gate, the vmnetcfg duplicate and range guards and the
-// ippool spec guard.
+// ippool deletion gate, the vmnetcfg duplicate and range guards, the ippool
+// spec guard and the vm static ip guard.
 func (h *Handler) desiredWebhooks(cert string) []admregv1.ValidatingWebhook {
 	return []admregv1.ValidatingWebhook{
 		h.buildIPPoolWebhook(cert),
 		h.buildVmNetCfgWebhook(cert),
 		h.buildIPPoolSpecWebhook(cert),
+		h.buildVirtualMachineWebhook(cert),
 	}
 }
 
@@ -226,6 +227,56 @@ func (h *Handler) ippoolSpecWebhookName() string {
 	return fmt.Sprintf("%s-ippool-spec.%s.svc", h.webhookName, h.webhookNamespace)
 }
 
+// buildVirtualMachineWebhook builds the admission entry which rejects a
+// VirtualMachine whose kubevirtiphelper.k8s.binbash.org/static-ip annotation
+// requests an address the helper cannot reserve for it: a malformed
+// annotation, an interface the vm does not define or whose network is not a
+// multus network, a network without an IPPool, an address outside the pool
+// range or equal to the subnet broadcast address or an excluded entry, an
+// address already recorded for another vm, and an address two interfaces of
+// the same vm request at once. the reservation stays check-at-admission and
+// claim-at-reconcile: the vm controller claims the address through the
+// existing ownership-checked ipam path, so the gate only keeps a request out
+// of the cluster which the helper could never serve.
+//
+// the entry uses failurePolicy Ignore like the vmnetcfg entry: an admission
+// outage must not block a vm from being created, and the controller's own
+// claim remains the authoritative defense. it carries no namespace selector so
+// the vms of every namespace are guarded, mirroring the cluster-wide scope of
+// the helper CRDs, and it serves the v1 and v1alpha3 versions, the two
+// versions the kubevirt crd serves.
+func (h *Handler) buildVirtualMachineWebhook(cert string) admregv1.ValidatingWebhook {
+	webhook := admregv1.ValidatingWebhook{}
+	webhook.Name = h.virtualMachineWebhookName()
+
+	var rules []admregv1.RuleWithOperations
+	rule := admregv1.RuleWithOperations{}
+	rule.APIGroups = []string{"kubevirt.io"}
+	rule.APIVersions = []string{"v1", "v1alpha3"}
+	rule.Operations = []admregv1.OperationType{"CREATE", "UPDATE"}
+	rule.Resources = []string{"virtualmachines"}
+	scope := admregv1.AllScopes
+	rule.Scope = &scope
+	rules = append(rules, rule)
+	webhook.Rules = rules
+
+	sideeffects := admregv1.SideEffectClassNone
+	webhook.SideEffects = &sideeffects
+
+	failurePolicy := admregv1.Ignore
+	webhook.FailurePolicy = &failurePolicy
+
+	webhook.ClientConfig = h.buildWebhookClientConfig(webhook.Name, "/validate-vm", cert)
+
+	webhook.AdmissionReviewVersions = []string{"v1"}
+
+	return webhook
+}
+
+func (h *Handler) virtualMachineWebhookName() string {
+	return fmt.Sprintf("%s-vm.%s.svc", h.webhookName, h.webhookNamespace)
+}
+
 // ensureMissingWebhookEntries appends the admission entries this version
 // serves to an already existing ValidatingWebhookConfiguration. the
 // existing entries are left untouched so a concurrent renewal of the
@@ -237,7 +288,7 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 	}
 
 	missing := []string{}
-	for _, name := range []string{h.vmNetCfgWebhookName(), h.ippoolSpecWebhookName()} {
+	for _, name := range []string{h.vmNetCfgWebhookName(), h.ippoolSpecWebhookName(), h.virtualMachineWebhookName()} {
 		present := false
 
 		for _, webhook := range vwc.Webhooks {

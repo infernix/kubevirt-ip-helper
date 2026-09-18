@@ -14,11 +14,13 @@ import (
 	"time"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	kubevirtV1 "kubevirt.io/api/core/v1"
 )
 
 // vmNetCfgAPIPath is the apiserver path of the kubevirtiphelper v1 group.
@@ -419,6 +421,26 @@ func checkNICMACAddress(nc kihv1.NetworkConfig) (denied *string) {
 	return nil
 }
 
+// ipPoolByNetwork indexes the IPPools by their canonical network name. the
+// first pool of a network wins, mirroring the controller's own lookup, and a
+// pool without a valid network name is skipped.
+func ipPoolByNetwork(pools *kihv1.IPPoolList) map[string]*kihv1.IPPool {
+	poolByNetwork := map[string]*kihv1.IPPool{}
+
+	for i := range pools.Items {
+		network := util.QualifyNetworkName("", pools.Items[i].Spec.NetworkName)
+		if network == "" {
+			continue
+		}
+
+		if _, exists := poolByNetwork[network]; !exists {
+			poolByNetwork[network] = &pools.Items[i]
+		}
+	}
+
+	return poolByNetwork
+}
+
 // validateVmNetCfgIPAddresses rejects the explicit ipaddress of a
 // VirtualMachineNetworkConfig which does not lie between the start and the
 // end of the allocation range of the IPPool serving its networkname. the
@@ -457,17 +479,7 @@ func (h *Handler) validateVmNetCfgIPAddresses(obj *kihv1.VirtualMachineNetworkCo
 		return nil
 	}
 
-	poolByNetwork := map[string]*kihv1.IPPool{}
-	for i := range pools.Items {
-		network := util.QualifyNetworkName("", pools.Items[i].Spec.NetworkName)
-		if network == "" {
-			continue
-		}
-
-		if _, exists := poolByNetwork[network]; !exists {
-			poolByNetwork[network] = &pools.Items[i]
-		}
-	}
+	poolByNetwork := ipPoolByNetwork(pools)
 
 	for _, nc := range obj.Spec.NetworkConfig {
 		if msg := checkNICIPAddress(nc, poolByNetwork[util.QualifyNetworkName(obj.Namespace, nc.NetworkName)]); msg != nil {
@@ -622,6 +634,300 @@ func (h *Handler) validateVmNetCfg(ar *admissionv1.AdmissionReview) *admissionv1
 	}
 
 	return allow
+}
+
+// staticIPInterfaceNetwork resolves the canonical network of the vm
+// interface which the static ip annotation names. the first problem is
+// returned as the denial message: a vm template without interfaces, an
+// interface name the vm does not define, an interface without a network of
+// the same name, a network which is not a multus network, a multus
+// network without a networkname, and a networkname which is not a valid
+// network reference. only multus networks can carry a reservation: the
+// controller only configures the multus interfaces of a vm.
+func staticIPInterfaceNetwork(vm *kubevirtV1.VirtualMachine, nicName string) (network string, denied *string) {
+	if vm.Spec.Template == nil {
+		msg := fmt.Sprintf("the static ip annotation requests interface %s, but the vm template defines no interfaces", nicName)
+
+		return "", &msg
+	}
+
+	defined := false
+	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
+		if nic.Name == nicName {
+			defined = true
+
+			break
+		}
+	}
+
+	if !defined {
+		msg := fmt.Sprintf("the static ip annotation requests interface %s, which the vm does not define in spec.template.spec.domain.devices.interfaces", nicName)
+
+		return "", &msg
+	}
+
+	for _, net := range vm.Spec.Template.Spec.Networks {
+		if net.Name != nicName {
+			continue
+		}
+
+		if net.Multus == nil {
+			msg := fmt.Sprintf("the static ip annotation requests interface %s, whose network is not a multus network: only multus networks carry a reservation", nicName)
+
+			return "", &msg
+		}
+
+		if net.Multus.NetworkName == "" {
+			msg := fmt.Sprintf("the static ip annotation requests interface %s, whose multus network carries no networkname", nicName)
+
+			return "", &msg
+		}
+
+		network = util.QualifyNetworkName(vm.Namespace, net.Multus.NetworkName)
+		if network == "" {
+			msg := fmt.Sprintf("the static ip annotation requests interface %s, whose networkname %q is not a valid network reference", nicName, net.Multus.NetworkName)
+
+			return "", &msg
+		}
+
+		return network, nil
+	}
+
+	msg := fmt.Sprintf("the static ip annotation requests interface %s, which has no network in spec.template.spec.networks", nicName)
+
+	return "", &msg
+}
+
+// checkStaticIPAddress rejects a requested static address which the IPPool
+// of its interface cannot serve for this vm: the broadcast address of the
+// pool subnet, an address outside the pool range (mirroring the vmnetcfg
+// range guard and the controller's own registration validation), an excluded
+// address, an address recorded in the pool status under another owner, and
+// an address reserved by an exclude. the owner is compared on its namespace
+// and vm name only, so a vm which kept its address after its macaddress
+// changed keeps it: the helper keys the pool status on the (vm, macaddress)
+// pair, and the controller's reclaim accepts the same vm through its
+// claimant vmRef.
+//
+// internal failures fail open exactly like the vmnetcfg checks: a pool whose
+// range or subnet does not parse and an unparseable recorded owner never
+// deny, because the controller's own claim stays the authoritative guard.
+func checkStaticIPAddress(vm *kubevirtV1.VirtualMachine, nicName string, address string, pool *kihv1.IPPool) (denied *string) {
+	ip, err := netip.ParseAddr(address)
+	if err != nil || !ip.Is4() {
+		msg := fmt.Sprintf("the static ip address %s of interface %s does not parse as an ipv4 address (IPPool %s)",
+			address, nicName, pool.Name)
+
+		return &msg
+	}
+
+	// the broadcast address of the subnet is named as such before the
+	// range check: a range which reaches it (a pool end equal to the
+	// broadcast, which the ippool guard rejects) would otherwise report
+	// the less precise range problem
+	if prefix, prefixErr := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet); prefixErr == nil && prefix.Addr().Is4() && ip == ipv4Broadcast(prefix) {
+		msg := fmt.Sprintf("the static ip address %s of interface %s is the broadcast address %s of the subnet %s (IPPool %s): no interface can hold it",
+			address, nicName, ip, pool.Spec.IPv4Config.Subnet, pool.Name)
+
+		return &msg
+	}
+
+	start, startErr := netip.ParseAddr(pool.Spec.IPv4Config.Pool.Start)
+	end, endErr := netip.ParseAddr(pool.Spec.IPv4Config.Pool.End)
+	if startErr == nil && endErr == nil && start.Is4() && end.Is4() && (ip.Compare(start) < 0 || ip.Compare(end) > 0) {
+		msg := fmt.Sprintf("the static ip address %s of interface %s is not between the pool range %s..%s of network %s (IPPool %s)",
+			address, nicName, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End, pool.Spec.NetworkName, pool.Name)
+
+		return &msg
+	}
+
+	for _, exclude := range pool.Spec.IPv4Config.Pool.Exclude {
+		excluded, excludeErr := netip.ParseAddr(exclude)
+		if excludeErr != nil || !excluded.Is4() {
+			continue
+		}
+
+		if excluded == ip {
+			msg := fmt.Sprintf("the static ip address %s of interface %s is excluded by the pool range %s..%s of network %s (IPPool %s)",
+				address, nicName, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End, pool.Spec.NetworkName, pool.Name)
+
+			return &msg
+		}
+	}
+
+	owner, claimed := pool.Status.IPv4.Allocated[address]
+	if !claimed {
+		return nil
+	}
+
+	if owner == kihipam.ExcludedOwner {
+		msg := fmt.Sprintf("the static ip address %s of interface %s is a reserved exclude of network %s (IPPool %s)",
+			address, nicName, pool.Spec.NetworkName, pool.Name)
+
+		return &msg
+	}
+
+	// the owner is compared on its namespace and vm name only: the
+	// controller's reclaim accepts the same vm whatever macaddress its
+	// interfaces carry, so a vm which changed its macaddress keeps its
+	// address. an unparseable owner is unprovable and fails open.
+	namespace, vmName, _, ok := util.ParseAllocationRef(owner)
+	if ok && (namespace != vm.Namespace || vmName != vm.Name) {
+		msg := fmt.Sprintf("the static ip address %s of interface %s is already allocated to %s of network %s (IPPool %s)",
+			address, nicName, owner, pool.Spec.NetworkName, pool.Name)
+
+		return &msg
+	}
+
+	return nil
+}
+
+// validateVirtualMachineStaticIPs rejects every requested address of a vm
+// which its IPPools cannot serve for it: an unknown or non-multus
+// interface, a network no IPPool serves, an address the pool of that
+// network cannot hand out, and an address two interfaces of the same vm
+// request at once. the requests are checked in a deterministic order, so the
+// denial of a vm with several problems is stable.
+//
+// a failed IPPool list fails open like the vmnetcfg checks: the
+// controller's own claim stays the authoritative guard.
+func (h *Handler) validateVirtualMachineStaticIPs(vm *kubevirtV1.VirtualMachine, requested map[string]string) (denied *string) {
+	pools, err := h.listIPPools()
+	if err != nil {
+		log.Errorf("(service.validateVirtualMachineStaticIPs) cannot list the IPPools, allowing the request: %s", err.Error())
+
+		return nil
+	}
+
+	poolByNetwork := ipPoolByNetwork(pools)
+
+	nicNames := make([]string, 0, len(requested))
+	for nicName := range requested {
+		nicNames = append(nicNames, nicName)
+	}
+	sort.Strings(nicNames)
+
+	claimed := map[string]string{}
+	for _, nicName := range nicNames {
+		network, msg := staticIPInterfaceNetwork(vm, nicName)
+		if msg != nil {
+			return msg
+		}
+
+		pool := poolByNetwork[network]
+		if pool == nil {
+			msg := fmt.Sprintf("the static ip annotation requests address %s on interface %s, but no IPPool serves its network %s",
+				requested[nicName], nicName, network)
+
+			return &msg
+		}
+
+		if msg := checkStaticIPAddress(vm, nicName, requested[nicName], pool); msg != nil {
+			return msg
+		}
+
+		if otherNic, duplicate := claimed[requested[nicName]]; duplicate {
+			msg := fmt.Sprintf("the static ip annotation requests address %s on both interfaces %s and %s",
+				requested[nicName], otherNic, nicName)
+
+			return &msg
+		}
+
+		claimed[requested[nicName]] = nicName
+	}
+
+	return nil
+}
+
+// validateVirtualMachine rejects a VirtualMachine whose static ip annotation
+// requests an address the helper cannot reserve for it: a malformed
+// annotation, an interface the vm does not define or whose network is not a
+// multus network, a network without an IPPool, and an address which the pool
+// cannot serve (outside its range, its broadcast address, an exclude entry, a
+// reservation of another vm, or an address two of its interfaces request).
+// the reservation itself stays check-at-admission and claim-at-reconcile: the
+// vm controller claims the address through the existing ownership-checked ipam
+// path, so this gate only keeps a request out of the cluster which could
+// never be served.
+//
+// a vm without the annotation, an annotation without any address and an
+// address a pool cannot range-check are all admitted, and internal lookup
+// failures fail open, exactly like the vmnetcfg checks: the controller stays
+// the authoritative guard.
+func (h *Handler) validateVirtualMachine(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	allow := &admissionv1.AdmissionResponse{
+		UID:     ar.Request.UID,
+		Allowed: true,
+	}
+
+	vm := &kubevirtV1.VirtualMachine{}
+	if err := json.Unmarshal(ar.Request.Object.Raw, vm); err != nil {
+		log.Errorf("cannot unmarshal json to virtualmachine: %s", err)
+
+		return allow
+	}
+
+	requested, err := util.ParseStaticIPAnnotation(vm.ObjectMeta.Annotations)
+	if err != nil {
+		log.Warnf("(service.validateVirtualMachine) denying VirtualMachine %s/%s: %s",
+			vm.Namespace, vm.Name, err.Error())
+
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: err.Error(),
+			},
+		}
+	}
+
+	if len(requested) == 0 {
+		return allow
+	}
+
+	if msg := h.validateVirtualMachineStaticIPs(vm, requested); msg != nil {
+		log.Warnf("(service.validateVirtualMachine) denying VirtualMachine %s/%s: %s",
+			vm.Namespace, vm.Name, *msg)
+
+		return &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: *msg,
+			},
+		}
+	}
+
+	return allow
+}
+
+func (h *Handler) validateVirtualMachineAdmission(w http.ResponseWriter, r *http.Request) {
+	ar := &admissionv1.AdmissionReview{}
+	if err := json.NewDecoder(r.Body).Decode(&ar); err != nil {
+		log.Errorf("cannot decode AdmissionReview to json: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "cannot decode AdmissionReview to json: %s", err)
+
+		return
+	}
+
+	if ar.Request == nil || len(ar.Request.Object.Raw) == 0 {
+		log.Errorf("the AdmissionReview carries no object, allowing the request")
+
+		w.Header().Set("Content-Type", "application/json")
+		ar.Response = &admissionv1.AdmissionResponse{
+			UID:     "",
+			Allowed: true,
+		}
+		json.NewEncoder(w).Encode(&ar)
+
+		return
+	}
+
+	ar.Response = h.validateVirtualMachine(ar)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&ar)
 }
 
 func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request) {
@@ -880,6 +1186,7 @@ func (h *Handler) Run() {
 	mux.HandleFunc("/validate-ippool", h.validateIPPoolAdmission)
 	mux.HandleFunc("/validate-ippool-spec", h.validateIPPoolSpecAdmission)
 	mux.HandleFunc("/validate-vmnetcfg", h.validateVmNetCfgAdmission)
+	mux.HandleFunc("/validate-vm", h.validateVirtualMachineAdmission)
 
 	h.httpServer = &http.Server{
 		Addr:           ":8443",
