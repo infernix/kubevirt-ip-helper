@@ -59,7 +59,7 @@ func main() {
 		kubeconfig_file,
 		kubeconfig_context,
 		"kubevirt-ip-helper-webhook",
-		"kubevirt-ip-helper",
+		"dhcp",
 	)
 
 	admissionHandler := admission.Register(
@@ -67,7 +67,7 @@ func main() {
 		kubeconfig_file,
 		kubeconfig_context,
 		"kubevirt-ip-helper-webhook",
-		"kubevirt-ip-helper",
+		"dhcp",
 		"kubevirt-ip-helper-validator",
 	)
 
