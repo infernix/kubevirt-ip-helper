@@ -61,7 +61,7 @@ jobs:
           version: v3.14.4
 
       - name: Lint chart
-        run: helm lint deployments/charts/kubevirt-ip-helper
+        run: helm lint deployments/charts/kubevirt-ip-helper --namespace dhcp
 
       - name: Render chart
-        run: helm template test deployments/charts/kubevirt-ip-helper > /dev/null
+        run: helm template test deployments/charts/kubevirt-ip-helper --namespace dhcp > /dev/null
