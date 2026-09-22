@@ -1,16 +1,22 @@
-name: Build, tag, and push the v1.1.0-beta1 images to GHCR
+name: Build, tag, and push the v1.1.0-beta images to GHCR
 
-# Publishes the images of the v1.1.0-beta1 tag (the network-scoped helper with the
-# static ip annotation, E2E qualified) from the fork. The checkout pins the tag, so the
-# published image is byte-identical to the tagged revision regardless of the branch tip.
+# Publishes the images of a v1.1.0-beta tag from the fork. The checkout pins the pushed
+# tag, so the published image is byte-identical to the tagged revision regardless of any
+# branch tip. workflow_dispatch republishes an existing tag on demand.
 on:
   push:
-    branches:
-      - release/v1.1.x
+    tags:
+      - 'v1.1.0-beta*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v1.1.0-beta2)
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
+  IMAGE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-images:
@@ -23,7 +29,7 @@ jobs:
       - name: Checkout the tagged release revision
         uses: actions/checkout@v7
         with:
-          ref: v1.1.0-beta1
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Log in to the Container registry
         uses: docker/login-action@v4
@@ -38,8 +44,8 @@ jobs:
           image="${REGISTRY}/${{ github.repository }}"
           docker build -f build/Dockerfile -t "${image}:${sha}" .
           docker push "${image}:${sha}"
-          docker tag "${image}:${sha}" "${image}:v1.1.0-beta1"
-          docker push "${image}:v1.1.0-beta1"
+          docker tag "${image}:${sha}" "${image}:${IMAGE_TAG}"
+          docker push "${image}:${IMAGE_TAG}"
 
       - name: Build, tag and push the webhook image
         run: |
@@ -47,5 +53,5 @@ jobs:
           image="${REGISTRY}/${{ github.repository }}-webhook"
           docker build -f build/Dockerfile.webhook -t "${image}:${sha}" .
           docker push "${image}:${sha}"
-          docker tag "${image}:${sha}" "${image}:v1.1.0-beta1"
-          docker push "${image}:v1.1.0-beta1"
+          docker tag "${image}:${sha}" "${image}:${IMAGE_TAG}"
+          docker push "${image}:${IMAGE_TAG}"
