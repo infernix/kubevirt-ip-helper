@@ -1,7 +1,7 @@
 # Default values for kubevirt-ip-helper.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
-# Install one release in namespace kubevirt-ip-helper.
+# Install one release in namespace dhcp.
 # NADs and IPPools are operator-managed; this chart only references them.
 
 #

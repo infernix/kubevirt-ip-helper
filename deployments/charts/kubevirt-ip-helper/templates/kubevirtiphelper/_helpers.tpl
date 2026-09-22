@@ -71,8 +71,8 @@ Create the name of the service account to use
 {{- end -}}
 
 {{- define "kubevirt-ip-helper.validate" -}}
-{{- if ne .Release.Namespace "kubevirt-ip-helper" -}}
-{{- fail "install one release in namespace kubevirt-ip-helper" -}}
+{{- if ne .Release.Namespace "dhcp" -}}
+{{- fail "install one release in namespace dhcp" -}}
 {{- end -}}
 {{- if ne .Values.webhook.fullnameOverride "kubevirt-ip-helper-webhook" -}}
 {{- fail "webhook.fullnameOverride must be kubevirt-ip-helper-webhook (runtime TLS/admission identity)" -}}
