@@ -41,12 +41,72 @@ patches:
         name: metrics-storage
         namespace: kubevirt-ip-helper
       $patch: delete
+  # The webhook is a cluster singleton which watches dhcp, because the estate
+  # catalogue moves every NAD and IPPool into dhcp. Its own objects therefore run
+  # in dhcp while the helper daemon stays in kubevirt-ip-helper: this is
+  # KIH_WEBHOOK_NAMESPACE in versions.env. The kustomize namespace transformer
+  # cannot be applied selectively (it would also move the helper, the NADs and the
+  # kube-system cabundle Role/RoleBinding), so every webhook object is moved
+  # explicitly here. The cabundle Role/RoleBinding stay in kube-system on purpose:
+  # the webhook reads kube-system/kube-root-ca.crt, so only their subjects move.
+  - target:
+      kind: ServiceAccount
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: dhcp
+  - target:
+      kind: Service
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: dhcp
+  - target:
+      kind: Role
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: dhcp
+  - target:
+      kind: RoleBinding
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: dhcp
+      - op: replace
+        path: /subjects/0/namespace
+        value: dhcp
+  - target:
+      kind: ClusterRoleBinding
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: dhcp
+  - target:
+      kind: RoleBinding
+      name: kubevirt-ip-helper-webhook-cabundle
+    patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: dhcp
+  - target:
+      kind: Deployment
+      name: kubevirt-ip-helper-webhook
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: dhcp
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
       metadata:
         name: kubevirt-ip-helper-webhook
-        namespace: kubevirt-ip-helper
+        namespace: dhcp
       spec:
         template:
           spec:

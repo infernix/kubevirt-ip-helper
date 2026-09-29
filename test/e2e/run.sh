@@ -506,11 +506,14 @@ admission_rejects() { # <manifest>
 
 webhook_ready() {
   local config service endpoints pods certificate csr ca dns
-  dns="${KIH_WEBHOOK_SERVICE}.${KIH_HELPER_NAMESPACE}.svc"
+  # The webhook is a cluster singleton: its identity, its namespace-scoped RBAC,
+  # its TLS Secret, its Service and the VWC entries it registers all use
+  # ${KIH_WEBHOOK_NAMESPACE}, the namespace whose NADs/IPPools it watches.
+  dns="${KIH_WEBHOOK_SERVICE}.${KIH_WEBHOOK_NAMESPACE}.svc"
   config="$(kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" -o json)" || return 1
-  service="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get service "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
-  endpoints="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
-  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook -o json)" || return 1
+  service="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get service "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
+  endpoints="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get endpoints "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
+  pods="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook -o json)" || return 1
   # This version serves four entries: the ippool deletion gate, the vmnetcfg
   # duplicate and range guards, the ippool spec guard, and the virtualmachine
   # static ip guard. The static ip entry is identified by name, path and rules
@@ -518,8 +521,8 @@ webhook_ready() {
   # virtualmachine to the real admission path and needs exactly that entry.
   jq -e -n --argjson config "${config}" --argjson service "${service}" \
     --argjson endpoints "${endpoints}" --argjson pods "${pods}" \
-    --arg name "${KIH_WEBHOOK_SERVICE}" --arg ns "${KIH_HELPER_NAMESPACE}" \
-    --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_HELPER_NAMESPACE}.svc" '
+    --arg name "${KIH_WEBHOOK_SERVICE}" --arg ns "${KIH_WEBHOOK_NAMESPACE}" \
+    --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_WEBHOOK_NAMESPACE}.svc" '
       ($config.webhooks | length == 4)
       and all($config.webhooks[]; .clientConfig.service.name == $name
         and .clientConfig.service.namespace == $ns and .clientConfig.service.port == 8080
@@ -530,6 +533,7 @@ webhook_ready() {
         and .rules[0].apiGroups == ["kubevirt.io"]
         and .rules[0].resources == ["virtualmachines"]
         and ([.rules[0].operations[]] | sort == ["CREATE", "UPDATE"]))
+      and $service.metadata.namespace == $ns
       and $service.spec.selector.app == "kubevirt-ip-helper-webhook"
       and ($service.spec.selector | has("kubevirtiphelper/network") | not)
       and any($service.spec.ports[]; .port == 8080 and .targetPort == 8443)
@@ -540,7 +544,7 @@ webhook_ready() {
           .metadata.uid == $uid and .metadata.labels.app == "kubevirt-ip-helper-webhook"
           and (.metadata.labels | has("kubevirtiphelper/network") | not)))
     ' > /dev/null || return 1
-  certificate="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get secret "${KIH_WEBHOOK_TLS_SECRET}" \
+  certificate="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get secret "${KIH_WEBHOOK_TLS_SECRET}" \
     -o jsonpath='{.data.tls\.crt}')" || return 1
   csr="$(kubectl get csr "${dns}" -o json)" || return 1
   [ "$(jq -r '.status.certificate' <<< "${csr}")" = "${certificate}" ] || return 1
@@ -2499,7 +2503,7 @@ static_ip_taken_denied() { # <manifest>
   local manifest="$1" response
   admission_rejects "${manifest}" || return 1
   response="$(cat "${manifest}.admission.txt")" || return 1
-  [[ "${response}" == *"${KIH_WEBHOOK_SERVICE}-vm.${KIH_HELPER_NAMESPACE}.svc"* ]] || return 1
+  [[ "${response}" == *"${KIH_WEBHOOK_SERVICE}-vm.${KIH_WEBHOOK_NAMESPACE}.svc"* ]] || return 1
   [[ "${response}" == *"the static ip address ${STATIC_IP_RESERVATION} of interface ${KIH_HELPER_INTERFACE} is already allocated to ${KIH_WORKLOAD_NAMESPACE}/${KIH_VM_NAME} [${KIH_VM_MAC}]"* ]]
 }
 
@@ -2665,7 +2669,9 @@ main() {
     install_mode="ordinary changed-image rollout"
   fi
   kubectl apply -f "${rendered}"
-  kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
+  # The overlay deploys the helper into ${KIH_HELPER_NAMESPACE} and the
+  # standalone webhook into ${KIH_WEBHOOK_NAMESPACE}, the namespace it watches.
+  kubectl -n "${KIH_WEBHOOK_NAMESPACE}" rollout status \
     "deployment/${KIH_WEBHOOK_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
   wait_for CORE-WEBHOOK-ROUTING-TLS 120 \
     "canonical singleton webhook routes only to admission pods with valid serving TLS" webhook_ready

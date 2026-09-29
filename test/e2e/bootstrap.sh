@@ -669,9 +669,13 @@ assert_multus_chain() {
   done <<< "${nodes}"
 }
 
+# The overlay deploys the helper into ${KIH_HELPER_NAMESPACE} and the standalone
+# webhook into ${KIH_WEBHOOK_NAMESPACE} (a cluster singleton which watches the
+# dhcp namespace the estate catalogue keeps every NAD and IPPool in), so both must
+# exist before the rendered manifests are applied.
 ensure_namespaces() {
   local ns
-  for ns in "${KIH_HELPER_NAMESPACE}" "${KIH_WORKLOAD_NAMESPACE}"; do
+  for ns in "${KIH_HELPER_NAMESPACE}" "${KIH_WORKLOAD_NAMESPACE}" "${KIH_WEBHOOK_NAMESPACE}"; do
     kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f -
   done
 }

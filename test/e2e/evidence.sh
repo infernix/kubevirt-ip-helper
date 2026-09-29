@@ -312,14 +312,25 @@ _evidence_object_captures() { # <dir>
     -n "${KIH_HELPER_NAMESPACE}" get endpoints -o json || rc=1
   _evidence_group "${dir}" helper-endpointslices \
     -n "${KIH_HELPER_NAMESPACE}" get endpointslices -o json || rc=1
+  # The webhook is a cluster singleton which runs in ${KIH_WEBHOOK_NAMESPACE},
+  # the namespace it watches, so its own objects are captured from there rather
+  # than from the helper namespace. The VWC and CSR stay cluster-scoped.
+  _evidence_group "${dir}" webhook-deployment \
+    -n "${KIH_WEBHOOK_NAMESPACE}" get deployments -o json || rc=1
+  _evidence_group "${dir}" webhook-services \
+    -n "${KIH_WEBHOOK_NAMESPACE}" get services -o json || rc=1
+  _evidence_group "${dir}" webhook-endpoints \
+    -n "${KIH_WEBHOOK_NAMESPACE}" get endpoints -o json || rc=1
+  _evidence_group "${dir}" webhook-endpointslices \
+    -n "${KIH_WEBHOOK_NAMESPACE}" get endpointslices -o json || rc=1
   _evidence_group "${dir}" webhook-registration get validatingwebhookconfigurations \
-    --field-selector metadata.name=kubevirt-ip-helper-validator -o json || rc=1
+    --field-selector metadata.name="${KIH_WEBHOOK_CONFIGURATION}" -o json || rc=1
   _evidence_group "${dir}" webhook-csr get certificatesigningrequests \
-    --field-selector metadata.name=kubevirt-ip-helper-webhook.kubevirt-ip-helper.svc -o json || rc=1
+    --field-selector "metadata.name=${KIH_WEBHOOK_SERVICE}.${KIH_WEBHOOK_NAMESPACE}.svc" -o json || rc=1
   if [ "${allow_custom_api}" -eq 0 ]; then
     # Project at kubectl output time: no private key or last-applied Secret
     # annotation ever reaches a file, stderr, or the checksum-covered artifacts.
-    if ! _evidence_kubectl -n kubevirt-ip-helper get secret kubevirt-ip-helper-webhook-tls \
+    if ! _evidence_kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get secret "${KIH_WEBHOOK_TLS_SECRET}" \
       -o go-template='{"apiVersion":"v1","kind":"Secret","metadata":{"name":{{printf "%q" .metadata.name}},"namespace":{{printf "%q" .metadata.namespace}},"uid":{{printf "%q" .metadata.uid}}},"type":{{printf "%q" .type}},"data":{"tls.crt":{{printf "%q" (index .data "tls.crt")}}}}' \
       > "${dir}/parts/webhook-public-certificate.json" 2> "${dir}/.webhook-cert.err"; then
       _evidence_fail "webhook-public-certificate" "$(tr '\n' ' ' < "${dir}/.webhook-cert.err")" || true
@@ -441,6 +452,9 @@ _evidence_topology_required() { # <raw-json> [bootstrap]
     --arg secondaryService "${KIH_SECOND_METRICS_SERVICE}" \
     --arg secondaryNetwork "${KIH_SECOND_NAD_NAME}" \
     --arg namespace "${KIH_HELPER_NAMESPACE}" --arg bootstrap "${bootstrap}" \
+    --arg webhookNamespace "${KIH_WEBHOOK_NAMESPACE}" \
+    --arg webhookDeployment "${KIH_WEBHOOK_DEPLOYMENT}" \
+    --arg webhookService "${KIH_WEBHOOK_SERVICE}" \
     --arg secondaryExpected "${E2E_SECOND_NETWORK_EXPECTED:-0}" '
     . as $raw
     | .["helper-deployment"].items as $deployments
@@ -449,6 +463,10 @@ _evidence_topology_required() { # <raw-json> [bootstrap]
     | .["helper-leases"].items as $leases
     | .["helper-endpoints"].items as $endpoints
     | .["helper-endpointslices"].items as $slices
+    | .["webhook-deployment"].items as $webhookDeployments
+    | .["webhook-services"].items as $webhookServices
+    | .["webhook-endpoints"].items as $webhookEndpoints
+    | .["webhook-endpointslices"].items as $webhookSlices
     | [if $bootstrap != "1" then
          {deployment:$primary, service:$primaryService, network:$primaryNetwork}
        else empty end,
@@ -482,14 +500,18 @@ _evidence_topology_required() { # <raw-json> [bootstrap]
               then empty else "missing EndpointSlices for \($name)" end)
            end)
       ] + [if $bootstrap != "1" then
-        (if any($deployments[]; .metadata.name == "kubevirt-ip-helper-webhook")
-         then empty else "missing standalone webhook Deployment" end),
-        (if any($services[]; .metadata.name == "kubevirt-ip-helper-webhook")
-         then empty else "missing canonical webhook Service" end),
-        (if any($endpoints[]; .metadata.name == "kubevirt-ip-helper-webhook")
-         then empty else "missing webhook Endpoints" end),
-        (if any($slices[]; .metadata.labels["kubernetes.io/service-name"] == "kubevirt-ip-helper-webhook")
-         then empty else "missing webhook EndpointSlices" end),
+        (if any($webhookDeployments[]; .metadata.name == $webhookDeployment
+             and .metadata.namespace == $webhookNamespace)
+         then empty else "missing standalone webhook Deployment in \($webhookNamespace)" end),
+        (if any($webhookServices[]; .metadata.name == $webhookService
+             and .metadata.namespace == $webhookNamespace)
+         then empty else "missing canonical webhook Service in \($webhookNamespace)" end),
+        (if any($webhookEndpoints[]; .metadata.name == $webhookService
+             and .metadata.namespace == $webhookNamespace)
+         then empty else "missing webhook Endpoints in \($webhookNamespace)" end),
+        (if any($webhookSlices[]; .metadata.labels["kubernetes.io/service-name"] == $webhookService
+             and .metadata.namespace == $webhookNamespace)
+         then empty else "missing webhook EndpointSlices in \($webhookNamespace)" end),
         (if ($raw["webhook-registration"].items | length) == 1
          then empty else "missing canonical ValidatingWebhookConfiguration" end),
         (if ($raw["webhook-csr"].items | length) == 1
