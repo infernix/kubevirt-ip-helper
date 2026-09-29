@@ -1026,6 +1026,36 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				if !retried {
 					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot allocate an address for hwaddr %s in network %s: %w",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName, err)
+
+					// the refusal must stay observable even though the
+					// sync fails: the ERROR status of this nic is
+					// published with the failing sync, while the
+					// durable status rows of the other nics of this
+					// network are preserved (the failing sync commits
+					// none of its own status rows, so the live rows
+					// are the base of this sync). the rate-limited
+					// retry of handleErr forgets the key after five
+					// attempts (R03), so a refusal which only a
+					// retried sync could write would never become
+					// observable.
+					refusalStatus := make([]kihv1.NetworkConfigStatus, 0, len(vmnetcfg.Status.NetworkConfig)+1)
+					for _, row := range vmnetcfg.Status.NetworkConfig {
+						if row.MACAddress == netcfgStatus.MACAddress && row.NetworkName == netcfgStatus.NetworkName {
+							continue
+						}
+
+						refusalStatus = append(refusalStatus, row)
+					}
+
+					refusalStatus = append(refusalStatus, netcfgStatus)
+
+					newVmnetCfgStatus := kihv1.VirtualMachineNetworkConfigStatus{}
+					newVmnetCfgStatus.NetworkConfig = refusalStatus
+					if statusErr := c.updateVirtualMachineNetworkConfigStatus(base, &newVmnetCfgStatus); statusErr != nil {
+						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot publish the refused status of hwaddr %s in network %s: %s",
+							vmnetcfg.Namespace, vmnetcfg.Name, netcfgStatus.MACAddress, netcfgStatus.NetworkName, statusErr.Error())
+						c.metrics.UpdateLogStatus("error")
+					}
 				}
 			}
 
