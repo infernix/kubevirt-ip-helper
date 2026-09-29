@@ -111,7 +111,7 @@ func (h *Handler) buildWebhookClientConfig(webhookName string, path string, cert
 
 func (h *Handler) buildIPPoolWebhook(cert string) admregv1.ValidatingWebhook {
 	webhook := admregv1.ValidatingWebhook{}
-	webhook.Name = fmt.Sprintf("%s.%s.svc", h.webhookName, h.webhookNamespace)
+	webhook.Name = h.ipPoolWebhookName()
 
 	matchLabels := make(map[string]string)
 	matchLabels["admission-webhook"] = "enabled"
@@ -181,6 +181,13 @@ func (h *Handler) buildVmNetCfgWebhook(cert string) admregv1.ValidatingWebhook {
 
 func (h *Handler) vmNetCfgWebhookName() string {
 	return fmt.Sprintf("%s-vmnetcfg.%s.svc", h.webhookName, h.webhookNamespace)
+}
+
+// ipPoolWebhookName is the name of the deletion gate entry. it keeps the bare
+// service-qualified spelling the entry had before the other entries gained their
+// suffixes, so an existing installation does not orphan it.
+func (h *Handler) ipPoolWebhookName() string {
+	return fmt.Sprintf("%s.%s.svc", h.webhookName, h.webhookNamespace)
 }
 
 // buildIPPoolSpecWebhook builds the admission entry which rejects an IPPool
@@ -277,10 +284,18 @@ func (h *Handler) virtualMachineWebhookName() string {
 	return fmt.Sprintf("%s-vm.%s.svc", h.webhookName, h.webhookNamespace)
 }
 
-// ensureMissingWebhookEntries appends the admission entries this version
-// serves to an already existing ValidatingWebhookConfiguration. the
-// existing entries are left untouched so a concurrent renewal of the
+// ensureMissingWebhookEntries reconciles the admission entries of an already
+// existing ValidatingWebhookConfiguration: it appends the entries this version
+// serves and prunes the entries a previous installation of this helper left
+// behind. the surviving entries are left untouched so a concurrent renewal of the
 // serving certificate cannot be overwritten with a stale bundle.
+//
+// the entry names are namespace-qualified, so moving the helper to another
+// namespace renames every entry and leaves the previous ones in place. that is not
+// benign: the ippool deletion gate carries the default failurePolicy Fail, so its
+// stale entry fails every IPPool delete once the old namespace's service is gone.
+// only the entries of this helper are pruned, matched on the serving service
+// name; the entries of another product stay untouched.
 func (h *Handler) ensureMissingWebhookEntries() (err error) {
 	vwc, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
@@ -288,7 +303,7 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 	}
 
 	missing := []string{}
-	for _, name := range []string{h.vmNetCfgWebhookName(), h.ippoolSpecWebhookName(), h.virtualMachineWebhookName()} {
+	for _, name := range []string{h.ipPoolWebhookName(), h.vmNetCfgWebhookName(), h.ippoolSpecWebhookName(), h.virtualMachineWebhookName()} {
 		present := false
 
 		for _, webhook := range vwc.Webhooks {
@@ -304,7 +319,20 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 		}
 	}
 
-	if len(missing) == 0 {
+	kept := make([]admregv1.ValidatingWebhook, 0, len(vwc.Webhooks))
+	pruned := []string{}
+	for _, webhook := range vwc.Webhooks {
+		if h.isStaleWebhookEntry(&webhook) {
+			pruned = append(pruned, webhook.Name)
+
+			continue
+		}
+
+		kept = append(kept, webhook)
+	}
+	vwc.Webhooks = kept
+
+	if len(missing) == 0 && len(pruned) == 0 {
 		return
 	}
 
@@ -323,9 +351,22 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 
 	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(), vwc, metav1.UpdateOptions{})
 	if err == nil {
-		log.Infof("(admission.ensureMissingWebhookEntries) added the admission webhooks %v to the ValidatingWebhookConfiguration %s",
-			missing, h.validatingWebhookConfigName)
+		log.Infof("(admission.ensureMissingWebhookEntries) reconciled the ValidatingWebhookConfiguration %s: added %v, pruned the entries of a previous namespace %v",
+			h.validatingWebhookConfigName, missing, pruned)
 	}
 
 	return
+}
+
+// isStaleWebhookEntry reports whether an entry was left behind by a previous
+// installation of this helper: its serving service is this helper's service by
+// name but runs in another namespace. an entry of another product is never stale,
+// however it is named.
+func (h *Handler) isStaleWebhookEntry(webhook *admregv1.ValidatingWebhook) bool {
+	service := webhook.ClientConfig.Service
+	if service == nil {
+		return false
+	}
+
+	return service.Name == h.webhookName && service.Namespace != h.webhookNamespace
 }
