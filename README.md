@@ -258,6 +258,16 @@ new chart network replicas explicitly zero in the staging values and change
 them only after the stop/wait boundary. This handover intentionally interrupts
 DHCP rather than allowing unsafe overlap.
 
+Moving the helper to another namespace also moves its admission entries, because the
+entry names are namespace-qualified. The webhook of the new namespace prunes the
+entries of the previous one on startup, so **stop the old webhook together with the
+old helper** before the move: a webhook of the previous namespace re-adds its own
+entries every time it starts. Until the stale entries are pruned, the apiserver keeps
+calling a service which no longer exists, and the IPPool deletion gate fails closed
+(its entry carries the default `failurePolicy: Fail`), so every IPPool delete is
+rejected meanwhile. The prune only removes entries which serve this helper's own
+service name; entries of another product are left untouched.
+
 The normal migration assumes NADs already live in `kubevirt-ip-helper`.
 Moving a legacy NAD from another namespace into `kubevirt-ip-helper` changes network
 identity, not merely labels. Drain its allocations under the old helper,
