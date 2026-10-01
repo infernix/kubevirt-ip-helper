@@ -222,6 +222,12 @@ func (h *handler) Run(mainCtx context.Context) {
 	// its pod (the server used to start per service era, so the kubelet
 	// killed every standby shortly after it started)
 	h.metrics = metrics.New()
+	// the app log counter means "the app's log lines": the hook counts
+	// every warning-or-above entry of the process logger, so the errors of
+	// the packages which hold no metrics handle (the dhcp handlers) reach
+	// the alert, and the explicit UpdateLogStatus calls only report state
+	// which is not logged
+	h.metrics.InstallLogHook(log.StandardLogger())
 	h.registerHealthChecks()
 	go h.metrics.Run()
 
@@ -441,9 +447,6 @@ func (h *handler) onStoppedLeading() {
 		log.Infof("(app.Run) election stopped without this process ever leading (standby shutdown)")
 	} else {
 		log.Errorf("(app.Run) leader lost: %s", h.leaderId)
-		if h.metrics != nil {
-			h.metrics.UpdateLogStatus("error")
-		}
 	}
 
 	// close the listeners before the era join: StopAll closes every
@@ -632,7 +635,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 		}
 
 		log.Errorf("(app.RunServices) giving up on %s: %s", "the IPPoolList", err.Error())
-		h.metrics.UpdateLogStatus("error")
 
 		return fmt.Errorf("cannot gather the IPPoolList: %s", err.Error())
 	}
@@ -668,7 +670,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 		// without releasing the lease, unlabeling the leader pod or
 		// stopping the DHCP listeners
 		log.Errorf("(app.RunServices) failed to initialize the ippool event listener: %s", err.Error())
-		h.metrics.UpdateLogStatus("error")
 
 		return fmt.Errorf("cannot initialize the ippool event listener: %s", err.Error())
 	}
@@ -685,11 +686,9 @@ func (h *handler) RunServices(ctx context.Context) error {
 			switch {
 			case tick == 12:
 				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", settled, target)
-				h.metrics.UpdateLogStatus("warning")
 			case tick == 24:
 				log.Errorf("app.RunServices) DHCP services are still NOT running [%d out of %d]! There might be something wrong with one of the IPPools!"+
 					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", settled, target)
-				h.metrics.UpdateLogStatus("error")
 			}
 		},
 	); err != nil {
@@ -711,7 +710,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 		}
 
 		log.Errorf("(app.RunServices) giving up on %s: %s", "the VirtualMachineNetworkConfig list", err.Error())
-		h.metrics.UpdateLogStatus("error")
 
 		return fmt.Errorf("cannot gather the VirtualMachineNetworkConfig list: %s", err.Error())
 	}
@@ -748,7 +746,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 		// without releasing the lease, unlabeling the leader pod or
 		// stopping the DHCP listeners
 		log.Errorf("(app.RunServices) failed to initialize the vmnetcfg event listener: %s", err.Error())
-		h.metrics.UpdateLogStatus("error")
 
 		return fmt.Errorf("cannot initialize the vmnetcfg event listener: %s", err.Error())
 	}
@@ -765,14 +762,11 @@ func (h *handler) RunServices(ctx context.Context) error {
 			switch {
 			case tick == 30:
 				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", settled, target)
-				h.metrics.UpdateLogStatus("warning")
 			case tick == 60:
 				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", settled, target)
-				h.metrics.UpdateLogStatus("warning")
 			case tick == 90:
 				log.Errorf("app.RunServices) VirtualMachineNetworkConfiguration initialization is still not complete [%d out of %d] after > 15 mins! There might be something wrong with the VmNetCfgs count!"+
 					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", settled, target)
-				h.metrics.UpdateLogStatus("error")
 			}
 		},
 	); err != nil {
@@ -805,7 +799,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 		// without releasing the lease, unlabeling the leader pod or
 		// stopping the DHCP listeners
 		log.Errorf("(app.RunServices) failed to initialize the vm event listener: %s", err.Error())
-		h.metrics.UpdateLogStatus("error")
 
 		return fmt.Errorf("cannot initialize the vm event listener: %s", err.Error())
 	}
@@ -868,7 +861,6 @@ func (h *handler) waitForStartupGate(ctx context.Context, what string, startupGa
 		if !stalledSince.IsZero() && time.Since(stalledSince) > startupStallTimeout {
 			log.Errorf("app.RunServices) %s initialization has not progressed for %s [%d out of %d], giving up so the pod restarts",
 				what, startupStallTimeout, settled, target)
-			h.metrics.UpdateLogStatus("error")
 
 			return fmt.Errorf("%s initialization has not progressed for %s (%d/%d objects)", what, startupStallTimeout, settled, target)
 		}
@@ -936,7 +928,6 @@ func retryList[T any](ctx context.Context, m *metrics.MetricsAllocator, what str
 		if time.Now().After(deadline) {
 			log.Errorf("(app.RunServices) %s still cannot be gathered after %s, giving up so the pod restarts and the leadership lease is released: %s",
 				what, startupListTimeout, err.Error())
-			m.UpdateLogStatus("error")
 
 			return result, fmt.Errorf("%s still cannot be gathered after %s: %w", what, startupListTimeout, err)
 		}

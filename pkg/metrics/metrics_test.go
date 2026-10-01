@@ -3,6 +3,7 @@ package metrics
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -66,6 +67,32 @@ func TestMetricsAppLogStatus(t *testing.T) {
 	}
 	if v, ok := metricValue(t, fam, map[string]string{LabelLogLevel: "error"}); !ok || v != 1 {
 		t.Errorf("error count = %v (found=%v), want 1", v, ok)
+	}
+}
+
+func TestMetricsLogHookCountsWarningAndAbove(t *testing.T) {
+	// the counter means "the app's log lines": the hook must count every
+	// warning-or-above entry of the logger it is installed on, including the
+	// ones of a package which holds no metrics handle (the dhcp handlers),
+	// and must leave info entries alone
+	m := NewMetricsAllocator()
+	logger := log.New()
+	logger.SetOutput(io.Discard)
+	m.InstallLogHook(logger)
+
+	logger.Info("an info entry")
+	logger.Warn("a warning entry")
+	logger.Error("an error entry")
+
+	fam := gatherFamily(t, m, "kubevirtiphelper_app_logs")
+	if v, ok := metricValue(t, fam, map[string]string{LabelLogLevel: "warning"}); !ok || v != 1 {
+		t.Errorf("warning count = %v (found=%v), want 1", v, ok)
+	}
+	if v, ok := metricValue(t, fam, map[string]string{LabelLogLevel: "error"}); !ok || v != 1 {
+		t.Errorf("error count = %v (found=%v), want 1", v, ok)
+	}
+	if v, ok := metricValue(t, fam, map[string]string{LabelLogLevel: "info"}); ok {
+		t.Errorf("info count = %v, want no info series from the hook", v)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -588,6 +589,71 @@ func TestDHCPHandlerMissingPoolNoReply(t *testing.T) {
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply without a matching pool, got %d", conn.len())
+	}
+}
+
+// dhcpAppLogValue reads the application log counter of the allocator through
+// its registry: the metric is the alert contract, so the test asserts on the
+// stored series rather than on the log output.
+func dhcpAppLogValue(t *testing.T, m *metrics.MetricsAllocator, loglevel string) (float64, bool) {
+	t.Helper()
+	mfs, err := m.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "kubevirtiphelper_app_logs" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == metrics.LabelLogLevel && lp.GetValue() == loglevel {
+					return metric.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// the dhcp handlers hold no metrics handle: the application log hook installed
+// on the process logger is the only counter source, so a handler error path
+// (unknown hwaddr, no matched pool) must increment it and a converged path
+// must not.
+func TestDHCPHandlerLogHookCountsHandlerErrors(t *testing.T) {
+	m := metrics.NewMetricsAllocator()
+	logger := log.StandardLogger()
+	oldHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	defer logger.ReplaceHooks(oldHooks)
+	m.InstallLogHook(logger)
+
+	a := newTestPooledAllocator(t)
+	conn := &recordingPacketConn{}
+
+	// a converged path (known hwaddr, matched pool) is answered and must
+	// leave the counter untouched
+	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
+	if v, ok := dhcpAppLogValue(t, m, "warning"); ok {
+		t.Errorf("converged discover counted %v warning entries, want none", v)
+	}
+
+	// an unknown hwaddr is the unknown-hwaddr flood the estate alert fires on
+	unknown := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeDiscover)
+	a.dhcpHandler("pool1", conn, testPeer(), unknown)
+	if v, ok := dhcpAppLogValue(t, m, "warning"); !ok || v != 1 {
+		t.Errorf("unknown-hwaddr warning count = %v (found=%v), want 1", v, ok)
+	}
+
+	// a lease whose pool vanished is the second handler error
+	ghost := NewDHCPAllocator()
+	if err := ghost.AddLease("aa:bb:cc:dd:ee:02", "ghost-pool", "192.168.0.60", ""); err != nil {
+		t.Fatalf("AddLease: %v", err)
+	}
+	noPool := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:02"), dhcpv4.MessageTypeDiscover)
+	ghost.dhcpHandler("ghost-pool", conn, testPeer(), noPool)
+	if v, ok := dhcpAppLogValue(t, m, "warning"); !ok || v != 2 {
+		t.Errorf("no-matched-pool warning count = %v (found=%v), want 2", v, ok)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 var (
@@ -111,6 +112,42 @@ func (m *MetricsAllocator) UpdateLogStatus(loglevel string) {
 	m.kubevirtiphelperAppLogs.With(prometheus.Labels{
 		LabelLogLevel: loglevel,
 	}).Inc()
+}
+
+// logHook increments the application log counter for every entry the logger
+// emits at warning level or above: the counter means "the app's log lines", so a
+// package which holds no metrics handle (the dhcp handlers) is covered without
+// threading the allocator through every call site, and a new log site is counted
+// the moment it is written.
+type logHook struct {
+	allocator *MetricsAllocator
+}
+
+func (h logHook) Levels() []log.Level {
+	return []log.Level{log.WarnLevel, log.ErrorLevel, log.FatalLevel, log.PanicLevel}
+}
+
+func (h logHook) Fire(entry *log.Entry) error {
+	h.allocator.kubevirtiphelperAppLogs.With(prometheus.Labels{
+		LabelLogLevel: entry.Level.String(),
+	}).Inc()
+
+	return nil
+}
+
+// InstallLogHook registers the application log counter on the given logger: every
+// warning-or-above entry it emits increments the kubevirtiphelper_app_logs gauge
+// of this allocator. the application installs it once, where the process logger
+// is configured, so the counter stays "the app's log lines".
+func (m *MetricsAllocator) InstallLogHook(logger *log.Logger) {
+	logger.AddHook(logHook{allocator: m})
+}
+
+// Gather exposes the registry of this allocator, so a caller can read the
+// current series without scraping the metrics endpoint (the health checks and the
+// tests use it).
+func (m *MetricsAllocator) Gather() ([]*dto.MetricFamily, error) {
+	return m.registry.Gather()
 }
 
 func (m *MetricsAllocator) UpdateIPPoolUsed(ippoolName string, subnet string, networkName string, used int) {
