@@ -310,3 +310,71 @@ func TestEnsureMissingWebhookEntriesKeepsForeignNamespaceEntries(t *testing.T) {
 		t.Errorf("updates = %d, want 0 when only foreign entries coexist", updates)
 	}
 }
+
+// TestEnsureMissingWebhookEntriesReconcilesStaleContent proves the reconcile lands
+// content changes on entries which already exist: an entry whose failurePolicy, rule,
+// path or caBundle drifted from what this version serves is replaced with the
+// freshly built one, a foreign entry survives untouched, a stale entry of a previous
+// namespace is still pruned, and the whole rewrite is a single update.
+func TestEnsureMissingWebhookEntriesReconcilesStaleContent(t *testing.T) {
+	handler := &Handler{webhookName: "kubevirt-ip-helper-webhook", webhookNamespace: "dhcp"}
+
+	drifted := currentEntries(t)
+	for i := range drifted {
+		if drifted[i].Name != handler.vmNetCfgWebhookName() {
+			continue
+		}
+
+		drifted[i].FailurePolicy = new(admregv1.Fail)
+		drifted[i].Rules[0].Resources = []string{"virtualmachines"}
+		drifted[i].ClientConfig.Service.Path = new("/validate-stale")
+		drifted[i].ClientConfig.CABundle = []byte("stale-bundle")
+	}
+
+	foreign := admissionEntry("policy-engine.kyverno.svc", "policy-engine", "kyverno", "foreign-bundle")
+
+	seeded := append([]admregv1.ValidatingWebhook{}, drifted...)
+	seeded = append(seeded, foreign)
+	seeded = append(seeded, staleEntries()...)
+
+	api := newAdmissionTestAPI(t, testConfig(t, seeded))
+	handler = testHandler(t, api)
+
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("reconcile returned an error: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 1 {
+		t.Fatalf("updates = %d, want 1 (the drifted entry and the prune must be persisted)", updates)
+	}
+
+	wanted := handler.desiredWebhooks("live-bundle")
+	for _, desired := range wanted {
+		kept := api.entryByName(desired.Name)
+		if kept == nil {
+			t.Errorf("entry %s disappeared", desired.Name)
+
+			continue
+		}
+
+		if !reflect.DeepEqual(*kept, desired) {
+			t.Errorf("entry %s = %+v, want the freshly built entry %+v", desired.Name, *kept, desired)
+		}
+	}
+
+	if kept := api.entryByName(foreign.Name); kept == nil {
+		t.Errorf("the entry of another product %s was pruned", foreign.Name)
+	} else if !reflect.DeepEqual(kept.ClientConfig, foreign.ClientConfig) {
+		t.Errorf("foreign entry client config changed: %+v", kept.ClientConfig)
+	}
+
+	for _, stale := range staleEntries() {
+		if api.entryByName(stale.Name) != nil {
+			t.Errorf("stale entry %s of the previous namespace survived", stale.Name)
+		}
+	}
+
+	if names := api.entryNames(); len(names) != len(wanted)+1 {
+		t.Errorf("entries = %v, want the four current entries plus the foreign one", names)
+	}
+}

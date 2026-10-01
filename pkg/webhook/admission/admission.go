@@ -3,6 +3,7 @@ package admission
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
@@ -297,10 +298,13 @@ func (h *Handler) virtualMachineWebhookName() string {
 }
 
 // ensureMissingWebhookEntries reconciles the admission entries of an already
-// existing ValidatingWebhookConfiguration: it appends the entries this version
-// serves and prunes the entries a previous installation of this helper left
-// behind. the surviving entries are left untouched so a concurrent renewal of the
-// serving certificate cannot be overwritten with a stale bundle.
+// existing ValidatingWebhookConfiguration: it replaces every entry this version
+// serves with the freshly built one, appends the entries the configuration
+// lacks and prunes the entries a previous installation of this helper left
+// behind. reconciling the content, not only the presence, is what lets a
+// changed failurePolicy, rule, path or caBundle land on an installation which
+// already carries an entry of that name. the configuration is only written when
+// an entry actually changed, so a converged installation is not rewritten.
 //
 // the entry names are namespace-qualified, so moving the helper to another
 // namespace renames every entry and leaves the previous ones in place. that is not
@@ -314,57 +318,72 @@ func (h *Handler) ensureMissingWebhookEntries(ctx context.Context) (err error) {
 		return
 	}
 
-	missing := []string{}
-	for _, name := range []string{h.ipPoolWebhookName(), h.vmNetCfgWebhookName(), h.ippoolSpecWebhookName(), h.virtualMachineWebhookName()} {
-		present := false
-
-		for _, webhook := range vwc.Webhooks {
-			if webhook.Name == name {
-				present = true
-
-				break
-			}
-		}
-
-		if !present {
-			missing = append(missing, name)
-		}
+	// the ca bundle is read unconditionally: the desired entries carry it, so a
+	// rotated bundle must be compared against (and written to) an existing entry
+	// too, not only to an appended one.
+	cert, err := h.getCaBundleFromCABundleConfigMap(ctx)
+	if err != nil {
+		return
 	}
 
-	kept := make([]admregv1.ValidatingWebhook, 0, len(vwc.Webhooks))
+	desired := h.desiredWebhooks(cert)
+	desiredByName := make(map[string]admregv1.ValidatingWebhook, len(desired))
+	for _, webhook := range desired {
+		desiredByName[webhook.Name] = webhook
+	}
+
+	present := make(map[string]struct{}, len(vwc.Webhooks))
+	for i := range vwc.Webhooks {
+		present[vwc.Webhooks[i].Name] = struct{}{}
+	}
+
+	reconciled := make([]admregv1.ValidatingWebhook, 0, len(vwc.Webhooks)+len(desired))
+	added := []string{}
+	replaced := []string{}
 	pruned := []string{}
-	for _, webhook := range vwc.Webhooks {
+
+	for i := range vwc.Webhooks {
+		webhook := vwc.Webhooks[i]
+
 		if h.isStaleWebhookEntry(&webhook) {
 			pruned = append(pruned, webhook.Name)
 
 			continue
 		}
 
-		kept = append(kept, webhook)
-	}
-	vwc.Webhooks = kept
+		wanted, ok := desiredByName[webhook.Name]
+		if !ok {
+			reconciled = append(reconciled, webhook)
 
-	if len(missing) == 0 && len(pruned) == 0 {
-		return
-	}
-
-	cert, err := h.getCaBundleFromCABundleConfigMap(ctx)
-	if err != nil {
-		return
-	}
-
-	for _, webhook := range h.desiredWebhooks(cert) {
-		for _, name := range missing {
-			if webhook.Name == name {
-				vwc.Webhooks = append(vwc.Webhooks, webhook)
-			}
+			continue
 		}
+
+		if !reflect.DeepEqual(webhook, wanted) {
+			replaced = append(replaced, webhook.Name)
+		}
+
+		reconciled = append(reconciled, wanted)
 	}
+
+	for _, webhook := range desired {
+		if _, ok := present[webhook.Name]; ok {
+			continue
+		}
+
+		added = append(added, webhook.Name)
+		reconciled = append(reconciled, webhook)
+	}
+
+	if len(added) == 0 && len(replaced) == 0 && len(pruned) == 0 {
+		return
+	}
+
+	vwc.Webhooks = reconciled
 
 	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(ctx, vwc, metav1.UpdateOptions{})
 	if err == nil {
-		log.Infof("(admission.ensureMissingWebhookEntries) reconciled the ValidatingWebhookConfiguration %s: added %v, pruned the entries of a previous namespace %v",
-			h.validatingWebhookConfigName, missing, pruned)
+		log.Infof("(admission.ensureMissingWebhookEntries) reconciled the ValidatingWebhookConfiguration %s: added %v, replaced %v, pruned the entries of a previous namespace %v",
+			h.validatingWebhookConfigName, added, replaced, pruned)
 	}
 
 	return
