@@ -149,7 +149,6 @@ func (c *Controller) sync(event Event) (err error) {
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(ippool.sync) fetching object with key %s from store failed with %v", event.key, err)
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
@@ -282,7 +281,6 @@ func (c *Controller) sync(event Event) (err error) {
 		err = c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
-			c.metrics.UpdateLogStatus("error")
 		}
 
 		// a pool whose dhcp listener died after its registration (its
@@ -310,7 +308,6 @@ func (c *Controller) sync(event Event) (err error) {
 					// won the race) serves the pool already: converged,
 					// nothing to retry
 					log.Warnf("(ippool.sync) the DHCP listener of pool %s is already running, nothing to repair", event.poolName)
-					c.metrics.UpdateLogStatus("warning")
 				} else if errors.Is(runErr, dhcp.ErrAllocatorClosed) {
 					// the shutdown path of this era already closed the
 					// allocator (the leadership was lost and the fence
@@ -324,16 +321,13 @@ func (c *Controller) sync(event Event) (err error) {
 					// converged outcome of a repair racing the fence, not
 					// a failure worth an error alert or a retry spin
 					log.Warnf("(ippool.sync) the DHCP allocator of this era is closed, the listener of pool %s is not repaired", event.poolName)
-					c.metrics.UpdateLogStatus("warning")
 				} else {
 					log.Errorf("(ippool.sync) failed to restore the DHCP listener of pool %s: %s", event.poolName, runErr.Error())
-					c.metrics.UpdateLogStatus("error")
 
 					err = runErr
 				}
 			} else {
 				log.Warnf("(ippool.sync) restored the DHCP listener of pool %s after its unexpected termination", event.poolName)
-				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 	case DELETE:
@@ -390,7 +384,6 @@ func (c *Controller) removeLocalRegistration(name string, uid types.UID) error {
 		// down), not a failure.
 		log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
 			name, c.scope.NetworkName())
-		c.metrics.UpdateLogStatus("warning")
 
 		return nil
 	}
@@ -402,7 +395,6 @@ func (c *Controller) removeLocalRegistration(name string, uid types.UID) error {
 		// object was deleted is incorrect, so this delete stays a no-op.
 		log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
 			name, c.scope.NetworkName())
-		c.metrics.UpdateLogStatus("warning")
 
 		return nil
 	}
@@ -414,7 +406,6 @@ func (c *Controller) removeLocalRegistration(name string, uid types.UID) error {
 		// listener until its resync re-registers it. the cleanup is
 		// dropped and the replacement's own events manage the object.
 		log.Warnf("(ippool.sync) IPPool %s was deleted but a same-name replacement exists, skipping the cleanup of the live state", name)
-		c.metrics.UpdateLogStatus("warning")
 
 		return nil
 	}
@@ -445,7 +436,6 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	}
 
 	log.Errorf("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
-	c.metrics.UpdateLogStatus("error")
 	// an exhausted key can never settle through its own retries anymore:
 	// the gate settles it so the app startup does not wait forever for an
 	// object which keeps failing
@@ -463,7 +453,6 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
 		log.Errorf("(ippool.Run) timed out waiting for caches to sync")
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}

@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	log "github.com/sirupsen/logrus"
+
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -105,6 +107,12 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 	}
 
 	cacheAllocator := kihcache.NewCacheAllocator()
+	m := metrics.NewMetricsAllocator()
+	// the production app installs the application log hook on the process
+	// logger (pkg/app.Run); the behavior tests install the same hook so the
+	// removed explicit UpdateLogStatus calls stay observable through the
+	// kubevirtiphelper_app_logs counter
+	installTestLogHook(t, m)
 	controller := NewController(
 		queue,
 		indexer,
@@ -113,7 +121,7 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		cacheAllocator,
 		ipam.NewIPAllocator(),
 		dhcp.NewDHCPAllocator(),
-		metrics.NewMetricsAllocator(),
+		m,
 		client,
 		appStatus,
 		startupGate,
@@ -123,6 +131,20 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 	t.Cleanup(queue.ShutDown)
 
 	return controller, cacheAllocator
+}
+
+// installTestLogHook routes the standard logger's warning-and-above entries
+// into m for the duration of the test: it mirrors the hook app.Run installs, so
+// the behavior tests observe the same kubevirtiphelper_app_logs series the
+// removed explicit UpdateLogStatus calls used to publish. The hooks present
+// before the test are restored on cleanup, keeping the tests isolated.
+func installTestLogHook(t *testing.T, m *metrics.MetricsAllocator) {
+	t.Helper()
+
+	logger := log.StandardLogger()
+	oldHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	m.InstallLogHook(logger)
+	t.Cleanup(func() { logger.ReplaceHooks(oldHooks) })
 }
 
 // newUnavailableClientset returns a generated clientset pointing at a local

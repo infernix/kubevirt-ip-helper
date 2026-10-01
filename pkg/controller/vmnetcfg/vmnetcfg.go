@@ -104,7 +104,6 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		} else {
 			log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
-			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -117,7 +116,6 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
 		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 
 	if err := c.updateIPPoolStatus(
@@ -138,7 +136,6 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		} else {
 			log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ippool status for ip %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
-			c.metrics.UpdateLogStatus("error")
 
 			// the pending commit was lost, so no spec entry will ever
 			// record this tuple again: a record whose owner-validated
@@ -165,7 +162,6 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 	if err := c.updateIPPoolMetrics(allocated.poolName); err != nil {
 		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 }
 
@@ -198,7 +194,6 @@ func (c *Controller) releaseOwnClaim(networkName string, ip string, ownerRef str
 		!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
 		log.Errorf("(vmnetcfg.releaseOwnClaim) [%s] cannot release the own claim of ip %s in network %s: %s",
 			ownerRef, ip, networkName, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 }
 
@@ -459,7 +454,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			if lease.Reference != fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName) || lease.PoolName != c.scope.NetworkName() {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s belongs to %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.Reference)
-				c.metrics.UpdateLogStatus("error")
 
 				netcfgStatus.Status = "ERROR"
 				netcfgStatus.Message = "macaddress belongs to another vm"
@@ -484,7 +478,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				pool.(kihv1.IPPool).Status.LastUpdate.After(vmnetcfg.CreationTimestamp.Time) {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, hijackErrorStatusMessage)
-				c.metrics.UpdateLogStatus("error")
 
 				netcfgStatus.Status = "ERROR"
 				netcfgStatus.Message = hijackErrorStatusMessage
@@ -497,7 +490,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if skipNic {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] network interface has an error status, skipping updates",
 				vmnetcfg.Namespace, vmnetcfg.Name)
-			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -514,7 +506,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] invalid macaddress %q for network %s, skipping interface",
 				vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName)
-			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -627,7 +618,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					// to agree
 					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s is leased with ip %s in network %s which VirtualMachineNetworkConfig %s/%s records, refusing the requested change",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), lease.PoolName, siblingNamespace, siblingName)
-					c.metrics.UpdateLogStatus("error")
 
 					netcfgStatus.Status = "ERROR"
 					netcfgStatus.Message = fmt.Sprintf("ip %s in network %s is leased by VirtualMachineNetworkConfig %s/%s: the live lease wins, delete or edit the conflicting object to agree", lease.ClientIP.String(), lease.PoolName, siblingNamespace, siblingName)
@@ -639,7 +629,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				} else {
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] address or network change found for hwaddr=%s: the lease holds ip=%s in network=%s, the spec records ip=%s in network=%s, starting cleanup of the leased state",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), lease.PoolName, v.IPAddress, v.NetworkName)
-					c.metrics.UpdateLogStatus("warning")
 
 					oldNetcfg := kihv1.NetworkConfig{}
 					// the cleanup must un-record and release the allocation the
@@ -660,7 +649,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						// restoration of the others
 						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] failed to clean up the old address of hwaddr %s: %s",
 							vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, cleanupErr)
-						c.metrics.UpdateLogStatus("error")
 
 						newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -750,7 +738,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						// migrates it properly
 						log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished before its address could be adopted, releasing the stale claim of the removed nic",
 							vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
-						c.metrics.UpdateLogStatus("warning")
 
 						c.releaseOwnClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 
@@ -768,7 +755,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					} else {
 						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam re-claim error: %s, skipping interface",
 							vmnetcfg.Namespace, vmnetcfg.Name, adoptErr)
-						c.metrics.UpdateLogStatus("error")
 
 						if restoreErr == nil {
 							restoreErr = adoptErr
@@ -807,7 +793,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				if !c.dhcp.HasOwnedLease(v.MACAddress, vmRef, v.NetworkName, v.IPAddress) {
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished during the ownership repair, skipping it and releasing the stale claim of the removed nic",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
-					c.metrics.UpdateLogStatus("warning")
 
 					c.releaseOwnClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 
@@ -826,7 +811,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				); err != nil {
 					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 						vmnetcfg.Namespace, vmnetcfg.Name, err)
-					c.metrics.UpdateLogStatus("error")
 
 					repairErr = err
 				}
@@ -840,7 +824,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					// before it blocks the address for a later binding
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s was removed by a concurrent cleanup during the ownership repair, undoing the record",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
-					c.metrics.UpdateLogStatus("warning")
 
 					if err := c.updateIPPoolStatus(
 						DELETE,
@@ -856,7 +839,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						// validation; any other failure is retriable
 						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot undo the ownership record after the raced cleanup: %s",
 							vmnetcfg.Namespace, vmnetcfg.Name, err)
-						c.metrics.UpdateLogStatus("error")
 
 						repairErr = err
 
@@ -996,7 +978,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam error: %s, skipping interface",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -1054,7 +1035,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					if statusErr := c.updateVirtualMachineNetworkConfigStatus(base, &newVmnetCfgStatus); statusErr != nil {
 						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot publish the refused status of hwaddr %s in network %s: %s",
 							vmnetcfg.Namespace, vmnetcfg.Name, netcfgStatus.MACAddress, netcfgStatus.NetworkName, statusErr.Error())
-						c.metrics.UpdateLogStatus("error")
 					}
 				}
 			}
@@ -1089,7 +1069,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// exactly like the earlier sync left it, never unwound
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err)
-				c.metrics.UpdateLogStatus("error")
 
 				if !adoptedReservation {
 					rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
@@ -1138,7 +1117,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// the publication
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err)
-				c.metrics.UpdateLogStatus("error")
 
 				newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -1189,7 +1167,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// predates this sync and stays held instead
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err)
-				c.metrics.UpdateLogStatus("error")
 
 				if !adoptedReservation {
 					rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
@@ -1207,7 +1184,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
 		}
 
 		// an adopted reservation is the pre-existing hold of an earlier
@@ -1233,7 +1209,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	if err := c.verifyClaimedNics(base, claimedNics, &newVmNetCfgs, &newNetCfgStatusList); err != nil {
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
 
 		contested := false
 		for _, nc := range appliedAllocations {
@@ -1321,7 +1296,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	if err := c.updateVirtualMachineNetworkConfigStatus(commitBase, &newVmnetCfgStatus); err != nil {
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			base.Namespace, base.Name, err)
-		c.metrics.UpdateLogStatus("error")
 
 		if verifyErr := c.verifyClaimedNics(commitBase, claimedNics, &newVmNetCfgs, &newNetCfgStatusList); verifyErr != nil {
 			log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) cannot verify failed status commit: %s", verifyErr)
@@ -1443,7 +1417,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the ipam release of it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
-			c.metrics.UpdateLogStatus("warning")
 
 			releaseIP = false
 		}
@@ -1466,7 +1439,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s, skipping the dhcp cleanup of it",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-				c.metrics.UpdateLogStatus("warning")
 
 			case errors.Is(err, dhcp.ErrLeaseNotFound):
 				// no lease left for this interface: the cleanup already
@@ -1502,7 +1474,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				// registration pin: converged, nothing left to release
 				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s is allocated by another owner, skipping the ipam release of it",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress)
-				c.metrics.UpdateLogStatus("warning")
 			} else if !util.IsAlreadyReleased(err) && !util.IsUnusableIdentity(err) {
 				// already-free addresses and unparseable addresses are
 				// treated as done so a retried cleanup can converge
@@ -1533,7 +1504,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		if siblingNamespace, siblingName, held := c.findSiblingRecordingTuple(vmnetcfg, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress); held {
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s in network %s is recorded by VirtualMachineNetworkConfig %s/%s, leaving its lease, claim and ledger record to that object",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, netCfg.NetworkName, siblingNamespace, siblingName)
-			c.metrics.UpdateLogStatus("warning")
 
 			return
 		}
@@ -1586,7 +1556,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			(capturedLease.PoolName != netCfg.NetworkName || capturedLease.ClientIP.String() != netCfg.IPAddress) {
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the deleted lease of hwaddr %s served the unrecorded tuple (network %s, ip %s), releasing its reservations",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, capturedLease.PoolName, capturedLease.ClientIP.String())
-			c.metrics.UpdateLogStatus("warning")
 
 			if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{
 				MACAddress:  netCfg.MACAddress,
@@ -1662,7 +1631,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				if !poolExists {
 					log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
 						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
-					c.metrics.UpdateLogStatus("warning")
 				}
 			} else {
 				// the api verification itself failed: fail conservatively,
@@ -1696,7 +1664,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			// network which is not registered in this era)
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
-			c.metrics.UpdateLogStatus("warning")
 		}
 	}
 
@@ -1716,7 +1683,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			if deleting && errors.Is(err, util.ErrForeignOwner) {
 				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, poolName)
-				c.metrics.UpdateLogStatus("warning")
 			} else {
 				// during a live transition the durable un-record happens
 				// before any local release: a failed status write leaves the
@@ -1750,7 +1716,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	if registered {
 		if err := ippoolstatus.UpdateAccounting(c.ctx, c.kihClientset, c.ipam, c.scope.NetworkName(), poolNames[0]); err != nil {
 			log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot refresh pool accounting: %s", vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -1762,7 +1727,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		if err := c.updateIPPoolMetrics(poolNames[0]); err != nil {
 			log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -1812,7 +1776,6 @@ func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkC
 	if vmErr != nil {
 		log.Warnf("(vmnetcfg.sweepOrphanedBinding) [%s/%s] cannot verify the VirtualMachine %s of the binding, skipping the orphan sweep of this sync: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName, vmErr.Error())
-		c.metrics.UpdateLogStatus("warning")
 
 		return false
 	}
@@ -1826,7 +1789,6 @@ func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkC
 	}); err != nil && !apierrors.IsNotFound(err) {
 		log.Errorf("(vmnetcfg.sweepOrphanedBinding) [%s/%s] cannot delete the orphaned vmnetcfg of the gone VirtualMachine %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName, err.Error())
-		c.metrics.UpdateLogStatus("error")
 
 		return false
 	}
@@ -1950,7 +1912,6 @@ func (c *Controller) verifyClaimedNics(vmnetcfg *kihv1.VirtualMachineNetworkConf
 
 		log.Warnf("(vmnetcfg.verifyClaimedNics) [%s/%s] the nic %s of network %s with ip %s was removed while this sync restored it, unwinding its freshly created claim",
 			vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.networkName, nc.ipAddress)
-		c.metrics.UpdateLogStatus("warning")
 
 		c.unwindClaim(vmnetcfg, nc)
 		removeNicFromSpec(pendingSpec, nc.macAddress, nc.networkName)
@@ -1993,7 +1954,6 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 		!errors.Is(err, dhcp.ErrLeaseNotFound) && !errors.Is(err, dhcp.ErrLeaseForeignOwner) {
 		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to delete the lease of hwaddr %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 
 	ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, nc.macAddress)
@@ -2001,14 +1961,12 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 		!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
 		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to release the claim of ip %s in network %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, nc.ipAddress, nc.networkName, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 
 	if err := c.updateIPPoolStatus(DELETE, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, nc.ipAddress, nc.networkName, nc.macAddress, nc.poolName); err != nil &&
 		!errors.Is(err, util.ErrForeignOwner) {
 		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to remove the ip %s record from the IPPool %s status: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, nc.ipAddress, nc.poolName, err)
-		c.metrics.UpdateLogStatus("error")
 
 		c.rememberPendingUnwind(
 			fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name),
@@ -2027,7 +1985,6 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 	if err := c.updateIPPoolMetrics(nc.poolName); err != nil {
 		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 }
 
@@ -2076,7 +2033,6 @@ func (c *Controller) publishPendingLeases(vmnetcfg *kihv1.VirtualMachineNetworkC
 		if err := c.dhcp.AddLease(nc.macAddress, nc.networkName, nc.ipAddress, vmRef); err != nil {
 			log.Errorf("(vmnetcfg.publishPendingLeases) [%s/%s] cannot publish the lease of hwaddr %s for ip %s after the committed assignment: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.ipAddress, err)
-			c.metrics.UpdateLogStatus("error")
 
 			for i := range status.NetworkConfig {
 				if status.NetworkConfig[i].MACAddress == nc.macAddress && status.NetworkConfig[i].NetworkName == nc.networkName {
@@ -2129,7 +2085,6 @@ func (c *Controller) resolveFailedCommit(vmnetcfg *kihv1.VirtualMachineNetworkCo
 		if !apierrors.IsNotFound(err) {
 			log.Warnf("(vmnetcfg.resolveFailedCommit) [%s/%s] cannot reread the object after the failed commit, keeping the reservations of this sync held without serving them until the API answers again: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("warning")
 
 			return
 		}
@@ -2151,7 +2106,6 @@ func (c *Controller) resolveFailedCommit(vmnetcfg *kihv1.VirtualMachineNetworkCo
 			if err := c.dhcp.AddLease(nc.macAddress, nc.networkName, nc.ipAddress, vmRef); err != nil {
 				log.Errorf("(vmnetcfg.resolveFailedCommit) [%s/%s] cannot publish the lease of the committed assignment of hwaddr %s for ip %s: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.ipAddress, err)
-				c.metrics.UpdateLogStatus("error")
 			}
 
 			continue

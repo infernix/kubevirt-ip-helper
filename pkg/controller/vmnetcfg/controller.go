@@ -300,7 +300,6 @@ func (c *Controller) drainPendingUnwinds(key string) {
 			// without any write
 			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] the pending ledger record of ip %s in network %s converged: the pool is gone with its ledger",
 				key, entry.ip, entry.networkName)
-			c.metrics.UpdateLogStatus("warning")
 
 			continue
 		}
@@ -313,7 +312,6 @@ func (c *Controller) drainPendingUnwinds(key string) {
 			// revalidates the ledger
 			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in network %s after the deletion, the next era's registration revalidates the ledger: %s",
 				key, entry.ip, entry.networkName, resolveErr)
-			c.metrics.UpdateLogStatus("warning")
 
 			continue
 		}
@@ -331,7 +329,6 @@ func (c *Controller) drainPendingUnwinds(key string) {
 			if err == nil {
 				log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] removed the pending ledger record of ip %s in pool %s after the deletion",
 					key, entry.ip, poolName)
-				c.metrics.UpdateLogStatus("warning")
 
 				continue
 			}
@@ -339,14 +336,12 @@ func (c *Controller) drainPendingUnwinds(key string) {
 			if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
 				log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] the pending ledger record of ip %s in pool %s converged: %s",
 					key, entry.ip, poolName, err)
-				c.metrics.UpdateLogStatus("warning")
 
 				continue
 			}
 
 			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in pool %s after the deletion, the next era's registration revalidates the ledger: %s",
 				key, entry.ip, poolName, err)
-			c.metrics.UpdateLogStatus("warning")
 		}
 	}
 }
@@ -424,7 +419,6 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 		if entry.uid != "" && entry.uid != vmnetcfg.UID && pendingUnwindShadowsLiveObject(entry, vmnetcfg) {
 			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in network %s was recorded by a replaced generation of this key, not replaying it against the live object",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.networkName)
-			c.metrics.UpdateLogStatus("warning")
 
 			c.rememberPendingUnwind(key, entry)
 
@@ -437,7 +431,6 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 			// without any write
 			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in network %s converged: the pool is gone with its ledger",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.networkName)
-			c.metrics.UpdateLogStatus("warning")
 
 			continue
 		}
@@ -448,7 +441,6 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 			// recorded and the retried reconciliation resolves it again
 			log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot resolve the pool of network %s for the pending ledger record of ip %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.networkName, entry.ip, resolveErr)
-			c.metrics.UpdateLogStatus("error")
 
 			c.rememberPendingUnwind(key, entry)
 
@@ -472,7 +464,6 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 			if err == nil {
 				log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] removed the pending ledger record of ip %s in pool %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName)
-				c.metrics.UpdateLogStatus("warning")
 
 				continue
 			}
@@ -483,14 +474,12 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 				// against this pool
 				log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in pool %s converged: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName, err)
-				c.metrics.UpdateLogStatus("warning")
 
 				continue
 			}
 
 			log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot remove the pending ledger record of ip %s in pool %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName, err)
-			c.metrics.UpdateLogStatus("error")
 
 			// the entry is recorded once however many pool objects
 			// claimed the network: a second failure of the same entry
@@ -560,14 +549,12 @@ func (c *Controller) sync(event Event) (err error) {
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vmnetcfg.sync) fetching object with key %s from store failed with %v", event.key, err)
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
 
 	if !exists && event.action != DELETE {
 		log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
-		c.metrics.UpdateLogStatus("warning")
 		// the object is gone and cannot produce a sync anymore; the startup
 		// gate must not wait for it
 		c.markInitAttempt(event.key)
@@ -580,7 +567,6 @@ func (c *Controller) sync(event Event) (err error) {
 		err = c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
 		if err != nil {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
-			c.metrics.UpdateLogStatus("error")
 		}
 		// the startup gate settles a vmnetcfg once its sync settled,
 		// whether the settled sync was the initial ADD or a resynced
@@ -627,7 +613,6 @@ func (c *Controller) sync(event Event) (err error) {
 		// (owner-validated and idempotent).
 		if exists {
 			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the deletion replay", event.key)
-			c.metrics.UpdateLogStatus("warning")
 
 			return
 		}
@@ -693,7 +678,6 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 
 	log.Errorf("(vmnetcfg.handleErr) dropping VirtualMachineNetworkConfig %q out of the queue: %v", key, err)
-	c.metrics.UpdateLogStatus("error")
 
 	// an exhausted key can never settle through its own retries anymore:
 	// the gate settles it so the app startup does not wait forever for an
@@ -712,7 +696,6 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
 		log.Errorf("(vmnetcfg.Run) timed out waiting for caches to sync")
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
@@ -730,7 +713,6 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 			if _, exists, getErr := c.indexer.GetByKey(key); getErr == nil && !exists {
 				log.Warnf("(vmnetcfg.Run) VirtualMachineNetworkConfig %s of the startup snapshot was deleted before the informer started, settling it for the startup gate",
 					key)
-				c.metrics.UpdateLogStatus("warning")
 
 				c.markInitAttempt(key)
 			}

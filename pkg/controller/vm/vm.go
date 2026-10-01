@@ -539,7 +539,6 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 	if staticIPErr != nil {
 		log.Warnf("(vm.getNetworkConfigs) [%s/%s] ignoring the static ip annotation: %s",
 			vm.Namespace, vm.Name, staticIPErr)
-		c.metrics.UpdateLogStatus("warning")
 	}
 	if len(staticIPs) != 0 {
 		// a request which names no interface of this vm can never be
@@ -553,7 +552,6 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 			if !interfaces[nicName] {
 				log.Warnf("(vm.getNetworkConfigs) [%s/%s] the static ip annotation names interface %s which the vm does not have, ignoring it",
 					vm.Namespace, vm.Name, nicName)
-				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 	}
@@ -594,7 +592,6 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 						// the networkname should be there from the beginning
 						log.Errorf("(vm.getNetworkConfigs) [%s/%s] no networkname found for vm",
 							vm.Namespace, vm.Name)
-						c.metrics.UpdateLogStatus("error")
 					} else {
 						nic.MacAddress = util.CanonicalHWAddr(nic.MacAddress)
 						if c.dhcp.CheckLease(nic.MacAddress) {
@@ -735,7 +732,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 			// freed while the successor's lease keeps serving the address
 			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the release of it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
-			c.metrics.UpdateLogStatus("warning")
 
 			successorLive = true
 		}
@@ -791,7 +787,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 				// which is not registered in this era)
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
-				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 
@@ -823,7 +818,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, poolName)
-				c.metrics.UpdateLogStatus("warning")
 			} else if c.ipam.HasSubnet(netCfg.NetworkName) {
 				// the counter republish below recomputes from the live
 				// allocator: it applies whenever the allocator knows the
@@ -868,7 +862,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 				// interface state by now
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-				c.metrics.UpdateLogStatus("warning")
 
 			default:
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
@@ -898,7 +891,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 				// registration pin: converged, nothing left to release
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s is allocated by another owner, skipping the release of it",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress)
-				c.metrics.UpdateLogStatus("warning")
 			} else if !util.IsAlreadyReleased(err) && !util.IsUnusableIdentity(err) {
 				// already-free addresses and unparseable addresses are
 				// treated as done so a retried cleanup can converge
@@ -910,7 +902,6 @@ func (c *Controller) cleanupOwnedNetworkInterface(vmnetcfg *kihv1.VirtualMachine
 			// As before, a failed refresh is logged rather than retried.
 			if err := c.updateIPPoolStatus(DELETE, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, netCfg.IPAddress, netCfg.NetworkName, netCfg.MACAddress, cleanupPoolName); err != nil {
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] cannot refresh pool accounting: %s", vmnetcfg.Namespace, vmnetcfg.Name, err)
-				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 	}
@@ -936,7 +927,6 @@ func (c *Controller) releaseDivergentTuple(vmnetcfg *kihv1.VirtualMachineNetwork
 
 	log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the deleted lease of hwaddr %s served the unrecorded tuple (network %s, ip %s), releasing its reservations",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, capturedLease.PoolName, capturedLease.ClientIP.String())
-	c.metrics.UpdateLogStatus("warning")
 
 	return c.cleanupOwnedNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{
 		MACAddress:  netCfg.MACAddress,

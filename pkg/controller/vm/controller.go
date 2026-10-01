@@ -104,7 +104,6 @@ func (c *Controller) sync(event Event) (err error) {
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vm.sync) fetching object with key %s from store failed with %v", event.key, err)
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
@@ -129,7 +128,6 @@ func (c *Controller) sync(event Event) (err error) {
 			// configuration. the cleanup is dropped and the replacement's
 			// own events manage the object.
 			log.Warnf("(vm.sync) VirtualMachine %s was deleted but a same-name replacement exists, skipping the vmnetcfg cleanup", event.key)
-			c.metrics.UpdateLogStatus("warning")
 
 			return
 		}
@@ -139,7 +137,6 @@ func (c *Controller) sync(event Event) (err error) {
 
 	if err != nil {
 		log.Errorf("(vm.sync) %s", err)
-		c.metrics.UpdateLogStatus("error")
 	}
 
 	return
@@ -163,7 +160,6 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 
 	log.Errorf("(vm.handleErr) dropping VirtualMachine %q out of the queue: %v", key, err)
-	c.metrics.UpdateLogStatus("error")
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {
@@ -175,7 +171,6 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
 		log.Errorf("Timed out waiting for caches to sync")
-		c.metrics.UpdateLogStatus("error")
 
 		return
 	}

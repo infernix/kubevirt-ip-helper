@@ -20,6 +20,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	log "github.com/sirupsen/logrus"
+
 	prom "github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
@@ -68,6 +70,20 @@ const (
 	metricIPPoolAvail    = "kubevirtiphelper_ippool_available"
 	metricVMNetCfgStatus = "kubevirtiphelper_vmnetcfg_status"
 )
+
+// installTestLogHook routes the standard logger's warning-and-above entries
+// into m for the duration of the test: it mirrors the hook app.Run installs, so
+// the behavior tests observe the same kubevirtiphelper_app_logs series the
+// removed explicit UpdateLogStatus calls used to publish. The hooks present
+// before the test are restored on cleanup, keeping the tests isolated.
+func installTestLogHook(t *testing.T, m *metrics.MetricsAllocator) {
+	t.Helper()
+
+	logger := log.StandardLogger()
+	oldHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	m.InstallLogHook(logger)
+	t.Cleanup(func() { logger.ReplaceHooks(oldHooks) })
+}
 
 // testEnv bundles the in-memory allocators, the metrics registry and a controller
 // wired to a real generated clientset backed by an httptest fake API server.
@@ -123,6 +139,11 @@ func newTestEnv(t *testing.T) *testEnv {
 	// requeued events through the controller
 	e.indexer = newTestIndexer()
 	e.queue = newTestQueue()
+	// the production app installs the application log hook on the process
+	// logger (pkg/app.Run); the behavior tests install the same hook so
+	// the removed explicit UpdateLogStatus calls stay observable through
+	// the kubevirtiphelper_app_logs counter
+	installTestLogHook(t, e.metrics)
 	e.controller = NewController(context.Background(), e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, nil, e.scope, e.reconcileMu)
 	e.appStatus = &appStatus
 	t.Cleanup(e.queue.ShutDown)

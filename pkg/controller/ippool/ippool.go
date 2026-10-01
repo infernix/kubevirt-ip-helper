@@ -392,12 +392,10 @@ func (c *Controller) registerPoolWithTeardown(pool *kihv1.IPPool, failLog string
 	}
 
 	log.Errorf("(ippool.sync) %s %s: %s", failLog, pool.Name, err.Error())
-	c.metrics.UpdateLogStatus("error")
 
 	if cleanup {
 		if cleanupErr := c.cleanupIPPoolObjects(pool); cleanupErr != nil {
 			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", pool.Name, cleanupErr.Error())
-			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -624,7 +622,6 @@ func (c *Controller) stopDHCPListener(pool *kihv1.IPPool) {
 	if err := c.dhcp.Stop(pool.Spec.NetworkName); err != nil {
 		log.Errorf("(ippool.stopDHCPListener) error while shutting down DHCP listener running on nic [%s] for network [%s]: %s",
 			pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
-		c.metrics.UpdateLogStatus("error")
 	}
 }
 
@@ -937,7 +934,6 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		if liveness == ownerGone {
 			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s whose owner is authoritatively gone, dropping it instead of resurrecting it",
 				pool.Name, ownerRef, ip)
-			c.metrics.UpdateLogStatus("warning")
 
 			continue
 		}
@@ -954,7 +950,6 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		if owner != nil && owner.Spec.VMName != "" && owner.Spec.VMName != vmName {
 			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s whose recorded nic is claimed by the vm %s now, re-attributing it to the current claimant",
 				pool.Name, ownerRef, ip, owner.Spec.VMName)
-			c.metrics.UpdateLogStatus("warning")
 
 			ownerRef = util.AllocationRef(namespace, owner.Spec.VMName, hwAddr)
 		}
@@ -1447,7 +1442,6 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 	} else if !apierrors.IsNotFound(getErr) {
 		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the owner %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, getErr.Error())
-		c.metrics.UpdateLogStatus("warning")
 
 		return ownerUnverified, nil
 	}
@@ -1461,7 +1455,6 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 	if listErr != nil {
 		log.Warnf("(ippool.verifyLedgerOwner) cannot resolve the claiming binding of the owner %s/%s of the recorded ip %s of IPPool %s among the actual bindings, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, listErr.Error())
-		c.metrics.UpdateLogStatus("warning")
 
 		return ownerUnverified, nil
 	}
@@ -1487,7 +1480,6 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 	if vmErr != nil {
 		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the virtualmachine %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, vmErr.Error())
-		c.metrics.UpdateLogStatus("warning")
 
 		return ownerUnverified, nil
 	}
@@ -1535,7 +1527,6 @@ func (c *Controller) excludeEntryConflicts(pool *kihv1.IPPool, ip string, ref st
 	if !ok {
 		log.Warnf("(ippool.excludeEntryConflicts) IPPool %s carries the unparseable allocation reference %q for the exclude entry %s, treating it as a live claim",
 			pool.Name, ref, ip)
-		c.metrics.UpdateLogStatus("warning")
 
 		return true, nil
 	}
@@ -1544,7 +1535,6 @@ func (c *Controller) excludeEntryConflicts(pool *kihv1.IPPool, ip string, ref st
 	case ownerGone:
 		log.Warnf("(ippool.excludeEntryConflicts) the exclude entry %s of IPPool %s is recorded for the owner %s/%s whose binding is authoritatively gone, ignoring the stale record",
 			ip, pool.Name, namespace, vmName)
-		c.metrics.UpdateLogStatus("warning")
 
 		return false, nil
 	case ownerUnverified:
@@ -1572,7 +1562,6 @@ func (c *Controller) dropSpecPin(pool *kihv1.IPPool, claim specClaim) {
 			!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
 			log.Errorf("(ippool.dropSpecPin) cannot drop the pin of ip %s of VirtualMachineNetworkConfig %s/%s: %s",
 				claim.ip, claim.namespace, claim.name, err.Error())
-			c.metrics.UpdateLogStatus("error")
 		}
 
 		return
@@ -1584,7 +1573,6 @@ func (c *Controller) dropSpecPin(pool *kihv1.IPPool, claim specClaim) {
 	if err := c.ipam.ReleaseIP(pool.Spec.NetworkName, claim.ip); err != nil && !util.IsAlreadyReleased(err) {
 		log.Errorf("(ippool.dropSpecPin) cannot drop the ownerless pin of ip %s of VirtualMachineNetworkConfig %s/%s: %s",
 			claim.ip, claim.namespace, claim.name, err.Error())
-		c.metrics.UpdateLogStatus("error")
 	}
 }
 
