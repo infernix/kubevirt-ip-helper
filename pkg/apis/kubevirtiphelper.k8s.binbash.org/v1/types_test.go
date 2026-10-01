@@ -1,12 +1,48 @@
 package v1
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// The counters are published without omitempty so a consumer can tell a
+// fresh pool (used:0) from a pool whose status was never written, and can
+// see available:0 when the pool is exhausted instead of an absent field.
+func TestIPv4StatusPublishesZeroCounters(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status IPv4Status
+		want   []string
+	}{
+		{
+			name:   "exhausted pool",
+			status: IPv4Status{Allocated: map[string]string{}, Used: 10, Available: 0},
+			want:   []string{`"used":10`, `"available":0`, `"allocated":{}`},
+		},
+		{
+			name:   "fresh pool",
+			status: IPv4Status{Allocated: map[string]string{}, Used: 0, Available: 0},
+			want:   []string{`"used":0`, `"available":0`, `"allocated":{}`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.status)
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(string(raw), want) {
+					t.Errorf("marshalled status %s does not contain %s", raw, want)
+				}
+			}
+		})
+	}
+}
 
 func TestAddToSchemeRegistersKnownTypes(t *testing.T) {
 	scheme := runtime.NewScheme()

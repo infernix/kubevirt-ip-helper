@@ -1643,7 +1643,10 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[s
 
 	cPool.Status.LastUpdate = metav1.Now()
 
-	allocatedExcludes := make(map[string]string)
+	// Allocated is published without omitempty, so the rebuilt status always
+	// carries a non-nil map: a pool without exclusions or protected claims
+	// publishes {} instead of null.
+	allocatedExcludes := make(map[string]string, len(pool.Spec.IPv4Config.Pool.Exclude)+len(protectedClaims))
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
 		allocatedExcludes[v] = ipam.ExcludedOwner
 	}

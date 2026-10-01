@@ -295,6 +295,50 @@ func TestUpdateStatusPreservesCountersOfAnUnregisteredNetwork(t *testing.T) {
 	}
 }
 
+// A registered network whose addresses are all claimed publishes
+// available:0 on the status write, so an exhausted pool is
+// distinguishable from a status that was never written.
+func TestUpdateStatusPublishesZeroAvailableOfAnExhaustedPool(t *testing.T) {
+	ctx, client, allocator, api := newUpdateStatusEnv(t, 0, 0)
+
+	api.mu.Lock()
+	api.pool.Spec.NetworkName = "net-a"
+	api.mu.Unlock()
+
+	if err := allocator.NewSubnet("net-a", "10.0.0.0/29", "10.0.0.1", "10.0.0.6"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"} {
+		if _, err := allocator.ReclaimIP("net-a", ip, "ns/vm-a [02:00:00:00:00:01]"); err != nil {
+			t.Fatalf("ReclaimIP %s: %v", ip, err)
+		}
+	}
+
+	if err := UpdateStatus(ctx, client, allocator, EventAdd, "ns", "vm-a", "10.0.0.5", "net-a", "02:00:00:00:00:01", "pool-a"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if got := api.pool.Status.IPv4.Used; got != 6 {
+		t.Errorf("Used = %d, want 6 recomputed from the exhausted allocator", got)
+	}
+	if got := api.pool.Status.IPv4.Available; got != 0 {
+		t.Errorf("Available = %d, want 0 recomputed from the exhausted allocator", got)
+	}
+	if api.pool.Status.IPv4.Allocated == nil {
+		t.Error("Allocated = nil, want a non-nil map so the status publishes {} instead of null")
+	}
+
+	raw, err := json.Marshal(api.pool.Status)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"available":0`) {
+		t.Errorf("persisted status %s does not publish available:0", raw)
+	}
+}
+
 // A registered network keeps its counters recomputed from the live
 // allocator on every write, so the persisted status matches the serving
 // state of this era.

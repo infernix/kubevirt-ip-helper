@@ -83,7 +83,10 @@ func UpdateStatus(
 				return false, nil
 			}
 		}
-		updatedAllocated := make(map[string]string)
+		// Allocated is published without omitempty, so the write always
+		// carries a non-nil map: an empty ledger publishes {} instead of
+		// null.
+		updatedAllocated := make(map[string]string, len(currentPool.Status.IPv4.Allocated))
 
 		switch event {
 		case EventAdd:

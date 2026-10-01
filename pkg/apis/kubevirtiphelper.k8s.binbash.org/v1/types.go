@@ -90,9 +90,9 @@ type IPPoolStatus struct {
 }
 
 type IPv4Status struct {
-	Allocated map[string]string `json:"allocated,omitempty"`
-	Used      int               `json:"used,omitempty"`
-	Available int               `json:"available,omitempty"`
+	Allocated map[string]string `json:"allocated"`
+	Used      int               `json:"used"`
+	Available int               `json:"available"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
