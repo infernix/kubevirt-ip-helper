@@ -145,6 +145,8 @@ Metric predicates resolve the requested Service's current nonterminating Ready l
 
 Every polling command has a deadline-clamped watchdog. A deadline cannot pass by taking a grace re-probe; an ownership-regression signature fails immediately rather than being converted into a later pass.
 
+The guest console is captured with a reattaching loop rather than one long `virtctl console` call. Each attempt runs in the background with its own stdin keeper and keeps appending to the same `console-<label>.log`, so a websocket dropped when a worker is stopped and started again cannot freeze the run's console evidence; the guest's own sample sequence numbers make a reattach seamless. An attempt also ends when the console file has not grown for `E2E_CONSOLE_IDLE_TIMEOUT` seconds (default 20), which covers a websocket that stays open while delivering nothing. The attempt keeps its own stdin keeper and stays in the loop's process group, so the exit trap's group kill still reaches it, and only the attempt is replaced, never the run's console evidence.
+
 ## Diagnostics
 
 When cluster state, the kind binary, and a kubeconfig are available, `collect.sh` is invoked from the exit trap before deletion of a cluster owned by the run. Each command and the complete collection have hard deadlines, so best-effort diagnostic command failures are recorded without replacing an earlier test failure; failures to finalize required reports, evidence comparisons, or checksums do fail an otherwise successful run. The collection is written into the execution directory of the current run and contains:
@@ -161,6 +163,8 @@ When cluster state, the kind binary, and a kubeconfig are available, `collect.sh
 - kind-node CNI files, bridge state, runtime-network identities, and container-runtime information
 - `console-*.log` and `10-guest-samples.txt`, the compact index of fresh native samples
 - top-level `dhcp-*.pcap`, decoded `*.pcap.jsonl`, capture `*.pcap.stderr`, and `*.pcap.decode-errors` files for each passive observer capture
+
+A failing case additionally writes `failure-<case-id>.txt` into the run directory before the report is finalized: the case id, its description and predicate, the last 40 lines of the guest console, the last 20 decoded DHCP events, the `VirtualMachineInstance` YAML, the helper pods with their restart counts, and the helper Deployment's available replicas. Every command in it is bounded and best effort, so it adds evidence for a failure without replacing or delaying the failure itself, and it is an ordinary top-level artifact covered by `artifact-manifest.sha256`.
 
 For a retained cluster in the default lane:
 

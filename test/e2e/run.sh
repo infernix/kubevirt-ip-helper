@@ -134,13 +134,14 @@ die() {
 # One executed assertion with a stable id. The predicate runs directly so
 # predicates that record leader or reservation state keep their side effects.
 assert_case() { # <case-id> <name> <predicate> [args...]
-  local name="$2"
-  report_case_start "$1" "${name}"
+  local case_id="$1" name="$2"
+  report_case_start "${case_id}" "${name}"
   shift 2
   if "$@"; then
     log "ok: ${name}"
     report_case_pass "${name}"
   else
+    record_case_failure_diagnostics "${case_id}" "${name}" "$1"
     die "${name}"
   fi
 }
@@ -150,15 +151,59 @@ assert_case() { # <case-id> <name> <predicate> [args...]
 # still-open case, so the record carries the operation's id instead of landing on
 # the generic suite record.
 guard_case() { # <case-id> <name> <command> [args...]
-  local name="$2"
-  report_case_start "$1" "${name}"
+  local case_id="$1" name="$2"
+  report_case_start "${case_id}" "${name}"
   shift 2
   if "$@"; then
     log "ok: ${name}"
     report_case_pass "${name}"
     return 0
   fi
+  record_case_failure_diagnostics "${case_id}" "${name}" "$1"
   die "${name}"
+}
+
+# A failing case leaves a per-case evidence file next to the report. The console
+# tail and the decoded DHCP events are the two streams that explain a stalled or
+# silent guest, and the VMI dump plus helper pod state explain whether the helper
+# was still there. Every command is bounded and best effort: diagnostics must never
+# replace the failure that triggered them, so the function always returns success.
+record_case_failure_diagnostics() { # <case-id> <description> <predicate>
+  local case_id="$1" description="$2" predicate="$3" file
+  [ -n "${E2E_ARTIFACTS_DIR}" ] && [ -d "${E2E_ARTIFACTS_DIR}" ] || return 0
+  file="${E2E_ARTIFACTS_DIR}/failure-${case_id}.txt"
+  {
+    printf 'case: %s\n' "${case_id}"
+    printf 'description: %s\n' "${description}"
+    printf 'predicate: %s\n' "${predicate}"
+    printf '\n== guest console tail: %s ==\n' "${GUEST_CONSOLE:-unset}"
+    if [ -n "${GUEST_CONSOLE}" ] && [ -f "${GUEST_CONSOLE}" ]; then
+      tail -n 40 "${GUEST_CONSOLE}" || true
+    else
+      printf '(no guest console captured)\n'
+    fi
+    printf '\n== last DHCP events: %s ==\n' "${GUEST_EVENTS:-unset}"
+    if [ -n "${GUEST_EVENTS}" ] && [ -f "${GUEST_EVENTS}" ]; then
+      tail -n 20 "${GUEST_EVENTS}" || true
+    else
+      printf '(no DHCP events decoded)\n'
+    fi
+    printf '\n== VMI %s/%s ==\n' "${KIH_WORKLOAD_NAMESPACE}" "${KIH_VM_NAME}"
+    timeout --foreground --kill-after=1s "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+      -n "${KIH_WORKLOAD_NAMESPACE}" get vmi "${KIH_VM_NAME}" -o yaml ||
+      printf '(vmi dump unavailable)\n'
+    printf '\n== helper pods (restart counts) ==\n'
+    timeout --foreground --kill-after=1s "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+      -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
+      -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount,NODE:.spec.nodeName' ||
+      printf '(helper pods unavailable)\n'
+    printf '\n== helper deployment %s available replicas ==\n' "${HELPER_DEPLOYMENT}"
+    timeout --foreground --kill-after=1s "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+      -n "${KIH_HELPER_NAMESPACE}" get deployment "${HELPER_DEPLOYMENT}" \
+      -o jsonpath='{.status.availableReplicas}{"\n"}' ||
+      printf '(helper deployment unavailable)\n'
+  } >> "${file}" 2>&1 || true
+  return 0
 }
 
 # Records the first failing command before the EXIT trap finalizes the report.
@@ -441,6 +486,7 @@ wait_until() { # <case-id> <absolute SECONDS> <description> <predicate> [args...
     [ "${attempt}" -le "${remaining}" ] || attempt="${remaining}"
     run_pred_once "${attempt}" "$@" && rc=0 || rc=$?
     if [ "${rc}" -eq 2 ]; then
+      record_case_failure_diagnostics "${case_id}" "${description}" "$1"
       if [ "$1" = boot_network_or_lease_loss ]; then
         die "${description}: repeated DHCP lease lookup failures for guest MAC ${KIH_VM_MAC}"
       else
@@ -458,6 +504,7 @@ wait_until() { # <case-id> <absolute SECONDS> <description> <predicate> [args...
     [ "${nap}" -le "${remaining}" ] || nap="${remaining}"
     sleep "${nap}"
   done
+  record_case_failure_diagnostics "${case_id}" "${description}" "$1"
   die "deadline expired: ${description}"
 }
 
@@ -1272,6 +1319,7 @@ guest_continuity_after() { # <post-action sample sequence>
 
 start_guest_and_assert() { # <label> [absolute SECONDS deadline]
   local label="$1" pool config bridge target boot_deadline budget node sample_cutoff monitor_was_on
+  local attempt_pid last_size idle_deadline size _i
   GUEST_DEADLINE="${2:-$((SECONDS + E2E_VM_BOOT_TIMEOUT + 180))}"
   boot_deadline=$((SECONDS + E2E_VM_BOOT_TIMEOUT))
   [ "${boot_deadline}" -le "${GUEST_DEADLINE}" ] || boot_deadline="${GUEST_DEADLINE}"
@@ -1311,6 +1359,13 @@ print(json.dumps(dict(address=sys.argv[1]+"/"+str(net.prefixlen),
   # the same console file instead of freezing the evidence stream for the rest of the
   # run. Samples carry the guest's own sequence numbers, so a reattach is seamless.
   #
+  # A websocket that stays open while delivering nothing never ends the attempt, so
+  # the attempt also ends when the console file has not grown for
+  # ${E2E_CONSOLE_IDLE_TIMEOUT}s. The attempt runs in the background and is
+  # watched by size, which ends a silent stream and lets the next iteration
+  # reattach. The attempt stays in this subshell's process group, so the outer
+  # teardown's group kill still reaches it.
+  #
   # Each attempt gets its own stdin keeper: virtctl exits on stdin EOF, and a keeper
   # that a previous attempt left behind would make this attempt block on it forever.
   CONSOLE_FIFO="${GUEST_CONSOLE}.stdin"
@@ -1325,7 +1380,32 @@ print(json.dumps(dict(address=sys.argv[1]+"/"+str(net.prefixlen),
       CONSOLE_FEEDER_PID=$!
       timeout --foreground --kill-after=1s "${remaining}s" "${VIRTCTL}" \
         -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
-        --timeout="$(((remaining+59)/60))" < "${CONSOLE_FIFO}" >> "${GUEST_CONSOLE}" 2>&1 || true
+        --timeout="$(((remaining+59)/60))" < "${CONSOLE_FIFO}" >> "${GUEST_CONSOLE}" 2>&1 &
+      attempt_pid=$!
+      last_size="$(wc -c < "${GUEST_CONSOLE}")"
+      idle_deadline=$((SECONDS + E2E_CONSOLE_IDLE_TIMEOUT))
+      while kill -0 "${attempt_pid}" 2> /dev/null; do
+        sleep 1
+        size="$(wc -c < "${GUEST_CONSOLE}")"
+        if [ "${size}" != "${last_size}" ]; then
+          last_size="${size}"
+          idle_deadline=$((SECONDS + E2E_CONSOLE_IDLE_TIMEOUT))
+        elif [ "${SECONDS}" -ge "${idle_deadline}" ]; then
+          # Closing the feeder ends virtctl's stdin, and the escalating signals
+          # cover a websocket that ignores the EOF.
+          kill "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
+          kill -TERM "${attempt_pid}" 2> /dev/null || true
+          for _i in 1 2 3 4 5; do
+            kill -0 "${attempt_pid}" 2> /dev/null || break
+            sleep 1
+          done
+          if kill -0 "${attempt_pid}" 2> /dev/null; then
+            kill -KILL "${attempt_pid}" 2> /dev/null || true
+          fi
+          break
+        fi
+      done
+      wait "${attempt_pid}" 2> /dev/null || true
       kill "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
       wait "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
       rm -f "${CONSOLE_FIFO}"
