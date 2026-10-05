@@ -192,6 +192,13 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 				}
 			}
 		}
+		// the withdrawn or changed requests are recorded as a durable
+		// release marker on the object: the vmnetcfg controller releases
+		// their lease, ipam claim and ledger record instead of adopting a
+		// withdrawn address through its F02 quarantined-lease branch. the
+		// marker lives on the object, so the release survives a restart.
+		c.mergeStaticIPReleaseMarker(current, released)
+
 		current.Spec.NetworkConfig = c.scope.MergeSpec(current.Namespace, current.Spec.NetworkConfig, desired)
 		return nil
 	}); err != nil {
@@ -288,6 +295,63 @@ func releaseKey(vm *kubevirtV1.VirtualMachine) string {
 	return vm.Namespace + "/" + vm.Name
 }
 
+// mergeStaticIPReleaseMarker records the releases of this projection in the
+// durable release marker of the vmnetcfg object: every withdrawn or changed
+// request is named by its (qualified network, canonical macaddress) tuple and
+// the address the binding held. the address is resolved from the pre-merge
+// stored row, and from the binding's own live lease or held claim when the
+// earlier commit never recorded it. the vmnetcfg controller releases exactly
+// those bindings instead of adopting the withdrawn address through its F02
+// quarantined-lease branch, and clears the consumed entries. the marker lives
+// on the object, so the release survives a helper restart.
+func (c *Controller) mergeStaticIPReleaseMarker(vmnetcfg *kihv1.VirtualMachineNetworkConfig, released map[networkConfigIdentity]bool) {
+	if len(released) == 0 {
+		return
+	}
+
+	marker, err := util.ParseStaticIPReleaseMarker(vmnetcfg.Annotations)
+	if err != nil {
+		log.Warnf("(vm.mergeStaticIPReleaseMarker) [%s/%s] ignoring the static ip release marker: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err)
+
+		marker = nil
+	}
+	if marker == nil {
+		marker = make(map[string]string, len(released))
+	}
+
+	vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
+	for key := range released {
+		address := ""
+		for _, nic := range vmnetcfg.Spec.NetworkConfig {
+			if networkConfigKey(vmnetcfg.Namespace, nic.NetworkName, nic.MACAddress) == key {
+				address = nic.IPAddress
+
+				break
+			}
+		}
+		if address == "" {
+			if lease := c.dhcp.GetLease(key.mac); lease.Reference == vmRef && lease.PoolName == key.network && lease.ClientIP != nil {
+				address = lease.ClientIP.String()
+			}
+		}
+		if address == "" {
+			ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, key.mac)
+			if owned, found := c.ipam.IPOwnedBy(key.network, ownerRef); found {
+				address = owned
+			}
+		}
+
+		marker[util.StaticIPReleaseKey(key.network, key.mac)] = address
+	}
+
+	if vmnetcfg.Annotations == nil {
+		vmnetcfg.Annotations = make(map[string]string, 1)
+	}
+	vmnetcfg.Annotations[util.StaticIPReleaseAnnotationName] = util.EncodeStaticIPReleaseMarker(marker)
+}
+
 // verifyProjectionRows fences cleanup acknowledgements against changed owned
 // bindings. Foreign changes and newer IPs on still-desired NICs are mergeable.
 func (c *Controller) verifyProjectionRows(base, current *kihv1.VirtualMachineNetworkConfig, wanted map[networkConfigIdentity]bool, removed map[networkConfigIdentity]kihv1.NetworkConfig) error {
@@ -361,7 +425,7 @@ func (c *Controller) commitProjection(base *kihv1.VirtualMachineNetworkConfig, s
 			}
 			_, err = client.UpdateStatus(c.ctx, next, metav1.UpdateOptions{})
 		} else {
-			if reflect.DeepEqual(current.Spec.NetworkConfig, next.Spec.NetworkConfig) {
+			if reflect.DeepEqual(current.Spec.NetworkConfig, next.Spec.NetworkConfig) && reflect.DeepEqual(current.Annotations, next.Annotations) {
 				return nil
 			}
 			_, err = client.Update(c.ctx, next, metav1.UpdateOptions{})
@@ -524,7 +588,7 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 	// make sure it also stays compatible with Harvester
 	var harvesterMacs map[string]string
 	if vm.ObjectMeta.Annotations != nil {
-		if macAnnotation, exists := vm.ObjectMeta.Annotations["harvesterhci.io/mac-address"]; exists {
+		if macAnnotation, exists := vm.ObjectMeta.Annotations[util.HarvesterMACAnnotationName]; exists {
 			if err := json.Unmarshal([]byte(macAnnotation), &harvesterMacs); err != nil {
 				log.Warnf("(vm.getNetworkConfigs) [%s/%s] failed to parse harvesterhci.io/mac-address annotation: %s",
 					vm.Namespace, vm.Name, err)

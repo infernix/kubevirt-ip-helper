@@ -449,6 +449,21 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		return declared, nil
 	}
 
+	// the durable release marker of the object names the (network, macaddress)
+	// tuples whose static ip request the vm controller withdrew or changed:
+	// their binding must be released instead of adopted through the F02
+	// quarantined-lease branch, and the marker is cleared once every release
+	// converged. the marker lives on the object, so a helper restart replays
+	// the release.
+	releaseMarker, releaseMarkerErr := util.ParseStaticIPReleaseMarker(vmnetcfg.Annotations)
+	if releaseMarkerErr != nil {
+		log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ignoring the static ip release marker: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, releaseMarkerErr)
+
+		releaseMarker = nil
+	}
+	consumedReleaseKeys := make([]string, 0, len(releaseMarker))
+
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		// create a fresh nic status
 		netcfgStatus := kihv1.NetworkConfigStatus{}
@@ -597,6 +612,70 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 
 			continue
+		}
+
+		// the durable release marker: a withdrawn or changed static ip
+		// request whose address the vm controller cleared must have its
+		// binding released - the lease, the ipam claim and the ledger
+		// record - instead of being adopted through the F02
+		// quarantined-lease branch below, which cannot tell a withdrawal
+		// from a commit that failed before the spec recorded the
+		// assignment. the release is owner-validated and idempotent, and
+		// the marker entry is cleared once it converged.
+		releaseKey := util.StaticIPReleaseKey(v.NetworkName, v.MACAddress)
+		if releasedIP, marked := releaseMarker[releaseKey]; marked {
+			// a row which already records the released address has nothing
+			// to release: the release of an earlier attempt converged and
+			// only the marker entry is left to clear. an empty row is not
+			// that case even for an empty marker value: the address is
+			// resolved from the live binding below.
+			if v.IPAddress == "" || v.IPAddress != releasedIP {
+				ip := releasedIP
+				if ip == "" {
+					// the vm controller could not resolve the withdrawn
+					// address (the earlier commit never recorded it): the
+					// binding's own live lease still names it
+					vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+					if lease := c.dhcp.GetLease(v.MACAddress); lease.Reference == vmRef && lease.PoolName == v.NetworkName && lease.ClientIP != nil {
+						ip = lease.ClientIP.String()
+					}
+				}
+
+				if ip != "" {
+					log.Infof("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the static ip request of hwaddr %s in network %s was withdrawn, releasing the address %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName, ip)
+
+					oldNetcfg := kihv1.NetworkConfig{
+						NetworkName: v.NetworkName,
+						MACAddress:  v.MACAddress,
+						IPAddress:   ip,
+					}
+					if cleanupErr := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg, false); cleanupErr != nil {
+						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] failed to release the withdrawn address %s of hwaddr %s: %s",
+							vmnetcfg.Namespace, vmnetcfg.Name, ip, v.MACAddress, cleanupErr)
+
+						newVmNetCfgs = append(newVmNetCfgs, v)
+
+						for _, nic := range vmnetcfg.Status.NetworkConfig {
+							if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+								netcfgStatus.Status = nic.Status
+								netcfgStatus.Message = nic.Message
+								newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+								break
+							}
+						}
+
+						if restoreErr == nil {
+							restoreErr = cleanupErr
+						}
+
+						continue
+					}
+				}
+			}
+
+			consumedReleaseKeys = append(consumedReleaseKeys, releaseKey)
 		}
 
 		// a recorded address which another binding declares is released and
@@ -1489,12 +1568,62 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		return err
 	}
 
+	// every release of this sync converged: the consumed marker entries are
+	// dropped so the withdrawal is not released again by the next resync. a
+	// failed clear keeps the marker and the retried sync replays the
+	// idempotent release.
+	if len(consumedReleaseKeys) > 0 {
+		if err := c.clearStaticIPReleaseMarker(commitBase, consumedReleaseKeys); err != nil {
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot clear the static ip release marker: %w",
+				vmnetcfg.Namespace, vmnetcfg.Name, err)
+		}
+	}
+
 	if publishErr != nil {
 		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %w",
 			vmnetcfg.Namespace, vmnetcfg.Name, publishErr)
 	}
 
 	return
+}
+
+// clearStaticIPReleaseMarker drops the consumed entries from the durable
+// release marker of a vmnetcfg object and removes the annotation once no
+// entry is left. the write is owner-fenced like the spec commit, and it is
+// idempotent: an absent or malformed marker converges without a write (a
+// malformed one is dropped), so a retried clear never fails on the state it
+// already produced.
+func (c *Controller) clearStaticIPReleaseMarker(base *kihv1.VirtualMachineNetworkConfig, keys []string) error {
+	_, err := c.retryOwnedWrite(base, false, func(live *kihv1.VirtualMachineNetworkConfig) (bool, error) {
+		marker, parseErr := util.ParseStaticIPReleaseMarker(live.Annotations)
+		if parseErr != nil {
+			// a marker we cannot decode can never be consumed: drop it so
+			// it does not linger on the object forever
+			delete(live.Annotations, util.StaticIPReleaseAnnotationName)
+
+			return true, nil
+		}
+		if len(marker) == 0 {
+			return false, nil
+		}
+
+		for _, key := range keys {
+			delete(marker, key)
+		}
+
+		if encoded := util.EncodeStaticIPReleaseMarker(marker); encoded == "" {
+			delete(live.Annotations, util.StaticIPReleaseAnnotationName)
+		} else {
+			if live.Annotations == nil {
+				live.Annotations = make(map[string]string, 1)
+			}
+			live.Annotations[util.StaticIPReleaseAnnotationName] = encoded
+		}
+
+		return true, nil
+	})
+
+	return err
 }
 
 // findSiblingRecordingTuple reports the live VirtualMachineNetworkConfig

@@ -455,10 +455,14 @@ The annotation belongs on the VirtualMachine's own `metadata.annotations`, not o
 matching `networks[]` entry must be a Multus network served by an IPPool. The
 requested address is reserved if it is available: it wins over an address already
 recorded for that interface in the VMNetCfg object, and removing the annotation
-releases the address and returns the interface to a dynamic address. That release is
-driven by the helper's reconcile of the removal, so a helper restart in between
-keeps the stored address served until the next annotation change or NIC removal. A
-VM without the annotation keeps its previous behavior exactly.
+releases the address and returns the interface to a dynamic address. The release is
+durable: the VM controller records the withdrawn address in the
+`kubevirtiphelper.k8s.binbash.org/static-ip-release` annotation of the VMNetCfg
+object in the same write that clears the row, and the VMNetCfg reconcile releases
+the DHCP lease, the IPAM claim and the ledger record named by that marker, then
+clears the entry. A helper restart in between therefore still releases the address;
+until that reconcile runs the stored address stays served. A VM without the
+annotation keeps its previous behavior exactly.
 
 Admission rejects a VM whose annotation is malformed, names no interface of
 that VM, names an interface whose `networks[]` entry is missing, not Multus or has
@@ -482,22 +486,29 @@ by this annotation.
 
 The declaration also protects the address from the other direction: a declared
 address is never handed out by a dynamic allocation. Before the helper allocates
-a fresh address it reads the static-IP annotations of the cluster's
-VirtualMachines for that network (one cluster-wide read per network and
-reconcile) and skips every declared address, so a NIC which asks for nothing is
-served a different address. A NIC whose VMNetCfg row carries no address while
-its VM declares one for that interface claims exactly the declared address
-instead of allocating dynamically; the claim is owner-validated, so a declared
+a fresh address, and before it restores a recorded one, it reads the static-IP
+annotations of the cluster's VirtualMachines for that network (one cluster-wide
+read per network and reconcile, memoized across the NICs of the object) and
+skips every declared address, so a NIC which asks for nothing is served a
+different address. A NIC whose VMNetCfg row carries no address while its VM
+declares one for that interface claims exactly the declared address instead of
+allocating dynamically. A declaration is attributed to the VM and the interface
+which made it: an unannotated VM which shares a MAC never claims another VM's
+declaration, and the exclusion set is the union of every declared address, so two
+declarations of the same MAC both stay protected. The declaring interface's MAC is
+resolved the way the projection resolves it (the spec `macAddress` first, else the
+`harvesterhci.io/mac-address` annotation), and a declaration whose MAC is not yet
+known still excludes its address. The claim is owner-validated, so a declared
 address which another VM already holds is refused with the same ERROR status and
-retry as any other refused claim. If the annotation read fails, the helper logs
-it and allocates without the exclusion for that reconciliation; the next resync
-repeats the read, and a declared address which was taken in the meantime
-converges through the declaring NIC's ERROR-and-retry path. Adding the
-annotation to a running VM therefore changes the ledger immediately but not the
-guest: the reservation names the declared address for that NIC (the previously
-served address is released), while the guest keeps the address it was served
-until its next DHCP request, up to its lease time, and is answered with the
-declared one from then on.
+retry as any other refused claim. If the annotation read fails, the helper fails
+that reconciliation and retries: an unknown declaration set never allocates or
+restores an address, so a dynamic allocation can never durably take a declared
+address. A recorded address which another owner declares is released and
+reallocated. Adding the annotation to a running VM therefore changes the ledger
+immediately but not the guest: the reservation names the declared address for that
+NIC (the previously served address is released), while the guest keeps the address
+it was served until its next DHCP request, up to its lease time, and is answered
+with the declared one from then on.
 
 ### Status information
 
