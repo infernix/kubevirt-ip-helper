@@ -71,11 +71,13 @@ the new topology.
 ## Deployment topology
 
 Run one helper Deployment per served NetworkAttachmentDefinition (NAD), with
-one replica by default and optional additional same-network HA replicas. All
-helpers and NADs live in `kubevirt-ip-helper`; tenant VMs use qualified references
-such as `kubevirt-ip-helper/management`. A network is the NAD namespace/name, not a
-VLAN number. CNI supplies the interface and VLAN configuration: the helper does
-not create VLAN devices, NADs or IPPools.
+one replica by default and optional additional same-network HA replicas. The
+plain manifests keep all helpers and NADs in `kubevirt-ip-helper`; a Helm
+release installs its helpers and expects the NADs in the release namespace,
+which the chart enforces as `dhcp`. Tenant VMs use qualified references such as
+`kubevirt-ip-helper/management` (plain) or `dhcp/management` (Helm). A network is
+the NAD namespace/name, not a VLAN number. CNI supplies the interface and VLAN
+configuration: the helper does not create VLAN devices, NADs or IPPools.
 
 Configure the host bridge/trunk and existing NADs before starting helpers.
 Each served NAD must represent a distinct DHCP broadcast domain; two NAD names
@@ -119,16 +121,23 @@ The base helper manifest does not require Prometheus. Its optional shared monito
 discovers both network metrics Services. Existing installations must instead
 follow the stop-old/start-new cutover below.
 
+`deployments/webhook-deployment.yaml` creates (or reuses) the `dhcp` namespace
+and installs the singleton webhook - its ServiceAccount, namespace-scoped Secret
+Role/RoleBinding, Deployment, Service and TLS Secret - there, because the runtime
+pins that namespace for its config and admission identity. The helper Deployments
+above stay in `kubevirt-ip-helper`. An installation whose webhook still runs in
+`kubevirt-ip-helper` must be moved explicitly; see the webhook migration below.
+
 ### Deploying with Helm
 
-Install one release in namespace `kubevirt-ip-helper`; the example names it
+Install one release in namespace `dhcp`; the example names it
 `kubevirt-ip-helper`. The chart enforces the namespace and canonical webhook
 Service/ports because the singleton runtime pins its TLS/admission identity.
 Do not install one release per network.
 
 ```SH
 helm install kubevirt-ip-helper deployments/charts/kubevirt-ip-helper \
-  --namespace kubevirt-ip-helper --create-namespace \
+  --namespace dhcp --create-namespace \
   --skip-crds -f my-values.yaml
 ```
 
@@ -194,14 +203,16 @@ Both packaging paths use the same startup/liveness/readiness probes and graceful
 shutdown. Keep the helper health/metrics listener on 8080 for these probes.
 A healthy standby is ready without serving DHCP; each metrics Service selects
 only its own `kubevirtiphelper/leader: active` pod. The per-network Lease is
-`kubevirt-ip-helper-lock-<nad-name>` in `kubevirt-ip-helper`.
+`kubevirt-ip-helper-lock-<nad-name>` in the helper's namespace: `kubevirt-ip-helper`
+for the plain manifests, the release namespace (`dhcp`) for a Helm release.
 
 ### Shared webhook ownership
 
 The singleton webhook uses Service `kubevirt-ip-helper-webhook` in
-`kubevirt-ip-helper`, Service port 8080 and listener 8443. Its TLS Secret is
-`kubevirt-ip-helper-webhook-tls`; CSR and serving DNS identity derive from
-`kubevirt-ip-helper-webhook.kubevirt-ip-helper.svc`.
+`dhcp`, Service port 8080 and listener 8443. Its TLS Secret is
+`kubevirt-ip-helper-webhook-tls` in `dhcp`; CSR and serving DNS identity derive
+from `kubevirt-ip-helper-webhook.dhcp.svc`. The helper daemon keeps its own
+namespace and is unaffected by this move.
 
 The webhook creates `kubevirt-ip-helper-validator` at runtime; that
 ValidatingWebhookConfiguration is not owned by Helm. Before a full teardown,
@@ -258,15 +269,53 @@ new chart network replicas explicitly zero in the staging values and change
 them only after the stop/wait boundary. This handover intentionally interrupts
 DHCP rather than allowing unsafe overlap.
 
-Moving the helper to another namespace also moves its admission entries, because the
-entry names are namespace-qualified. The webhook of the new namespace prunes the
-entries of the previous one on startup, so **stop the old webhook together with the
-old helper** before the move: a webhook of the previous namespace re-adds its own
-entries every time it starts. Until the stale entries are pruned, the apiserver keeps
-calling a service which no longer exists, and the IPPool deletion gate fails closed
-(its entry carries the default `failurePolicy: Fail`), so every IPPool delete is
-rejected meanwhile. The prune only removes entries which serve this helper's own
-service name; entries of another product are left untouched.
+#### Moving the singleton webhook to `dhcp`
+
+An installation whose webhook still runs in `kubevirt-ip-helper` must be moved to
+`dhcp` explicitly, because the binary pins `dhcp` as its config/admission namespace
+and the chart refuses any other release namespace. The helper daemon is unaffected
+and keeps its own namespace. The old namespace's webhook re-adds its own admission
+entries every time it starts, and those entries are namespace-qualified
+(`kubevirt-ip-helper-webhook.kubevirt-ip-helper.svc`), so the move is ordered:
+
+1. Stop the old singleton webhook first and wait for its pod to terminate, while
+   the helpers keep running:
+   ```SH
+   kubectl -n kubevirt-ip-helper scale deployment/kubevirt-ip-helper-webhook --replicas=0
+   kubectl -n kubevirt-ip-helper wait --for=delete pod -l app=kubevirt-ip-helper-webhook --timeout=180s
+   ```
+   Once its Service is gone, the namespace-qualified IPPool deletion entry
+   (`failurePolicy: Fail`) rejects every IPPool delete until the new webhook
+   prunes the stale entries, so keep this window short.
+2. Ensure the `dhcp` namespace exists. `deployments/webhook-deployment.yaml`
+   creates it, or create it yourself: `kubectl create namespace dhcp`.
+3. Apply the new webhook objects in `dhcp`
+   (`kubectl apply -f deployments/webhook-deployment.yaml`, or the Helm release
+   with `--namespace dhcp`). The webhook issues a fresh CSR and TLS Secret for
+   `kubevirt-ip-helper-webhook.dhcp.svc`; the old
+   `kubevirt-ip-helper-webhook-tls` Secret is not reusable because its serving
+   DNS identity differs.
+4. On startup the new webhook prunes the stale `*.kubevirt-ip-helper.svc` entries
+   it owns and appends the `dhcp` ones. Verify the
+   `kubevirt-ip-helper-validator` ValidatingWebhookConfiguration now references
+   `kubevirt-ip-helper-webhook.dhcp.svc`, then confirm an IPPool delete is
+   admitted again.
+5. Delete the old-namespace resources: the `kubevirt-ip-helper-webhook`
+   Deployment, Service, ServiceAccount, namespace-scoped Secret Role/RoleBinding
+   and the `kubevirt-ip-helper-webhook-tls` Secret in `kubevirt-ip-helper`. The
+   `kube-system` cabundle Role/RoleBinding stay in place; only their subjects move
+   to `dhcp`.
+
+Moving the webhook to another namespace renames its admission entries, because
+the entry names are namespace-qualified (`<service>.<namespace>.svc`). The
+webhook of the new namespace prunes the entries of the previous one on startup,
+so **stop the old webhook before the move** (see the webhook move above): a
+webhook of the previous namespace re-adds its own entries every time it starts.
+Until the stale entries are pruned, the apiserver keeps calling a service which
+no longer exists, and the IPPool deletion gate fails closed (its entry carries
+the default `failurePolicy: Fail`), so every IPPool delete is rejected meanwhile.
+The prune only removes entries which serve this helper's own service name;
+entries of another product are left untouched.
 
 The normal migration assumes NADs already live in `kubevirt-ip-helper`.
 Moving a legacy NAD from another namespace into `kubevirt-ip-helper` changes network
@@ -330,6 +379,8 @@ EOF
 > must exactly equal that namespace/name. Its `bindinterface` must match the
 > helper's attachment. Selected mismatches are rejected before serving DHCP.
 > Do not move a live pool to another network by relabelling it; drain and recreate it.
+> The example uses the plain manifests' `kubevirt-ip-helper`; with the Helm chart
+> the qualified name is `<release-namespace>/<nad-name>` (the chart enforces `dhcp`).
 
 Create a VM using the same shared network, for example this two-NIC excerpt:
 
