@@ -60,11 +60,38 @@ func (s NetworkScope) Owns(objectNamespace, reference string) bool {
 		(objectNamespace == s.namespace && reference == s.name))
 }
 
+// MatchesPool reports whether the pool carries the identity of this scope's
+// network: the network and network-namespace labels name the scope, and the
+// pool's spec.networkname carries the scope's qualified namespace/name.
 func (s NetworkScope) MatchesPool(pool *kihv1.IPPool) bool {
-	return s.name != "" && pool != nil &&
-		pool.Labels[NetworkLabel] == s.name &&
-		pool.Labels[NetworkNamespaceLabel] == s.namespace &&
-		pool.Spec.NetworkName == s.networkName
+	return s.name != "" && PoolNetwork(pool) == s.networkName
+}
+
+// PoolNetwork returns the qualified network identity an IPPool serves, or ""
+// when the pool carries none. The identity is the pool's spec.networkname when
+// that name is itself a valid qualified namespace/name reference and the
+// network and network-namespace labels name the same namespace/name. That pair
+// is exactly what the helper's own registration requires - its discovery
+// selector matches both labels and its identity check requires the qualified
+// spec.networkname - so a pool with a bare spec.networkname, or with absent or
+// foreign labels, is never served by the helper and must not be treated as the
+// pool of its spec.networkname. One definition serves both the controller's
+// acceptance and the admission webhook's index, so the two can never drift.
+func PoolNetwork(pool *kihv1.IPPool) string {
+	if pool == nil {
+		return ""
+	}
+
+	namespace, name, qualified := strings.Cut(pool.Spec.NetworkName, "/")
+	if !qualified || !validNetworkLabel(namespace) || !validNetworkLabel(name) {
+		return ""
+	}
+
+	if pool.Labels[NetworkLabel] != name || pool.Labels[NetworkNamespaceLabel] != namespace {
+		return ""
+	}
+
+	return pool.Spec.NetworkName
 }
 
 // QualifyNetworkName returns a canonical comparison key, never a repaired stored

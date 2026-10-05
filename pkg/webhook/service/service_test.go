@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -466,8 +467,12 @@ func TestFindRecordedTuple(t *testing.T) {
 	}
 }
 
+// testPool builds a serving IPPool: its spec.networkname is the qualified
+// reference and its network labels name the same namespace/name, exactly as the
+// helper's own registration requires. a bare networkname would be a pool the
+// helper never serves, so it is left unlabelled.
 func testPool(name string, networkName string, start string, end string) *kihv1.IPPool {
-	return &kihv1.IPPool{
+	pool := &kihv1.IPPool{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: kihv1.IPPoolSpec{
 			NetworkName: networkName,
@@ -478,6 +483,15 @@ func testPool(name string, networkName string, start string, end string) *kihv1.
 			},
 		},
 	}
+
+	if namespace, network, qualified := strings.Cut(networkName, "/"); qualified {
+		pool.Labels = map[string]string{
+			util.NetworkLabel:          network,
+			util.NetworkNamespaceLabel: namespace,
+		}
+	}
+
+	return pool
 }
 
 // TestCheckNICIPAddress covers the ipaddress range guard of the vmnetcfg
@@ -856,5 +870,110 @@ func TestValidateVirtualMachineStaticIPsFailOpen(t *testing.T) {
 	response := h.validateVirtualMachine(context.Background(), virtualMachineReview(t, admissionv1.Create, vm, nil))
 	if !response.Allowed {
 		t.Fatalf("an unavailable IPPool list must fail open: %+v", response.Result)
+	}
+}
+
+// TestIPPoolByNetworkRequiresRegistrationIdentity pins the pool index of the
+// vmnetcfg and static-vm admission checks to the helper's own registration
+// identity: a pool must carry the qualified spec.networkname AND the network
+// labels naming the same namespace/name, or the helper never serves it. An
+// unlabelled legacy pool or a foreign-labelled pool which merely carries the
+// same spec.networkname must not win the index.
+func TestIPPoolByNetworkRequiresRegistrationIdentity(t *testing.T) {
+	serving := testPool("serving", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+
+	unlabelled := testPool("legacy", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+	unlabelled.Labels = nil
+
+	foreignNamespace := testPool("foreign", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+	foreignNamespace.Labels = map[string]string{util.NetworkLabel: "net-a", util.NetworkNamespaceLabel: "other"}
+
+	foreignName := testPool("foreign-name", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+	foreignName.Labels = map[string]string{util.NetworkLabel: "net-b", util.NetworkNamespaceLabel: "tenant"}
+
+	bareSpec := testPool("bare", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+	bareSpec.Spec.NetworkName = "net-a"
+
+	// the legacy unlabelled pool is listed first: the old first-wins index
+	// selected it and ignored the serving pool entirely
+	pools := &kihv1.IPPoolList{Items: []kihv1.IPPool{*unlabelled, *foreignNamespace, *foreignName, *bareSpec, *serving}}
+
+	index := ipPoolByNetwork(pools)
+
+	if got := index["tenant/net-a"]; got == nil || got.Name != "serving" {
+		t.Fatalf("the index selected %v, want the labelled serving pool", got)
+	}
+
+	if len(index) != 1 {
+		t.Fatalf("the index has %d entries, want only the serving network", len(index))
+	}
+}
+
+// TestIPPoolByNetworkTieBreakIsDeterministic pins the tie-break of several
+// pools which carry the same network identity (the helper's registration rejects
+// the duplicate at its next sync, but admission cannot see that race): the
+// newest creation timestamp wins, the greater name breaks a timestamp tie, and
+// the selection never depends on list order.
+func TestIPPoolByNetworkTieBreakIsDeterministic(t *testing.T) {
+	older := testPool("b-pool", "tenant/net-a", "192.168.11.100", "192.168.11.110")
+	older.CreationTimestamp = metav1.NewTime(time.Unix(1000, 0))
+	newer := testPool("a-pool", "tenant/net-a", "192.168.11.120", "192.168.11.130")
+	newer.CreationTimestamp = metav1.NewTime(time.Unix(2000, 0))
+
+	for _, items := range [][]kihv1.IPPool{{*older, *newer}, {*newer, *older}} {
+		index := ipPoolByNetwork(&kihv1.IPPoolList{Items: items})
+		if got := index["tenant/net-a"]; got == nil || got.Name != "a-pool" {
+			t.Fatalf("the index selected %v, want the newest pool a-pool", got)
+		}
+	}
+
+	first := testPool("pool-a", "tenant/net-a", "192.168.11.100", "192.168.11.110")
+	second := testPool("pool-b", "tenant/net-a", "192.168.11.120", "192.168.11.130")
+
+	for _, items := range [][]kihv1.IPPool{{*first, *second}, {*second, *first}} {
+		index := ipPoolByNetwork(&kihv1.IPPoolList{Items: items})
+		if got := index["tenant/net-a"]; got == nil || got.Name != "pool-b" {
+			t.Fatalf("the index selected %v, want the greater-named pool-b", got)
+		}
+	}
+}
+
+// TestValidateVmNetCfgUsesTheServingPool proves the regression the label-blind
+// index caused: an unlabelled legacy pool listed first used to win the index and
+// deny an address which the labelled serving pool of the same network serves.
+// Both the vmnetcfg range guard and the static-vm guard must use the serving
+// pool's range.
+func TestValidateVmNetCfgUsesTheServingPool(t *testing.T) {
+	legacy := testPool("legacy", "tenant/net-a", "192.168.11.200", "192.168.11.210")
+	legacy.Labels = nil // hand-created before the label scheme existed
+	serving := testPool("serving", "tenant/net-a", "192.168.11.100", "192.168.11.166")
+
+	pools := &kihv1.IPPoolList{Items: []kihv1.IPPool{*legacy, *serving}}
+	h := admissionTestHandler(t, pools, &kihv1.VirtualMachineNetworkConfigList{}, false)
+
+	insideServing := vmnetcfg("tenant", "cfg", "vm", kihv1.NetworkConfig{
+		NetworkName: "net-a", MACAddress: "02:00:00:00:00:01", IPAddress: "192.168.11.110",
+	})
+	if response := h.validateVmNetCfg(context.Background(), vmNetCfgReview(t, admissionv1.Create, insideServing, nil)); !response.Allowed {
+		t.Fatalf("the address served by the labelled pool was denied: %+v", response.Result)
+	}
+
+	insideLegacy := vmnetcfg("tenant", "cfg", "vm", kihv1.NetworkConfig{
+		NetworkName: "net-a", MACAddress: "02:00:00:00:00:01", IPAddress: "192.168.11.205",
+	})
+	if response := h.validateVmNetCfg(context.Background(), vmNetCfgReview(t, admissionv1.Create, insideLegacy, nil)); response.Allowed {
+		t.Fatalf("the address outside the serving pool range was admitted: %+v", response.Result)
+	}
+
+	vm := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.110"}`,
+		staticIPNic{name: "net-a", mac: "02:00:00:00:00:01", network: "net-a", multus: true})
+	if response := h.validateVirtualMachine(context.Background(), virtualMachineReview(t, admissionv1.Create, vm, nil)); !response.Allowed {
+		t.Fatalf("the static ip served by the labelled pool was denied: %+v", response.Result)
+	}
+
+	vmLegacy := staticIPVM("tenant", "vm", `{"net-a":"192.168.11.205"}`,
+		staticIPNic{name: "net-a", mac: "02:00:00:00:00:01", network: "net-a", multus: true})
+	if response := h.validateVirtualMachine(context.Background(), virtualMachineReview(t, admissionv1.Create, vmLegacy, nil)); response.Allowed {
+		t.Fatalf("the static ip outside the serving pool range was admitted: %+v", response.Result)
 	}
 }

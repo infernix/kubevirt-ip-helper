@@ -118,6 +118,36 @@ func TestQualifyNetworkName(t *testing.T) {
 	}
 }
 
+// TestPoolNetwork pins the shared registration identity: a pool serves its
+// spec.networkname only when that name is a qualified reference and the network
+// and network-namespace labels name the same namespace/name. The controller's
+// MatchesPool and the admission webhook's index both build on it, so the two can
+// never disagree about which pool serves a network.
+func TestPoolNetwork(t *testing.T) {
+	qualified := func(labels map[string]string, networkName string) *kihv1.IPPool {
+		return &kihv1.IPPool{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: kihv1.IPPoolSpec{NetworkName: networkName}}
+	}
+
+	for _, tc := range []struct {
+		name string
+		pool *kihv1.IPPool
+		want string
+	}{
+		{"serving", qualified(map[string]string{NetworkLabel: "management", NetworkNamespaceLabel: "infra"}, "infra/management"), "infra/management"},
+		{"unlabelled", qualified(nil, "infra/management"), ""},
+		{"foreign namespace label", qualified(map[string]string{NetworkLabel: "management", NetworkNamespaceLabel: "tenant"}, "infra/management"), ""},
+		{"foreign name label", qualified(map[string]string{NetworkLabel: "storage", NetworkNamespaceLabel: "infra"}, "infra/management"), ""},
+		{"bare spec.networkname", qualified(map[string]string{NetworkLabel: "management", NetworkNamespaceLabel: "infra"}, "management"), ""},
+		{"unqualified spec.networkname", qualified(map[string]string{NetworkLabel: "management", NetworkNamespaceLabel: "infra"}, "infra/management/extra"), ""},
+		{"empty spec.networkname", qualified(map[string]string{NetworkLabel: "management", NetworkNamespaceLabel: "infra"}, ""), ""},
+		{"nil pool", nil, ""},
+	} {
+		if got := PoolNetwork(tc.pool); got != tc.want {
+			t.Errorf("PoolNetwork(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestNetworkScopeSpecMergePreservesForeignRows(t *testing.T) {
 	scope := networkScopeForTest(t, "infra", "management")
 	foreignBare := kihv1.NetworkConfig{NetworkName: "management", MACAddress: "malformed", IPAddress: "not-an-ip"}

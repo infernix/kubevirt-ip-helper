@@ -409,24 +409,53 @@ func checkNICMACAddress(nc kihv1.NetworkConfig) (denied *string) {
 	return nil
 }
 
-// ipPoolByNetwork indexes the IPPools by their canonical network name. the
-// first pool of a network wins, mirroring the controller's own lookup, and a
-// pool without a valid network name is skipped.
+// ipPoolByNetwork indexes the IPPools by their canonical network name, keeping
+// only the pools which carry the identity of that network: util.PoolNetwork
+// requires the pool's spec.networkname to be the qualified namespace/name
+// reference and its network and network-namespace labels to name the same
+// namespace/name. that is exactly the identity the helper's own registration
+// selector and check require, so an unlabelled or foreign-labelled pool which
+// merely carries the same spec.networkname can no longer win the index and
+// supply the wrong range, excludes or ledger to the vmnetcfg and static-vm
+// admission checks.
+//
+// several pools can still carry the same identity: the helper's registration
+// rejects the duplicate at its next sync (its cache is keyed by the network
+// name), but admission cannot see that race. the newest by creation timestamp
+// wins, with the pool name as the deterministic tie-break (an absent timestamp
+// counts as the oldest), so the selected pool does not depend on list order.
 func ipPoolByNetwork(pools *kihv1.IPPoolList) map[string]*kihv1.IPPool {
 	poolByNetwork := map[string]*kihv1.IPPool{}
 
 	for i := range pools.Items {
-		network := util.QualifyNetworkName("", pools.Items[i].Spec.NetworkName)
+		pool := &pools.Items[i]
+
+		network := util.PoolNetwork(pool)
 		if network == "" {
 			continue
 		}
 
-		if _, exists := poolByNetwork[network]; !exists {
-			poolByNetwork[network] = &pools.Items[i]
+		current, exists := poolByNetwork[network]
+		if !exists || newerPool(pool, current) {
+			poolByNetwork[network] = pool
 		}
 	}
 
 	return poolByNetwork
+}
+
+// newerPool reports whether candidate is the pool to prefer of two pools which
+// carry the same network identity: the newest creation timestamp wins, and the
+// greater name breaks a timestamp tie.
+func newerPool(candidate, current *kihv1.IPPool) bool {
+	candidateCreated := candidate.CreationTimestamp.Time
+	currentCreated := current.CreationTimestamp.Time
+
+	if !candidateCreated.Equal(currentCreated) {
+		return candidateCreated.After(currentCreated)
+	}
+
+	return candidate.Name > current.Name
 }
 
 // validateVmNetCfgIPAddresses rejects the explicit ipaddress of a
