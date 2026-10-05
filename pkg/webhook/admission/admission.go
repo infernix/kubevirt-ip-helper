@@ -9,6 +9,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 	admregv1 "k8s.io/api/admissionregistration/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -312,7 +313,34 @@ func (h *Handler) virtualMachineWebhookName() string {
 // stale entry fails every IPPool delete once the old namespace's service is gone.
 // only the entries of this helper are pruned, matched on the serving service
 // name; the entries of another product stay untouched.
+//
+// a concurrent bootstrap (a second replica, or a rolling restart racing the
+// previous pod) can write the configuration between this read and the update
+// below. the update is idempotent, so a conflict is retried once against the
+// object the winner stored; a conflict which survives that retry is accepted
+// when a fresh read already carries every desired entry, because the Init path
+// panics on any surfaced error and a benign lost race must not fail the boot.
 func (h *Handler) ensureMissingWebhookEntries(ctx context.Context) (err error) {
+	for attempt := 1; ; attempt++ {
+		err = h.reconcileWebhookEntriesOnce(ctx)
+		if err == nil || !apierrors.IsConflict(err) || attempt >= 2 {
+			break
+		}
+	}
+
+	if err != nil && apierrors.IsConflict(err) && h.webhookEntriesConverged(ctx) {
+		log.Infof("(admission.ensureMissingWebhookEntries) the ValidatingWebhookConfiguration %s was concurrently reconciled by another bootstrap; its entries already match this version",
+			h.validatingWebhookConfigName)
+
+		return nil
+	}
+
+	return err
+}
+
+// reconcileWebhookEntriesOnce performs one read-modify-write of the
+// configuration's admission entries.
+func (h *Handler) reconcileWebhookEntriesOnce(ctx context.Context) (err error) {
 	vwc, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, h.validatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return
@@ -358,7 +386,7 @@ func (h *Handler) ensureMissingWebhookEntries(ctx context.Context) (err error) {
 			continue
 		}
 
-		if !reflect.DeepEqual(webhook, wanted) {
+		if !webhookEntriesEqual(webhook, wanted) {
 			replaced = append(replaced, webhook.Name)
 		}
 
@@ -387,6 +415,90 @@ func (h *Handler) ensureMissingWebhookEntries(ctx context.Context) (err error) {
 	}
 
 	return
+}
+
+// webhookEntriesEqual compares two entries on the shape the apiserver persists,
+// not on the raw values: the desired entries only carry the fields this version
+// owns while a GET returns every API-defaulted field populated (failurePolicy
+// Fail, matchPolicy Equivalent, the empty namespace and object selectors and a
+// 10s timeout). comparing the raw desired entry against the stored one therefore
+// always reported a change and rewrote a converged configuration on every
+// startup. normalizing both sides to the API-defaulted shape makes a converged
+// installation a genuine no-op, while drift in an owned field (failurePolicy,
+// rule, path, caBundle, ...) still differs and is repaired.
+func webhookEntriesEqual(a, b admregv1.ValidatingWebhook) bool {
+	return reflect.DeepEqual(withWebhookDefaults(a), withWebhookDefaults(b))
+}
+
+// withWebhookDefaults returns a copy of the entry with the fields the apiserver
+// defaults populated, so a comparison against a stored entry does not treat the
+// apiserver's own defaulting as drift. The defaults mirror
+// SetDefaults_ValidatingWebhook of admissionregistration/v1.
+func withWebhookDefaults(webhook admregv1.ValidatingWebhook) admregv1.ValidatingWebhook {
+	if webhook.FailurePolicy == nil {
+		policy := admregv1.Fail
+		webhook.FailurePolicy = &policy
+	}
+
+	if webhook.MatchPolicy == nil {
+		policy := admregv1.Equivalent
+		webhook.MatchPolicy = &policy
+	}
+
+	if webhook.NamespaceSelector == nil {
+		webhook.NamespaceSelector = &metav1.LabelSelector{}
+	}
+
+	if webhook.ObjectSelector == nil {
+		webhook.ObjectSelector = &metav1.LabelSelector{}
+	}
+
+	if webhook.TimeoutSeconds == nil {
+		timeout := int32(10)
+		webhook.TimeoutSeconds = &timeout
+	}
+
+	return webhook
+}
+
+// webhookEntriesConverged reports whether a fresh read of the configuration
+// already carries every desired entry (and none of this helper's stale ones),
+// so a conflict which survived the retry was a benign concurrent write of the
+// same state.
+func (h *Handler) webhookEntriesConverged(ctx context.Context) bool {
+	vwc, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, h.validatingWebhookConfigName, metav1.GetOptions{})
+	if err != nil {
+		return false
+	}
+
+	cert, err := h.getCaBundleFromCABundleConfigMap(ctx)
+	if err != nil {
+		return false
+	}
+
+	missing := make(map[string]admregv1.ValidatingWebhook)
+	for _, webhook := range h.desiredWebhooks(cert) {
+		missing[webhook.Name] = webhook
+	}
+
+	for i := range vwc.Webhooks {
+		if h.isStaleWebhookEntry(&vwc.Webhooks[i]) {
+			return false
+		}
+
+		wanted, ok := missing[vwc.Webhooks[i].Name]
+		if !ok {
+			continue
+		}
+
+		if !webhookEntriesEqual(vwc.Webhooks[i], wanted) {
+			return false
+		}
+
+		delete(missing, vwc.Webhooks[i].Name)
+	}
+
+	return len(missing) == 0
 }
 
 // isStaleWebhookEntry reports whether an entry was left behind by a previous

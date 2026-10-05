@@ -27,6 +27,14 @@ type admissionTestAPI struct {
 	updates  []admregv1.ValidatingWebhookConfiguration
 	caBundle string
 	server   *httptest.Server
+
+	// conflictPuts rejects this many initial updates with a 409 conflict, so a
+	// test can drive the lost race against a concurrent bootstrap.
+	conflictPuts int
+	// storeOnFinalConflict makes the API store the rejected update body when the
+	// last conflict is served, modelling the concurrent winner landing exactly
+	// the content it rejected.
+	storeOnFinalConflict bool
 }
 
 func newAdmissionTestAPI(t *testing.T, config *admregv1.ValidatingWebhookConfiguration) *admissionTestAPI {
@@ -51,6 +59,28 @@ func newAdmissionTestAPI(t *testing.T, config *admregv1.ValidatingWebhookConfigu
 			updated := admregv1.ValidatingWebhookConfiguration{}
 			if err := json.Unmarshal(body, &updated); err != nil {
 				t.Errorf("cannot decode the update body: %s", err)
+			}
+
+			if api.conflictPuts > 0 {
+				api.conflictPuts--
+
+				if api.storeOnFinalConflict && api.conflictPuts == 0 {
+					// the concurrent winner stored exactly the content it
+					// rejected this update with
+					api.config = &updated
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(metav1.Status{
+					TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+					Status:   metav1.StatusFailure,
+					Message:  "the object has been modified; please apply your changes to the latest version and try again",
+					Reason:   metav1.StatusReasonConflict,
+					Code:     http.StatusConflict,
+				})
+
+				return
 			}
 
 			api.config = &updated
@@ -376,5 +406,147 @@ func TestEnsureMissingWebhookEntriesReconcilesStaleContent(t *testing.T) {
 
 	if names := api.entryNames(); len(names) != len(wanted)+1 {
 		t.Errorf("entries = %v, want the four current entries plus the foreign one", names)
+	}
+}
+
+// apiDefaultWebhook returns the entry as the apiserver persists it: every field
+// this version's builders leave unset is populated by the API server's own
+// defaulting (failurePolicy Fail, matchPolicy Equivalent, the empty namespace
+// and object selectors and a 10s timeout). the test mirrors the documented
+// defaults explicitly rather than reusing the production normalizer, so it pins
+// the external contract instead of the implementation.
+func apiDefaultWebhook(webhook admregv1.ValidatingWebhook) admregv1.ValidatingWebhook {
+	if webhook.FailurePolicy == nil {
+		policy := admregv1.Fail
+		webhook.FailurePolicy = &policy
+	}
+
+	if webhook.MatchPolicy == nil {
+		policy := admregv1.Equivalent
+		webhook.MatchPolicy = &policy
+	}
+
+	if webhook.NamespaceSelector == nil {
+		webhook.NamespaceSelector = &metav1.LabelSelector{}
+	}
+
+	if webhook.ObjectSelector == nil {
+		webhook.ObjectSelector = &metav1.LabelSelector{}
+	}
+
+	if webhook.TimeoutSeconds == nil {
+		timeout := int32(10)
+		webhook.TimeoutSeconds = &timeout
+	}
+
+	return webhook
+}
+
+func apiDefaultWebhooks(webhooks []admregv1.ValidatingWebhook) []admregv1.ValidatingWebhook {
+	defaulted := make([]admregv1.ValidatingWebhook, 0, len(webhooks))
+	for _, webhook := range webhooks {
+		defaulted = append(defaulted, apiDefaultWebhook(webhook))
+	}
+
+	return defaulted
+}
+
+// TestEnsureMissingWebhookEntriesIsIdempotentOnDefaultedEntries proves the
+// reconcile is idempotent against the shape the apiserver actually stores: a GET
+// returns the API-defaulted entries (matchPolicy, the empty selectors and the
+// timeout populated), so a comparison on the raw desired entries reported a
+// change and rewrote the configuration on every startup. A converged, defaulted
+// configuration must produce no Update at all.
+func TestEnsureMissingWebhookEntriesIsIdempotentOnDefaultedEntries(t *testing.T) {
+	api := newAdmissionTestAPI(t, testConfig(t, apiDefaultWebhooks(currentEntries(t))))
+	handler := testHandler(t, api)
+
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("reconcile returned an error: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 0 {
+		t.Fatalf("updates = %d, want 0 for a converged, API-defaulted configuration", updates)
+	}
+}
+
+// TestEnsureMissingWebhookEntriesRepairsDefaultedDrift proves the normalization
+// does not hide a genuine drift: an API-defaulted configuration whose entry
+// carries a drifted owned field is still replaced, and the reconciled
+// configuration then converges to no further updates.
+func TestEnsureMissingWebhookEntriesRepairsDefaultedDrift(t *testing.T) {
+	stored := apiDefaultWebhooks(currentEntries(t))
+
+	driftedName := (&Handler{webhookName: "kubevirt-ip-helper-webhook", webhookNamespace: "dhcp"}).vmNetCfgWebhookName()
+	for i := range stored {
+		if stored[i].Name == driftedName {
+			policy := admregv1.Fail
+			stored[i].FailurePolicy = &policy
+		}
+	}
+
+	api := newAdmissionTestAPI(t, testConfig(t, stored))
+	handler := testHandler(t, api)
+
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("reconcile returned an error: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 1 {
+		t.Fatalf("updates = %d, want 1 for a genuine drift in an owned field", updates)
+	}
+
+	// the repaired configuration must converge on the next reconcile
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("second reconcile returned an error: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 1 {
+		t.Fatalf("updates = %d, want the repaired configuration to converge without a rewrite", updates)
+	}
+}
+
+// TestEnsureMissingWebhookEntriesRetriesAConcurrentUpdate proves a lost race
+// against a concurrent bootstrap does not fail the boot: the first update
+// conflicts, the reconciliation re-reads and retries, and the retry lands the
+// change.
+func TestEnsureMissingWebhookEntriesRetriesAConcurrentUpdate(t *testing.T) {
+	api := newAdmissionTestAPI(t, testConfig(t, nil))
+	api.conflictPuts = 1
+	handler := testHandler(t, api)
+
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("reconcile returned an error after a retried conflict: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 1 {
+		t.Fatalf("updates = %d, want the retry to persist the entries", updates)
+	}
+
+	if names := api.entryNames(); len(names) != 4 {
+		t.Fatalf("entries = %v, want the four desired entries", names)
+	}
+}
+
+// TestEnsureMissingWebhookEntriesToleratesAConcurrentWinner proves a conflict
+// which survives the retry does not panic the Init path when the concurrent
+// winner already stored the same converged entries: the fresh-read check
+// accepts it instead of surfacing the conflict.
+func TestEnsureMissingWebhookEntriesToleratesAConcurrentWinner(t *testing.T) {
+	api := newAdmissionTestAPI(t, testConfig(t, nil))
+	api.conflictPuts = 2
+	api.storeOnFinalConflict = true
+	handler := testHandler(t, api)
+
+	if err := handler.ensureMissingWebhookEntries(context.Background()); err != nil {
+		t.Fatalf("a benign concurrent winner must not surface an error: %s", err)
+	}
+
+	if updates := api.updateCount(); updates != 0 {
+		t.Fatalf("updates = %d, want 0 (the concurrent winner persisted the entries)", updates)
+	}
+
+	if names := api.entryNames(); len(names) != 4 {
+		t.Fatalf("entries = %v, want the winner's four converged entries", names)
 	}
 }
