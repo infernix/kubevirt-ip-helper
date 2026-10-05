@@ -628,7 +628,7 @@ Then push it to the remote container registry target, for example:
 Use the webhook-deployment.yaml template which is located in the deployments directory, for example:
 
 ```SH
-kubectl create -f deployments/webhook-deployment.yaml
+kubectl apply -f deployments/webhook-deployment.yaml
 ```
 
 ### Webhook logging
