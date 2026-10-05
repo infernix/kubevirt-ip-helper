@@ -1,8 +1,18 @@
+# The webhook is a cluster singleton which watches dhcp (the namespace the
+# runtime pins for its config and admission identity). Every namespaced webhook
+# object below lives here; the helper daemon stays in its own namespace. The
+# namespace may already exist (the estate catalogue uses it for NADs/IPPools), so
+# this object only creates it when missing and carries no labels of its own.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dhcp
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
   labels:
     app: kubevirt-ip-helper-webhook
 ---
@@ -47,13 +57,13 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
   labels:
     app: kubevirt-ip-helper-webhook
 rules:
@@ -65,7 +75,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
   labels:
     app: kubevirt-ip-helper-webhook
 roleRef:
@@ -75,7 +85,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -104,7 +114,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -112,7 +122,7 @@ metadata:
   labels:
     app: kubevirt-ip-helper-webhook
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
 spec:
   progressDeadlineSeconds: 600
   replicas: 1
@@ -193,7 +203,7 @@ metadata:
   labels:
     app: kubevirt-ip-helper-webhook
   name: kubevirt-ip-helper-webhook
-  namespace: kubevirt-ip-helper
+  namespace: dhcp
 spec:
   selector:
     app: kubevirt-ip-helper-webhook
