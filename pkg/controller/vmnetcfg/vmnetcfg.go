@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,15 @@ const hijackErrorStatusMessage = "vmnetcfg was manually created after this progr
 // controller-managed, which is the admission condition of the orphan
 // sweep: a manually created vmnetcfg without it is never swept.
 const vmnetcfgCleanupFinalizer = "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"
+
+// staticIPDeclarationLookupAttempts and staticIPDeclarationLookupBackoff
+// bound the retry of a static-ip declaration read inside one reconciliation:
+// the lookup fails the sync closed, so a transient api error gets a short
+// in-sync retry before the rate-limited resync takes over.
+const (
+	staticIPDeclarationLookupAttempts = 3
+	staticIPDeclarationLookupBackoff  = 50 * time.Millisecond
+)
 
 // allocatedNetworkConfig tracks one fully applied interface allocation of a
 // vmnetcfg object so it can be reverted if the durable object update fails.
@@ -381,32 +391,62 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 	// declaredAddressesFor memoizes the static-ip declarations of this
 	// reconciliation per network: the walk over the cluster's virtual
-	// machines runs at most once for a network which reaches the
-	// fresh-allocation path, so a multi-nic object pays one LIST and a
-	// nic whose binding is intact pays none. the lookup is fail-soft:
-	// when it fails the declarations are unknown for this sync and the
-	// allocation path falls back to its pre-existing behavior.
+	// machines runs at most once for a network, so a multi-nic object pays
+	// one LIST. the declarations are consulted on the fresh-allocation
+	// path (a declared address is never handed out dynamically) and on the
+	// recorded-address restore path (an address another owner declares is
+	// released and reallocated instead of being restored durably). the
+	// lookup fails the sync closed: a dynamic allocation without the
+	// exclusions could durably take a declared address, so an unknown
+	// declaration set must not allocate. the failure is bounded by a short
+	// retry inside the sync; a failure which survives it is cached for the
+	// remaining nics of the reconciliation.
 	declarationsByNetwork := make(map[string][]declaredAddress)
-	declaredAddressesFor := func(networkName string) []declaredAddress {
+	declarationFailures := make(map[string]error)
+	declaredAddressesFor := func(networkName string) ([]declaredAddress, error) {
 		if declared, cached := declarationsByNetwork[networkName]; cached {
-			return declared
+			return declared, nil
+		}
+		if declarationErr, failed := declarationFailures[networkName]; failed {
+			return nil, declarationErr
+		}
+		if c.staticIPDeclarations == nil {
+			declarationsByNetwork[networkName] = nil
+
+			return nil, nil
 		}
 
 		var declared []declaredAddress
-		if c.staticIPDeclarations != nil {
-			var declarationErr error
-			declared, declarationErr = c.staticIPDeclarations(networkName)
-			if declarationErr != nil {
-				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s, allocating without the exclusion for this sync: %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, networkName, declarationErr)
+		var declarationErr error
 
-				declared = nil
+	lookup:
+		for attempt := range staticIPDeclarationLookupAttempts {
+			declared, declarationErr = c.staticIPDeclarations(networkName)
+			if declarationErr == nil {
+				break
 			}
+			if attempt < staticIPDeclarationLookupAttempts-1 {
+				select {
+				case <-c.ctx.Done():
+					declarationErr = c.ctx.Err()
+
+					break lookup
+				case <-time.After(staticIPDeclarationLookupBackoff):
+				}
+			}
+		}
+		if declarationErr != nil {
+			log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s, failing the sync closed: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, networkName, declarationErr)
+
+			declarationFailures[networkName] = declarationErr
+
+			return nil, declarationErr
 		}
 
 		declarationsByNetwork[networkName] = declared
 
-		return declared
+		return declared, nil
 	}
 
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
@@ -557,6 +597,77 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 
 			continue
+		}
+
+		// a recorded address which another binding declares is released and
+		// reallocated: the durable restore must not keep an address which a
+		// declaration claims for another owner. the F02 adoption below is
+		// deliberately outside this rule - its served address stays
+		// continuously reserved even while another vm declares it, which is
+		// the case the branch exists for. the lookup fails the sync closed:
+		// an unknown declaration set must not restore an address it might
+		// have to release.
+		if v.IPAddress != "" {
+			declared, declErr := declaredAddressesFor(v.NetworkName)
+			if declErr != nil {
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s for hwaddr %s, skipping interface: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.NetworkName, v.MACAddress, declErr)
+
+				newVmNetCfgs = append(newVmNetCfgs, v)
+
+				for _, nic := range vmnetcfg.Status.NetworkConfig {
+					if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+						netcfgStatus.Status = nic.Status
+						netcfgStatus.Message = nic.Message
+						newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+						break
+					}
+				}
+
+				if restoreErr == nil {
+					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s: %w",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.NetworkName, declErr)
+				}
+
+				continue
+			}
+
+			if declaredAddressOfAnotherOwner(declared, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress, v.IPAddress) &&
+				!declaredAddressOwnedBy(declared, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress, v.IPAddress) {
+				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the recorded address %s of hwaddr %s in network %s is declared by another owner, releasing it and allocating again",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.MACAddress, v.NetworkName)
+
+				oldNetcfg := kihv1.NetworkConfig{
+					NetworkName: v.NetworkName,
+					MACAddress:  v.MACAddress,
+					IPAddress:   v.IPAddress,
+				}
+				if cleanupErr := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg, false); cleanupErr != nil {
+					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] failed to release the address %s declared by another owner for hwaddr %s: %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.MACAddress, cleanupErr)
+
+					newVmNetCfgs = append(newVmNetCfgs, v)
+
+					for _, nic := range vmnetcfg.Status.NetworkConfig {
+						if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+							netcfgStatus.Status = nic.Status
+							netcfgStatus.Message = nic.Message
+							newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+							break
+						}
+					}
+
+					if restoreErr == nil {
+						restoreErr = cleanupErr
+					}
+
+					continue
+				}
+
+				v.IPAddress = ""
+			}
 		}
 
 		// handle address and network changes in the vmnetcfg object: the
@@ -982,10 +1093,30 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 
 			// the static-ip declarations of the network: a declared
-			// address must never be handed out dynamically, and the nic
-			// whose vm declares one claims exactly that address instead
-			// of a fresh allocation
-			declared := declaredAddressesFor(v.NetworkName)
+			// address must never be handed out dynamically. the lookup
+			// fails the sync closed, so an unknown declaration set never
+			// allocates an unprotected address.
+			declared, declErr := declaredAddressesFor(v.NetworkName)
+			if declErr != nil {
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s for hwaddr %s, skipping interface: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.NetworkName, v.MACAddress, declErr)
+
+				newVmNetCfgs = append(newVmNetCfgs, v)
+
+				netcfgStatus.Status = "ERROR"
+				netcfgStatus.Message = fmt.Sprintf("cannot read the static ip declarations of network %s: %s", v.NetworkName, declErr)
+				newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+				if restoreErr == nil {
+					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s: %w",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.NetworkName, declErr)
+				}
+
+				continue
+			}
+
+			// the nic whose vm declares an address for this very interface
+			// claims exactly that address instead of a fresh allocation
 			if declaredIP, declares := declaredForBinding(declared, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress); declares {
 				// the row carries no address while its vm declares one for
 				// this very nic: claim the declared address, so the nic is
