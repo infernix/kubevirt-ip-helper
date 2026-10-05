@@ -1,7 +1,6 @@
 package vmnetcfg
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
@@ -11,8 +10,14 @@ import (
 )
 
 // Tests for the static-ip declaration contract on the allocation path: a
-// declared address is never handed out dynamically, and the nic whose vm
-// declares one claims exactly that address.
+// declared address is never handed out dynamically, the nic whose vm declares
+// one claims exactly that address, and a declaration belongs to the vm and
+// the nic which made it.
+
+// declaredRecord builds one declaration record of the walk.
+func declaredRecord(namespace, name, nic, mac, address string) declaredAddress {
+	return declaredAddress{namespace: namespace, name: name, nic: nic, mac: mac, address: address}
+}
 
 // TestVMNetCfgDynamicAllocationSkipsDeclaredAddress pins the exclusion half
 // of the contract: a dynamic allocation never takes an address some vm
@@ -23,13 +28,13 @@ func TestVMNetCfgDynamicAllocationSkipsDeclaredAddress(t *testing.T) {
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
-	declaringRef := testNamespace + "/declaring-vm [02:00:00:00:00:99]"
-	e.controller.staticIPDeclarations = func(networkName string) (map[string]string, error) {
+	declaringRef := "declaring-ns/declaring-vm [02:00:00:00:00:99]"
+	e.controller.staticIPDeclarations = func(networkName string) ([]declaredAddress, error) {
 		if networkName != testNetwork {
 			t.Errorf("declaration lookup for %q, want %q", networkName, testNetwork)
 		}
 
-		return map[string]string{"02:00:00:00:00:99": "10.0.0.1"}, nil
+		return []declaredAddress{declaredRecord("declaring-ns", "declaring-vm", "net1", "02:00:00:00:00:99", "10.0.0.1")}, nil
 	}
 
 	vmnetcfg := newVMNetCfg("", testMAC)
@@ -66,10 +71,10 @@ func TestVMNetCfgDeclaredAddressIsClaimed(t *testing.T) {
 	e.seedPool(nil)
 
 	calls := 0
-	e.controller.staticIPDeclarations = func(string) (map[string]string, error) {
+	e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
 		calls++
 
-		return map[string]string{testMAC: "10.0.0.2"}, nil
+		return []declaredAddress{declaredRecord(testNamespace, testVMName, "net1", testMAC, "10.0.0.2")}, nil
 	}
 
 	vmnetcfg := newVMNetCfg("", testMAC)
@@ -121,8 +126,8 @@ func TestVMNetCfgDeclaredAddressRefusedWhenTaken(t *testing.T) {
 	}
 	e.seedPool(map[string]string{"10.0.0.2": foreignRef})
 
-	e.controller.staticIPDeclarations = func(string) (map[string]string, error) {
-		return map[string]string{testMAC: "10.0.0.2"}, nil
+	e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
+		return []declaredAddress{declaredRecord(testNamespace, testVMName, "net1", testMAC, "10.0.0.2")}, nil
 	}
 
 	vmnetcfg := newVMNetCfg("", testMAC)
@@ -149,36 +154,74 @@ func TestVMNetCfgDeclaredAddressRefusedWhenTaken(t *testing.T) {
 	}
 }
 
-// TestVMNetCfgDeclarationLookupFailureIsFailSoft pins the fail-soft choice
-// for a lookup failure: the reconciliation proceeds with the pre-existing
-// allocation behavior (logged, not failed), so a transient api read never
-// blocks the object's other interfaces.
-func TestVMNetCfgDeclarationLookupFailureIsFailSoft(t *testing.T) {
+// TestVMNetCfgDeclarationAttribution pins the ownership half of the contract:
+// a declaration belongs to the vm which made it, so a binding of another vm
+// which shares the declared macaddress never claims it, and the declared
+// address stays free for its declarer.
+func TestVMNetCfgDeclarationAttribution(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
-	e.controller.staticIPDeclarations = func(string) (map[string]string, error) {
-		return nil, errors.New("api read failed")
+	declaringRef := testNamespace + "/declaring-vm [" + testMAC + "]"
+	e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
+		// the declaring vm shares this binding's macaddress
+		return []declaredAddress{declaredRecord(testNamespace, "declaring-vm", "net1", testMAC, "10.0.0.1")}, nil
 	}
 
 	vmnetcfg := newVMNetCfg("", testMAC)
 	e.seedVMNetCfg(vmnetcfg)
 
 	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
-		t.Fatalf("a declaration lookup failure must not fail the sync: %s", err)
+		t.Fatalf("unexpected error: %s", err)
 	}
 
 	stored := e.getStoredVMNetCfg()
-	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" && got != "10.0.0.2" {
-		t.Errorf("spec ip = %q, want one of the pool addresses", got)
+	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.2" {
+		t.Errorf("spec ip = %q, want the undeclared 10.0.0.2: the declaration belongs to declaring-vm", got)
 	}
-	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
-		t.Errorf("status = %q, want OK", got)
+
+	// the declaration of the other vm stayed free for its own binding
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", declaringRef); err != nil {
+		t.Errorf("the declared address must stay claimable by its declarer: %s", err)
 	}
-	if v, ok := e.metricValue(metricAppLogs, map[string]string{"loglevel": "warning"}); !ok || v < 1 {
-		t.Errorf("warning log metric = %v (present %v), want >= 1", v, ok)
+}
+
+// TestVMNetCfgDynamicAllocationSkipsEverySameMACDeclaration pins that the
+// exclusion is the union of every declared address: two declarations which
+// share a macaddress must not overwrite each other, or a dynamic allocation
+// takes the dropped one.
+func TestVMNetCfgDynamicAllocationSkipsEverySameMACDeclaration(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.3")
+	e.seedPool(nil)
+
+	e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
+		return []declaredAddress{
+			declaredRecord("tenant-a", "vm-a", "net1", testMAC, "10.0.0.1"),
+			declaredRecord("tenant-b", "vm-b", "net1", testMAC, "10.0.0.2"),
+		}, nil
+	}
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.3" {
+		t.Errorf("spec ip = %q, want the undeclared 10.0.0.3: both same-mac declarations are excluded", got)
+	}
+
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "tenant-a/vm-a ["+testMAC+"]"); err != nil {
+		t.Errorf("vm-a's declared address must stay claimable: %s", err)
+	}
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", "tenant-b/vm-b ["+testMAC+"]"); err != nil {
+		t.Errorf("vm-b's declared address must stay claimable: %s", err)
 	}
 }
 
@@ -193,10 +236,10 @@ func TestVMNetCfgDeclarationLookupScope(t *testing.T) {
 		e.seedPool(nil)
 
 		calls := 0
-		e.controller.staticIPDeclarations = func(string) (map[string]string, error) {
+		e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
 			calls++
 
-			return map[string]string{testMAC: "10.0.0.1"}, nil
+			return []declaredAddress{declaredRecord(testNamespace, testVMName, "net1", testMAC, "10.0.0.1")}, nil
 		}
 
 		vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
@@ -238,7 +281,7 @@ func TestVMNetCfgDeclarationLookupScope(t *testing.T) {
 		e.seedPool(nil)
 
 		calls := 0
-		e.controller.staticIPDeclarations = func(string) (map[string]string, error) {
+		e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
 			calls++
 
 			return nil, nil

@@ -385,20 +385,14 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	// fresh-allocation path, so a multi-nic object pays one LIST and a
 	// nic whose binding is intact pays none. the lookup is fail-soft:
 	// when it fails the declarations are unknown for this sync and the
-	// allocation path falls back to its pre-existing behavior, instead of
-	// failing an object whose other interfaces still restore and whose
-	// lease/claim state is already applied. the window is one transient
-	// api failure wide and the next resync repeats the lookup; a declared
-	// address which was taken in the meantime converges through the
-	// declaring nic's ERROR status and its steady-state retry, exactly
-	// like any other refused claim.
-	declarationsByNetwork := make(map[string]map[string]string)
-	declaredAddressesFor := func(networkName string) map[string]string {
+	// allocation path falls back to its pre-existing behavior.
+	declarationsByNetwork := make(map[string][]declaredAddress)
+	declaredAddressesFor := func(networkName string) []declaredAddress {
 		if declared, cached := declarationsByNetwork[networkName]; cached {
 			return declared
 		}
 
-		var declared map[string]string
+		var declared []declaredAddress
 		if c.staticIPDeclarations != nil {
 			var declarationErr error
 			declared, declarationErr = c.staticIPDeclarations(networkName)
@@ -992,7 +986,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			// whose vm declares one claims exactly that address instead
 			// of a fresh allocation
 			declared := declaredAddressesFor(v.NetworkName)
-			if declaredIP, declares := declared[util.CanonicalHWAddr(v.MACAddress)]; declares {
+			if declaredIP, declares := declaredForBinding(declared, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress); declares {
 				// the row carries no address while its vm declares one for
 				// this very nic: claim the declared address, so the nic is
 				// never served an address its vm did not ask for (the

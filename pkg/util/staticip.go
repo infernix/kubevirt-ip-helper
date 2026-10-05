@@ -14,6 +14,13 @@ import (
 // of the vm spec, never by a vlan number.
 const StaticIPAnnotationName = "kubevirtiphelper.k8s.binbash.org/static-ip"
 
+// HarvesterMACAnnotationName is the Harvester-assigned macaddress annotation
+// of a VirtualMachine: a json object keyed by the vm interface name. The vm
+// projection falls back to it while the vm spec does not carry a macaddress
+// yet, and the static-ip declaration walk resolves the declaring interface's
+// macaddress with the same precedence.
+const HarvesterMACAnnotationName = "harvesterhci.io/mac-address"
+
 // ParseStaticIPAnnotation decodes the static ip annotation of a vm into a
 // map of interface name to a canonical ipv4 address. A missing, empty or
 // empty-valued annotation yields no requests at all, so a vm without the

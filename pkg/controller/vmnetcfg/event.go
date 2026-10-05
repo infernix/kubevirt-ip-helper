@@ -231,9 +231,10 @@ func (e *EventHandler) EventListener() (err error) {
 	// cluster: a declared address must never be handed out dynamically,
 	// and the declaring nic claims exactly its declared address. the
 	// cluster-wide LIST runs at most once per network and reconciliation
-	// (the caller memoizes it), never per packet and never per nic, and a
-	// listing failure is fail-soft at the call site.
-	controller.staticIPDeclarations = func(networkName string) (map[string]string, error) {
+	// (the caller memoizes it), never per packet and never per nic; a
+	// listing failure fails the sync closed, so no address is allocated
+	// without the exclusions.
+	controller.staticIPDeclarations = func(networkName string) ([]declaredAddress, error) {
 		vms, err := e.kcli.VirtualMachine("").List(&metav1.ListOptions{})
 		if err != nil {
 			return nil, err
