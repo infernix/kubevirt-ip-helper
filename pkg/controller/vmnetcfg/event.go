@@ -226,6 +226,21 @@ func (e *EventHandler) EventListener() (err error) {
 
 		return true, nil
 	}
+
+	// the allocation path reads the static-ip declarations of the
+	// cluster: a declared address must never be handed out dynamically,
+	// and the declaring nic claims exactly its declared address. the
+	// cluster-wide LIST runs at most once per network and reconciliation
+	// (the caller memoizes it), never per packet and never per nic, and a
+	// listing failure is fail-soft at the call site.
+	controller.staticIPDeclarations = func(networkName string) (map[string]string, error) {
+		vms, err := e.kcli.VirtualMachine("").List(&metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		return declaredAddresses(vms, networkName), nil
+	}
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

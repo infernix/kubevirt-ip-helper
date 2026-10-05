@@ -318,6 +318,24 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 // the binding's restore path reclaims with, so a resynchronized binding
 // stays idempotent.
 func (a *IPAllocator) AllocateIP(name string, owner string) (string, error) {
+	return a.AllocateIPExcluding(name, owner, nil)
+}
+
+// AllocateIPExcluding allocates like AllocateIP while skipping every
+// address of the excluded set: a virtual machine can declare an address
+// for one of its nics through the static-ip annotation, and the declaring
+// binding claims that address through ReclaimIPClaimant. A fresh
+// allocation which ran before that claim would otherwise take the
+// declared address and hand it to a guest whose vm never asked for it,
+// refusing the declaring nic in exchange. The exclusion is therefore the
+// allocator-side half of the declaration contract: a declared address is
+// never handed out dynamically, whether it is free or not. An excluded
+// address is treated exactly like an allocated one, so a pool whose free
+// addresses are all declared reports the same exhaustion error as a full
+// pool. The keys must carry the canonical spelling of the allocation
+// state (the v4 form of any v4-in-v6 input), like every other key of the
+// allocator.
+func (a *IPAllocator) AllocateIPExcluding(name string, owner string, excluded map[string]bool) (string, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -330,13 +348,15 @@ func (a *IPAllocator) AllocateIP(name string, owner string) (string, error) {
 	}
 
 	for ip, allocated := range a.ipam[name].ips {
-		if !allocated {
-			a.ipam[name].ips[ip] = true
-			a.ipam[name].owners[ip] = owner
-			delete(a.ipam[name].attributed, ip)
-
-			return ip, nil
+		if allocated || excluded[ip] {
+			continue
 		}
+
+		a.ipam[name].ips[ip] = true
+		a.ipam[name].owners[ip] = owner
+		delete(a.ipam[name].attributed, ip)
+
+		return ip, nil
 	}
 
 	return "", fmt.Errorf("no more ips left in network %s", name)

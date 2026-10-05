@@ -429,6 +429,25 @@ warning and no projection here. The pre-existing CR field
 for its VM and MAC, or refused by the owning helper with an ERROR status, unchanged
 by this annotation.
 
+The declaration also protects the address from the other direction: a declared
+address is never handed out by a dynamic allocation. Before the helper allocates
+a fresh address it reads the static-IP annotations of the cluster's
+VirtualMachines for that network (one cluster-wide read per network and
+reconcile) and skips every declared address, so a NIC which asks for nothing is
+served a different address. A NIC whose VMNetCfg row carries no address while
+its VM declares one for that interface claims exactly the declared address
+instead of allocating dynamically; the claim is owner-validated, so a declared
+address which another VM already holds is refused with the same ERROR status and
+retry as any other refused claim. If the annotation read fails, the helper logs
+it and allocates without the exclusion for that reconciliation; the next resync
+repeats the read, and a declared address which was taken in the meantime
+converges through the declaring NIC's ERROR-and-retry path. Adding the
+annotation to a running VM therefore changes the ledger immediately but not the
+guest: the reservation names the declared address for that NIC (the previously
+served address is released), while the guest keeps the address it was served
+until its next DHCP request, up to its lease time, and is answered with the
+declared one from then on.
+
 ### Status information
 
 Status information about the IP reservations are kept in the status fields in the ippool objects and in the vmnetcfg objects.

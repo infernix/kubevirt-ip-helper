@@ -62,6 +62,18 @@ type Controller struct {
 	// fails closed: no vm existence is verified, so nothing is swept.
 	verifyVM func(namespace string, name string) (bool, error)
 
+	// staticIPDeclarations reports the addresses which the virtual
+	// machines of the cluster declare for one network through their
+	// static-ip annotations, keyed by the canonical macaddress of the
+	// declaring interface. it is an indirection over the kubevirt client
+	// so the allocation path is testable without a live cluster (the
+	// same seam shape as verifyVM); the production wiring performs one
+	// cluster-wide VirtualMachine LIST per call, and the caller memoizes
+	// the result per network for the reconciliation. a nil seam declares
+	// nothing: the allocation path then behaves exactly as before the
+	// declaration contract existed.
+	staticIPDeclarations func(networkName string) (map[string]string, error)
+
 	mutex sync.Mutex
 	// deferredInitAllocations records the vmnetcfg keys whose startup
 	// sync deferred a fresh allocation until the initialization replay

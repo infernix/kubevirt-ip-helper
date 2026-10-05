@@ -379,6 +379,42 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		})
 	}
 
+	// declaredAddressesFor memoizes the static-ip declarations of this
+	// reconciliation per network: the walk over the cluster's virtual
+	// machines runs at most once for a network which reaches the
+	// fresh-allocation path, so a multi-nic object pays one LIST and a
+	// nic whose binding is intact pays none. the lookup is fail-soft:
+	// when it fails the declarations are unknown for this sync and the
+	// allocation path falls back to its pre-existing behavior, instead of
+	// failing an object whose other interfaces still restore and whose
+	// lease/claim state is already applied. the window is one transient
+	// api failure wide and the next resync repeats the lookup; a declared
+	// address which was taken in the meantime converges through the
+	// declaring nic's ERROR status and its steady-state retry, exactly
+	// like any other refused claim.
+	declarationsByNetwork := make(map[string]map[string]string)
+	declaredAddressesFor := func(networkName string) map[string]string {
+		if declared, cached := declarationsByNetwork[networkName]; cached {
+			return declared
+		}
+
+		var declared map[string]string
+		if c.staticIPDeclarations != nil {
+			var declarationErr error
+			declared, declarationErr = c.staticIPDeclarations(networkName)
+			if declarationErr != nil {
+				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s, allocating without the exclusion for this sync: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, networkName, declarationErr)
+
+				declared = nil
+			}
+		}
+
+		declarationsByNetwork[networkName] = declared
+
+		return declared
+	}
+
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		// create a fresh nic status
 		netcfgStatus := kihv1.NetworkConfigStatus{}
@@ -951,16 +987,36 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				continue
 			}
 
-			// F02: the pending nic may carry its own held reservation from
-			// an earlier sync of this era whose binding commit failed or
-			// could not be resolved: the claim (and with it the ledger
-			// record) survived while the spec assignment never landed.
-			// adopting the reserved address keeps it continuously
-			// unavailable to every competing allocation and converges the
-			// stranded reservation into the durable spec, while a fresh
-			// allocation would consume a second address and leave the
-			// first held for the rest of the era
-			if reservedIP, reserved := c.ipam.IPOwnedBy(v.NetworkName, ownerRef); reserved {
+			// the static-ip declarations of the network: a declared
+			// address must never be handed out dynamically, and the nic
+			// whose vm declares one claims exactly that address instead
+			// of a fresh allocation
+			declared := declaredAddressesFor(v.NetworkName)
+			if declaredIP, declares := declared[util.CanonicalHWAddr(v.MACAddress)]; declares {
+				// the row carries no address while its vm declares one for
+				// this very nic: claim the declared address, so the nic is
+				// never served an address its vm did not ask for (the
+				// belt-and-braces half of the declaration contract). the
+				// claim is owner-validated, so an address another owner
+				// holds is refused with the usual ERROR status and failing
+				// sync - exactly like a refused reclaim of a recorded
+				// address - while this binding's own held claim (an
+				// earlier sync whose commit failed) is reclaimed
+				// idempotently.
+				log.Infof("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s declares the static address %s in network %s, claiming it instead of allocating dynamically",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, declaredIP, v.NetworkName)
+
+				ip, err = c.ipam.ReclaimIPClaimant(v.NetworkName, declaredIP, ownerRef, vmRef)
+			} else if reservedIP, reserved := c.ipam.IPOwnedBy(v.NetworkName, ownerRef); reserved {
+				// F02: the pending nic may carry its own held reservation
+				// from an earlier sync of this era whose binding commit
+				// failed or could not be resolved: the claim (and with it
+				// the ledger record) survived while the spec assignment
+				// never landed. adopting the reserved address keeps it
+				// continuously unavailable to every competing allocation
+				// and converges the stranded reservation into the durable
+				// spec, while a fresh allocation would consume a second
+				// address and leave the first held for the rest of the era
 				log.Infof("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] adopting the held reservation of hwaddr %s: its address %s was never committed to the spec by the earlier sync",
 					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, reservedIP)
 				c.metrics.UpdateLogStatus("warning")
@@ -971,8 +1027,10 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// the fresh allocation is a named reservation of this binding:
 				// the delayed cleanup of a removed nic can release it through
 				// the owner-validated release, while no other owner can ever
-				// displace it
-				ip, err = c.ipam.AllocateIP(v.NetworkName, ownerRef)
+				// displace it. every declared address of the network is
+				// skipped, this nic's own included, so a dynamic nic can
+				// never take an address some vm declared
+				ip, err = c.ipam.AllocateIPExcluding(v.NetworkName, ownerRef, exclusionSet(declared))
 			}
 		}
 		if err != nil {
