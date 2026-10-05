@@ -1292,6 +1292,13 @@ snapshot_guest_continuity() {
   GUEST_ACTION_EPOCH="$(date +%s.%N)"
 }
 
+# the sample sequence must prove the guest kept its identity and health across the
+# action, not that the console capture was gapless: the guest's serial writes block
+# while no console reader is attached (the reader dies with the websocket and the
+# reattach drains the pty), so a capture gap is a harness artifact while the guest's
+# own uptime keeps increasing. seq and uptime must still be strictly monotonic, the
+# interface and client pid must match the baseline, and at least three samples must
+# land after the cutoff, so a stalled or restarted guest still fails.
 guest_continuity_after() { # <post-action sample sequence>
   local identity samples sample
   identity="$(guest_identity)" || return 1
@@ -1309,8 +1316,7 @@ guest_continuity_after() { # <post-action sample sequence>
         and ($i == 0 or $samples[$i].seq > $samples[$i-1].seq)
         and $samples[$i].iface == $base.iface
         and $samples[$i].client_pid == $base.client_pid
-        and ($i == 0 or ($samples[$i].uptime > $samples[$i-1].uptime
-          and $samples[$i].uptime - $samples[$i-1].uptime <= 20))))
+        and ($i == 0 or $samples[$i].uptime > $samples[$i-1].uptime)))
     | $samples' )" || return 1
   while IFS= read -r sample; do
     guest_sample_healthy "${sample}" || return 1
