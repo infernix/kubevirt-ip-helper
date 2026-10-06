@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -119,7 +121,12 @@ func newUpdateStatusEnv(t *testing.T, conflicts int, putCode int) (context.Conte
 	srv := httptest.NewServer(http.HandlerFunc(api.serveHTTP))
 	t.Cleanup(srv.Close)
 
-	client, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
+	// The fixture measures the retry logic, not client-go's client-side
+	// rate limiter: production raises the limits through util.GetKubeConfig
+	// (50 QPS/burst 100), while the default 5 QPS/burst 10 would dominate
+	// the elapsed time of the retry tests (a 30-attempt budget spends 60
+	// requests, i.e. 10s of pure limiter wait).
+	client, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL, QPS: 1000, Burst: 1000})
 	if err != nil {
 		t.Fatalf("creating clientset: %s", err)
 	}
@@ -155,18 +162,28 @@ func TestUpdateStatusRetriesConflictsThenSucceeds(t *testing.T) {
 func TestUpdateStatusConflictExhaustionIsAnError(t *testing.T) {
 	ctx, client, allocator, api := newUpdateStatusEnv(t, 99, 0)
 
+	start := time.Now()
 	err := UpdateStatus(ctx, client, allocator, EventAdd, "ns", "vm-a", "10.0.0.5", "ns/net-a", "02:00:00:00:00:01", "pool-a")
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected an error after the conflict budget is exhausted")
 	}
-	if !strings.Contains(err.Error(), "after 10 retries") {
-		t.Errorf("error = %q, want the retry-exhaustion message", err)
+	if want := fmt.Sprintf("after %d retries", maxAttempts-1); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want the retry-exhaustion message %q", err, want)
 	}
 
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	if api.putCount != 10 {
-		t.Errorf("put attempts = %d, want 10 (the retry budget)", api.putCount)
+	if api.putCount != maxAttempts {
+		t.Errorf("put attempts = %d, want %d (the write-attempt budget)", api.putCount, maxAttempts)
+	}
+
+	// The budget is bounded in time as well as in attempts: even a fully
+	// exhausted budget must return inside the documented worst case
+	// (maxAttempts-1 waits of at most retryMaxDelay) plus the round trips,
+	// so a wedged reconcile cannot hide behind the retries.
+	if worst := time.Duration(maxAttempts-1)*retryMaxDelay + 2*time.Second; elapsed > worst {
+		t.Errorf("exhausted budget took %s, want at most %s", elapsed, worst)
 	}
 }
 
@@ -192,7 +209,7 @@ func TestUpdateStatusNonConflictErrorIsNotRetried(t *testing.T) {
 
 // A canceled era must abort the retry backoff instead of burning it: the
 // cancellation lands strictly inside a nonzero retry sleep (the deadline
-// fires while the second retry waits its 200ms), so the ctx-aware select
+// fires while a jittered backoff is being awaited), so the ctx-aware select
 // of the retry loop is what returns - not client-go's ctx propagation on
 // the opening request. a pre-canceled context would fail the GET client
 // side and never reach the select, pinning nothing about the backoff.
@@ -201,9 +218,9 @@ func TestUpdateStatusCtxCancelDuringRetryWaitAborts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
-	// the cumulative retry waits are 0ms + 100ms + 200ms before the next
-	// attempt, so the 250ms deadline deterministically fires inside the
-	// 200ms sleep of the second retry, long after the live requests
+	// the cumulative retry waits (jittered 25ms/50ms/100ms/200ms... shifts)
+	// reach the 250ms deadline after a handful of attempts, long after the
+	// live requests
 	start := time.Now()
 	err := UpdateStatus(ctx, client, allocator, EventAdd, "ns", "vm-a", "10.0.0.5", "ns/net-a", "02:00:00:00:00:01", "pool-a")
 	if err == nil {
@@ -222,8 +239,8 @@ func TestUpdateStatusCtxCancelDuringRetryWaitAborts(t *testing.T) {
 	// one depends on scheduling, so the count is not pinned to an exact
 	// phase: at least two conflicts must have been delivered and the
 	// aborted run must stay well under the full retry budget
-	if api.putCount < 2 || api.putCount >= maxRetries {
-		t.Errorf("put attempts = %d, want >= 2 and < %d (the backoff cut short)", api.putCount, maxRetries)
+	if api.putCount < 2 || api.putCount >= maxAttempts {
+		t.Errorf("put attempts = %d, want >= 2 and < %d (the backoff cut short)", api.putCount, maxAttempts)
 	}
 	if api.putCount != api.getCount {
 		t.Errorf("get/put counts = %d/%d, want one read per write attempt", api.getCount, api.putCount)
@@ -626,4 +643,241 @@ func TestUpdateStatusMissingSubnetPreservesCounters(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An idempotent delete of an address the ledger does not hold (a replayed
+// release) mutates nothing, so it must not spend a status write while the
+// counters already match the live allocator: the write would only bump
+// LastUpdate. Measured before the fix: the DELETE of an absent ledger entry
+// still issued a pool-status PUT.
+func TestUpdateStatusIdempotentDeleteSkipsTheStatusWrite(t *testing.T) {
+	ctx, client, allocator, api := newUpdateStatusEnv(t, 0, 0)
+	used, available, exists := allocator.UsageCounts("ns/net-a")
+	if !exists {
+		t.Fatal("the fixture must register ns/net-a")
+	}
+	api.pool.Status.IPv4.Allocated = map[string]string{"10.0.0.9": "ns/other-vm [02:00:00:00:00:02]"}
+	api.pool.Status.IPv4.Used = used
+	api.pool.Status.IPv4.Available = available
+	api.pool.Status.LastUpdate = metav1.NewTime(time.Unix(100, 0).UTC())
+	before := api.pool.DeepCopy()
+
+	if err := UpdateStatus(ctx, client, allocator, EventDelete, "ns", "vm-a", "10.0.0.5", "ns/net-a", "02:00:00:00:00:01", "pool-a"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.getCount != 1 || api.putCount != 0 {
+		t.Errorf("get/put counts = %d/%d, want 1/0 for an absent ledger entry with matching counters", api.getCount, api.putCount)
+	}
+	if !reflect.DeepEqual(api.pool, before) {
+		t.Errorf("idempotent delete rewrote the pool or LastUpdate: got %+v, want %+v", api.pool, before)
+	}
+}
+
+// The counter refresh is what keeps a replayed release from skipping a
+// write it still owes: an absent ledger entry whose persisted counters lag
+// the live allocator must still be written.
+func TestUpdateStatusIdempotentDeleteStillWritesWhenCountersLag(t *testing.T) {
+	ctx, client, allocator, api := newUpdateStatusEnv(t, 0, 0)
+	used, available, exists := allocator.UsageCounts("ns/net-a")
+	if !exists {
+		t.Fatal("the fixture must register ns/net-a")
+	}
+	api.pool.Status.IPv4.Allocated = map[string]string{"10.0.0.9": "ns/other-vm [02:00:00:00:00:02]"}
+	api.pool.Status.IPv4.Used = used + 7
+	api.pool.Status.IPv4.Available = available + 7
+
+	if err := UpdateStatus(ctx, client, allocator, EventDelete, "ns", "vm-a", "10.0.0.5", "ns/net-a", "02:00:00:00:00:01", "pool-a"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.putCount != 1 {
+		t.Errorf("put attempts = %d, want 1 while the counters lag the live allocator", api.putCount)
+	}
+	if got := api.pool.Status.IPv4.Used; got != used {
+		t.Errorf("Used = %d, want the live %d", got, used)
+	}
+	if got := api.pool.Status.IPv4.Available; got != available {
+		t.Errorf("Available = %d, want the live %d", got, available)
+	}
+	if _, still := api.pool.Status.IPv4.Allocated["10.0.0.5"]; still {
+		t.Error("the absent ledger entry was invented by the write")
+	}
+	if got := api.pool.Status.IPv4.Allocated["10.0.0.9"]; got != "ns/other-vm [02:00:00:00:00:02]" {
+		t.Errorf("foreign ledger entry = %q, want it untouched", got)
+	}
+}
+
+// deepConflictPoolAPI models one IPPool status ledger under optimistic
+// concurrency: a status write applies only while its resourceVersion is
+// the stored one, and every other write is answered with the conflict the
+// API server produces.
+//
+// On top of the resource-version race it forces a deterministic conflict
+// floor per writer: every address must absorb `forced` conflicts before
+// its write applies. The floor identifies the writer by the one address
+// its body holds that the ledger does not - an ADD body is always the
+// writer's fresh read plus its own address, so that set is exactly the
+// writer's own address - which makes the retry depth of every writer a
+// property of the fixture instead of a property of the scheduler. The
+// production 20-writer measurement needed 120 retries (6 per writer) with
+// a tail beyond 10, so a floor of 12 pins the budget deterministically.
+type deepConflictPoolAPI struct {
+	mu              sync.Mutex
+	pool            *kihv1.IPPool
+	rv              int
+	forced          int
+	attemptsPerAddr map[string]int
+	maxAttemptsSeen int
+	getCount        int
+	putCount        int
+	applied         int
+	conflicts       int
+}
+
+func (f *deepConflictPoolAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	switch r.Method {
+	case http.MethodGet:
+		f.getCount++
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(f.pool); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	case http.MethodPut:
+		f.putCount++
+		var updated kihv1.IPPool
+		if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// the writer's own address: the body entry the ledger does not hold
+		added := ""
+		for ip := range updated.Status.IPv4.Allocated {
+			if _, held := f.pool.Status.IPv4.Allocated[ip]; !held {
+				added = ip
+				break
+			}
+		}
+
+		if added != "" {
+			f.attemptsPerAddr[added]++
+			if f.attemptsPerAddr[added] > f.maxAttemptsSeen {
+				f.maxAttemptsSeen = f.attemptsPerAddr[added]
+			}
+			if f.attemptsPerAddr[added] <= f.forced {
+				f.conflicts++
+				writeStatusError(w, http.StatusConflict, "please apply your changes to the latest version and try again")
+				return
+			}
+		}
+
+		if updated.ResourceVersion != f.pool.ResourceVersion {
+			f.conflicts++
+			writeStatusError(w, http.StatusConflict, "please apply your changes to the latest version and try again")
+			return
+		}
+
+		f.rv++
+		updated.ResourceVersion = strconv.Itoa(f.rv)
+		f.pool = &updated
+		f.applied++
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(&updated); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	default:
+		http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+	}
+}
+
+// The retry budget must survive the concurrency the ledger really sees:
+// writers concurrent reservations against one IPPool status, every one of
+// them owner-validated and rebased on a fresh read per conflict. The
+// former fixed 10-retry budget exhausted here - 20 production writers
+// measured 120 retries (54s) and 4 of 20 releases failed with "cannot
+// update status of IPPool ... after 10 retries" - so every writer must
+// absorb the measured conflict depth of 12 competing writes and still
+// converge.
+func TestUpdateStatusConcurrentWritersShareOneLedger(t *testing.T) {
+	const (
+		writers = 20
+		// the measured per-writer depth of the 20-writer production run:
+		// 120 retries over 20 writers with a tail beyond the old 10-retry
+		// budget
+		forcedConflicts = 12
+	)
+
+	api := &deepConflictPoolAPI{
+		pool: &kihv1.IPPool{
+			TypeMeta:   metav1.TypeMeta{Kind: "IPPool", APIVersion: "kubevirtiphelper.k8s.binbash.org/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", ResourceVersion: "1"},
+			Spec:       kihv1.IPPoolSpec{NetworkName: "ns/net-a"},
+			Status:     kihv1.IPPoolStatus{IPv4: kihv1.IPv4Status{Allocated: map[string]string{}}},
+		},
+		rv:              1,
+		forced:          forcedConflicts,
+		attemptsPerAddr: make(map[string]int, writers),
+	}
+	srv := httptest.NewServer(http.HandlerFunc(api.serveHTTP))
+	t.Cleanup(srv.Close)
+
+	// the client-side limiter is not what this test measures: the default
+	// 5 QPS would spend seconds on the reads alone, so it is raised like
+	// production does through util.GetKubeConfig
+	client, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL, QPS: 1000, Burst: 1000})
+	if err != nil {
+		t.Fatalf("creating clientset: %s", err)
+	}
+
+	allocator := ipam.NewIPAllocator()
+	if err := allocator.NewSubnet("ns/net-a", "10.0.0.0/24", "10.0.0.1", fmt.Sprintf("10.0.0.%d", writers)); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = UpdateStatus(context.Background(), client, allocator, EventAdd,
+				"ns", fmt.Sprintf("vm-%02d", i), fmt.Sprintf("10.0.0.%d", i+1), "ns/net-a", fmt.Sprintf("02:00:00:00:00:%02x", i+1), "pool-a")
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent writer %d failed: %v", i, err)
+		}
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.applied != writers {
+		t.Errorf("applied writes = %d, want %d (one per writer)", api.applied, writers)
+	}
+	if len(api.pool.Status.IPv4.Allocated) != writers {
+		t.Errorf("ledger holds %d entries, want all %d writers converged", len(api.pool.Status.IPv4.Allocated), writers)
+	}
+	// The retry depth of every writer is a property of the fixture, so the
+	// bound is pinned instead of sampled: each writer absorbed the forced
+	// floor and stayed inside the attempt budget.
+	if api.maxAttemptsSeen <= forcedConflicts {
+		t.Errorf("max attempts per writer = %d, want the forced %d conflicts plus the applying write", api.maxAttemptsSeen, forcedConflicts)
+	}
+	if api.maxAttemptsSeen > maxAttempts {
+		t.Errorf("max attempts per writer = %d, want at most the %d-attempt budget", api.maxAttemptsSeen, maxAttempts)
+	}
+	t.Logf("%d concurrent writers: %d gets, %d puts, %d applied, %d conflicts, max %d attempts (budget %d) for one writer",
+		writers, api.getCount, api.putCount, api.applied, api.conflicts, api.maxAttemptsSeen, maxAttempts)
 }

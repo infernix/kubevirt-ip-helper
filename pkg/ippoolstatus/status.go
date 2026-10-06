@@ -8,6 +8,7 @@ package ippoolstatus
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -23,9 +24,37 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
+// The conflict retry budget of updatePoolStatus. The ledger is one
+// resource that every release of every vm and vmnetcfg controller writes,
+// so the number of resource-version conflicts a writer must absorb grows
+// with the number of concurrent writers: measured against one ledger, 2
+// writers produced 1 conflict retry (2.7ms) and 8 writers 24 retries
+// (10.8s), but 20 writers produced 120 retries (54.0s) and exhausted the
+// former fixed 10-retry budget - 4 of the 20 releases failed with
+// "cannot update status of IPPool ... after 10 retries".
+//
+// maxAttempts is the write-attempt budget: 30 attempts, i.e. 29 conflict
+// retries. The worst case for N concurrent writers is one winner per
+// attempt round (every loser re-reads the same resource version and only
+// the first write of the round applies), so 30 attempts converge 30
+// writers - the 20 measured writers plus 50% headroom - without
+// exhausting the budget. retryBaseDelay/retryMaxDelay bound the
+// exponential backoff (25ms, doubling, capped at 250ms) and full jitter
+// spreads the losers of a round over the delay window so a later round
+// yields several winners instead of one.
+//
+// Worst-case latency: 29 waits of at most retryMaxDelay (7.25s) plus 30
+// GET+PUT round trips, which stays well inside the 30s client timeout of
+// util.GetKubeConfig, so an exhausted budget still surfaces as an error
+// rather than a wedged reconcile.
 const (
-	maxRetries = 10
-	retryDelay = 100 * time.Millisecond
+	maxAttempts    = 30
+	retryBaseDelay = 25 * time.Millisecond
+	retryMaxDelay  = 250 * time.Millisecond
+	// retryShiftCap bounds the exponential shift: 25ms << 4 = 400ms is
+	// already above retryMaxDelay, so no later retry can overflow the
+	// shift or the clamp.
+	retryShiftCap = 4
 )
 
 // EventAdd and EventDelete are the ledger mutation tokens of UpdateStatus;
@@ -75,37 +104,46 @@ func UpdateStatus(
 	// delete computations agree on owner identity across retries.
 	ownerRef := util.AllocationRef(vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
 	return updatePoolStatus(ctx, client, networkName, poolName, func(currentPool *kihv1.IPPool) (bool, error) {
-		if event == EventAdd {
+		// The ledger mutation and the counter refresh are tracked
+		// separately: an idempotent delete of an address the ledger does
+		// not hold (a replayed release) mutates nothing, so it only
+		// needs a write while the counters still lag the live allocator.
+		ledgerChanged := true
+		// Allocated is published without omitempty, so a write always
+		// carries a non-nil map: an empty ledger publishes {} instead of
+		// null. It is built only by the branch which mutates the ledger.
+		var updatedAllocated map[string]string
+
+		switch event {
+		case EventAdd:
 			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists {
 				if existing != ownerRef {
 					return false, fmt.Errorf("ip %s already found in IPPool status: %w", ip, util.ErrForeignOwner)
 				}
 				return false, nil
 			}
-		}
-		// Allocated is published without omitempty, so the write always
-		// carries a non-nil map: an empty ledger publishes {} instead of
-		// null.
-		updatedAllocated := make(map[string]string, len(currentPool.Status.IPv4.Allocated))
-
-		switch event {
-		case EventAdd:
+			updatedAllocated = make(map[string]string, len(currentPool.Status.IPv4.Allocated)+1)
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				updatedAllocated[k] = v
 			}
 			updatedAllocated[ip] = ownerRef
 		case EventDelete:
-			for k, v := range currentPool.Status.IPv4.Allocated {
-				if k != ip {
-					updatedAllocated[k] = v
-				}
-			}
-
-			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
+			existing, exists := currentPool.Status.IPv4.Allocated[ip]
+			if exists && existing != ownerRef {
 				return false, fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, util.ErrForeignOwner)
 			}
+			ledgerChanged = exists
+			if exists {
+				updatedAllocated = make(map[string]string, len(currentPool.Status.IPv4.Allocated)-1)
+				for k, v := range currentPool.Status.IPv4.Allocated {
+					if k != ip {
+						updatedAllocated[k] = v
+					}
+				}
+			}
 		}
-		currentPool.Status.IPv4.Allocated = updatedAllocated
+
+		counterChanged := false
 		// the counters describe the serving state of the pool: they are
 		// only recomputed from the in-memory allocator while the network
 		// is registered in it. a pool which exists without a registration
@@ -116,9 +154,28 @@ func UpdateStatus(
 		// whose ledger still holds live entries
 		if ipam.HasSubnet(networkName) {
 			used, available, _ := ipam.UsageCounts(networkName)
-			currentPool.Status.IPv4.Used = used
-			currentPool.Status.IPv4.Available = available
+			if currentPool.Status.IPv4.Used != used || currentPool.Status.IPv4.Available != available {
+				currentPool.Status.IPv4.Used = used
+				currentPool.Status.IPv4.Available = available
+				counterChanged = true
+			}
 		}
+
+		// Nothing to persist: the address was already absent from the
+		// ledger and the counters already match the live allocator, so
+		// the status write would only bump LastUpdate.
+		if !ledgerChanged && !counterChanged {
+			return false, nil
+		}
+		if updatedAllocated == nil {
+			// a counter-only write (an absent ledger entry whose counters
+			// lagged) still republishes the ledger as a non-nil map
+			updatedAllocated = make(map[string]string, len(currentPool.Status.IPv4.Allocated))
+			for k, v := range currentPool.Status.IPv4.Allocated {
+				updatedAllocated[k] = v
+			}
+		}
+		currentPool.Status.IPv4.Allocated = updatedAllocated
 		return true, nil
 	})
 }
@@ -141,11 +198,25 @@ func UpdateAccounting(ctx context.Context, client *kihclientset.Clientset, ipam 
 	})
 }
 
+// retryBackoff returns the wait before the retry following the given
+// zero-based attempt: an exponential backoff (retryBaseDelay doubled per
+// attempt, capped at retryMaxDelay) with full jitter, so the losers of one
+// conflict round do not wake in lockstep and collide again. It never
+// returns a negative duration and never exceeds retryMaxDelay.
+func retryBackoff(retry int) time.Duration {
+	backoff := retryBaseDelay << min(retry, retryShiftCap)
+	if backoff > retryMaxDelay {
+		backoff = retryMaxDelay
+	}
+
+	return time.Duration(rand.Int64N(int64(backoff) + 1))
+}
+
 // updatePoolStatus rebases only the intended status mutation on each fresh
 // read. The callback reports whether a write is required; it must not perform
 // allocation or release side effects, since conflicts invoke it again.
 func updatePoolStatus(ctx context.Context, client *kihclientset.Clientset, networkName, poolName string, update func(*kihv1.IPPool) (bool, error)) error {
-	for retry := 0; retry < maxRetries; retry++ {
+	for attempt := range maxAttempts {
 		currentPool, err := client.KubevirtiphelperV1().IPPools().Get(ctx, poolName, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("cannot get IPPool %s: %w", poolName, err)
@@ -163,23 +234,23 @@ func updatePoolStatus(ctx context.Context, client *kihclientset.Clientset, netwo
 			return nil
 		} else {
 			if apierrors.IsConflict(err) || strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
-				if retry == maxRetries-1 {
-					return fmt.Errorf("cannot update status of IPPool %s after %d retries: %w", poolName, maxRetries, err)
+				if attempt == maxAttempts-1 {
+					return fmt.Errorf("cannot update status of IPPool %s after %d retries: %w", poolName, maxAttempts-1, err)
 				}
 			} else {
 				return fmt.Errorf("cannot update status of IPPool %s: %w", poolName, err)
 			}
 
 			log.Warnf("(ippoolstatus.updatePoolStatus) cannot update status of IPPool %s after %d attempt(s), retrying in a bit",
-				poolName, retry+1)
+				poolName, attempt+1)
 
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("cannot update status of IPPool %s: %w", poolName, ctx.Err())
-			case <-time.After(time.Duration(retry) * retryDelay):
+			case <-time.After(retryBackoff(attempt)):
 			}
 		}
 	}
 
-	return fmt.Errorf("cannot update status of IPPool %s after %d retries", poolName, maxRetries)
+	return fmt.Errorf("cannot update status of IPPool %s after %d retries", poolName, maxAttempts-1)
 }
