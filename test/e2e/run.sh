@@ -3482,6 +3482,384 @@ run_orphan_sweep_checks() {
 }
 
 # ---------------------------------------------------------------------------
+# Synthetic DHCP wire paths
+#
+# The suite's only client is the stock cirros udhcpc, which identifies itself by
+# the MAC in chaddr, never emits option 61 (client identifier) or a foreign
+# option 50 (requested address), and never releases its lease. The network
+# services pod the suite already runs on the NAD carries NET_RAW, so a synthetic
+# client drives exactly those frames from inside that pod over the same bridge,
+# and the helper's answers are asserted twice: from the client's own decoded
+# replies and from the passive node-bridge capture the harness already decodes.
+#
+# The three paths, and the wrong behaviour each case excludes:
+#
+#   RELEASE    a release of a controller-owned reservation is a one-way
+#              notification: the pool counters, the durable ledger entry and the
+#              row must stay exactly as they were, and the same MAC must still
+#              be served its reserved address afterwards. A helper which freed
+#              the binding on a release would drop the counters, empty the
+#              ledger entry and stop answering that MAC (or answer a different
+#              address).
+#   option 50  the requested address is ignored for a MAC which holds a
+#              reservation: the OFFER and the ACK carry the reserved address,
+#              and the named free address is never handed out. A helper which
+#              honoured option 50 would offer and ack the named address.
+#   option 61  identity is the chaddr only: a reservation holder which also
+#              presents a foreign client identifier is still served its own
+#              reservation, and an unknown MAC which presents a reservation
+#              owner's client identifier gets no reply and consumes no address.
+#              A helper which keyed on the client identifier would serve the
+#              wrong binding, or answer the unknown MAC and leak an address.
+#
+# Every synthetic step carries a fixed transaction id, so an assertion matches
+# one exact exchange on the wire and no timing race can be mistaken for a
+# reply: the client waits for the reply of its own xid and chaddr, and a
+# negative case waits out the whole window and then requires the xid to carry
+# no reply at all.
+DHCP_WIRE_VM="dhcp-wire-vm"
+DHCP_WIRE_MAC="02:00:00:00:00:51"
+DHCP_WIRE_CLIENTID_VM="dhcp-wire-clientid-vm"
+DHCP_WIRE_CLIENTID_MAC="02:00:00:00:00:52"
+DHCP_WIRE_UNKNOWN_MAC="02:00:00:00:00:59"
+DHCP_WIRE_IFACE="primary"
+DHCP_WIRE_EXEC_TIMEOUT=60
+DHCP_WIRE_EVENTS=""
+# One fixed transaction id per synthetic exchange: distinct from each other and
+# from the guest client's random ids, so a reply can only belong to its step.
+DHCP_WIRE_XID_RELEASE=218103809
+DHCP_WIRE_XID_RELEASE_DISCOVER=218103810
+DHCP_WIRE_XID_RELEASE_REQUEST=218103811
+DHCP_WIRE_XID_OPTION50_DISCOVER=218103824
+DHCP_WIRE_XID_OPTION50_REQUEST=218103825
+DHCP_WIRE_XID_OPTION50_FOREIGN=218103826
+DHCP_WIRE_XID_CLIENTID_RESERVED=218103840
+DHCP_WIRE_XID_CLIENTID_UNKNOWN=218103841
+
+# The client identifier a reservation owner would present if the helper keyed
+# identity on option 61: type 1 (hardware address) followed by the owner MAC.
+dhcp_wire_client_id() { # <mac>
+  printf '01%s\n' "$(tr -d ':' <<< "$1")"
+}
+
+# Run one synthetic exchange inside the NAD pod. The pod's root filesystem is
+# read-only, so the client travels over stdin; its decoded replies are the
+# client-side evidence of the case and are appended to the named file. The exec
+# is bounded here because the caller runs this function directly.
+dhcp_wire_send() { # <output> <xid> <timeout> <expect> <send-json>
+  local output="$1" spec
+  spec="$(jq -cn --argjson xid "$2" --argjson timeout "$3" --arg expect "$4" \
+    --argjson send "$5" \
+    '[{xid:$xid,timeout:$timeout,settle:0.5,expect:$expect,send:$send}]')" || return 1
+  timeout --foreground --kill-after=1s "${DHCP_WIRE_EXEC_TIMEOUT}s" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" exec -i "${KIH_NETWORK_POD}" \
+    -c "${KIH_NETWORK_CONTAINER}" -- python3 - "${DHCP_WIRE_IFACE}" "${spec}" \
+    < "${E2E_DIR}/dhcp_wire_client.py" >> "${output}"
+}
+
+# The client's own decoded reply for one step: a reply of the named message type
+# carries the expected value in the named field.
+dhcp_wire_client_reply_is() { # <output> <xid> <message> <field> <value>
+  jq -se --argjson xid "$2" --arg message "$3" --arg field "$4" --arg value "$5" '
+    any(.[] | select(.xid == $xid);
+      any(.replies[]; .message == $message and .[$field] == $value))' "$1" > /dev/null
+}
+
+# The client collected no reply at all for one step.
+dhcp_wire_client_no_reply() { # <output> <xid>
+  jq -se --argjson xid "$2" '
+    any(.[] | select(.xid == $xid); (.replies | length) == 0)' "$1" > /dev/null
+}
+
+# The step exists and no reply of it carries the value in the named field.
+dhcp_wire_client_no_value() { # <output> <xid> <field> <value>
+  jq -se --argjson xid "$2" --arg field "$3" --arg value "$4" '
+    any(.[]; .xid == $xid)
+    and all(.[]; .xid != $xid or all(.replies[]; .[$field] != $value))' \
+    "$1" > /dev/null
+}
+
+# The pool accounting, the row and the durable ledger entry of one reserved
+# address, unchanged. A release which freed the binding shows a lower used
+# count, a missing ledger entry or a dropped row here.
+dhcp_wire_reservation_kept() { # <vm> <mac> <address> <used> <available>
+  [ "$(named_row_address "$1")" = "$3" ] &&
+    vmnetcfg_status_is "$1" OK &&
+    vm_managed_reservation "$1" OK &&
+    [ "$(pool_address_owner "${KIH_IPPOOL_NAME}" "$3")" = \
+      "${KIH_WORKLOAD_NAMESPACE}/$1 [$2]" ] &&
+    pool_counts_equal "${KIH_IPPOOL_NAME}" "$4" "$5"
+}
+
+dhcp_wire_fixture_ready() { # <reserved-a> <reserved-b> <free>
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] &&
+    [ "$1" != "$2" ] && [ "$3" != "$1" ] && [ "$3" != "$2" ] &&
+    dhcp_wire_reservation_kept "${DHCP_WIRE_VM}" "${DHCP_WIRE_MAC}" "$1" 2 9 &&
+    dhcp_wire_reservation_kept "${DHCP_WIRE_CLIENTID_VM}" "${DHCP_WIRE_CLIENTID_MAC}" \
+      "$2" 2 9 &&
+    pool_address_free "${KIH_IPPOOL_NAME}" "$3"
+}
+
+# The highest address of the pool range which carries no ledger entry and is not
+# one of the fixture reservations: the requested-address case names it, and the
+# case then asserts it is still free, so the named address is a property of the
+# ledger rather than of allocation order.
+dhcp_wire_free_address() { # <reserved-a> <reserved-b>
+  local object
+  object="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o json)" || return 1
+  jq -er --arg a "$1" --arg b "$2" '
+    def ip_number:
+      split(".") | map(tonumber) |
+      .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3];
+    def ip_text($n):
+      [($n / 16777216 | floor % 256), ($n / 65536 | floor % 256),
+       ($n / 256 | floor % 256), ($n | floor % 256)]
+      | map(tostring) | join(".");
+    (.spec.ipv4config.pool.start | ip_number) as $start
+    | (.spec.ipv4config.pool.end | ip_number) as $end
+    | ((.status.ipv4.allocated // {}) | keys | map(ip_number)) as $taken
+    | [range($start; $end + 1)
+       | select(. as $n | ($taken | index($n) | not))
+       | select(ip_text(.) != $a and ip_text(.) != $b)] as $free
+    | if ($free | length) > 0 then (($free | max) | ip_text(.))
+      else error("the pool carries no free address for the requested-address case") end
+  ' <<< "${object}"
+}
+
+# Merge the decoded capture of every node into one event stream: an injected
+# frame and its reply are recorded on whichever node's bridge carried them, so
+# the wire evidence is the union of the three records rather than one node's.
+dhcp_wire_events() { # <output>
+  local node
+  : > "$1" || return 1
+  for node in "${!CAPTURE_FILES[@]}"; do
+    [ -s "${CAPTURE_FILES[$node]}.jsonl" ] || continue
+    cat "${CAPTURE_FILES[$node]}.jsonl" >> "$1" || return 1
+  done
+  [ -s "$1" ]
+}
+
+dhcp_wire_on_wire() { # <xid> <message> <field> <value>
+  jq -se --argjson xid "$1" --arg message "$2" --arg field "$3" --arg value "$4" '
+    any(.[]; .xid == $xid and .message == $message and .[$field] == $value)' \
+    "${DHCP_WIRE_EVENTS}" > /dev/null
+}
+
+dhcp_wire_not_on_wire() { # <xid> <field> <value>
+  jq -se --argjson xid "$1" --arg field "$2" --arg value "$3" '
+    all(.[]; .xid != $xid or .[$field] != $value)' "${DHCP_WIRE_EVENTS}" > /dev/null
+}
+
+# Only the client's own request may carry the xid on the recorded bridge: a
+# reply of any kind (an OFFER, an ACK or a NAK) fails this.
+dhcp_wire_no_reply_on_wire() { # <xid>
+  jq -se --argjson xid "$1" '
+    all(.[]; .xid != $xid
+      or (.message == "DISCOVER" or .message == "REQUEST" or .message == "RELEASE"
+        or .message == "DECLINE" or .message == "INFORM"))' \
+    "${DHCP_WIRE_EVENTS}" > /dev/null
+}
+
+# The whole wire story in one predicate: every injected packet reached the
+# recorded bridge with the option it was meant to carry, the helper answered the
+# transactions it must answer with the reserved address, and the two negative
+# transactions stayed silent. The client's own view is asserted separately, so
+# this is the harness-owned half of the evidence.
+dhcp_wire_evidence_complete() { # <reserved-a> <free-address> <reserved-cid> <unknown-cid>
+  local reserved_a="$1" free_address="$2" reserved_cid="$3" unknown_cid="$4"
+  dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE}" RELEASE mac "${DHCP_WIRE_MAC}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE}" RELEASE ciaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE_DISCOVER}" DISCOVER mac "${DHCP_WIRE_MAC}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE_DISCOVER}" OFFER mac "${DHCP_WIRE_MAC}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE_DISCOVER}" OFFER yiaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE_REQUEST}" REQUEST mac "${DHCP_WIRE_MAC}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_RELEASE_REQUEST}" ACK yiaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_OPTION50_DISCOVER}" DISCOVER \
+      requested_ip "${free_address}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_OPTION50_DISCOVER}" OFFER yiaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_OPTION50_REQUEST}" REQUEST \
+      requested_ip "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_OPTION50_REQUEST}" ACK yiaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_OPTION50_FOREIGN}" REQUEST \
+      requested_ip "${free_address}" &&
+    dhcp_wire_not_on_wire "${DHCP_WIRE_XID_OPTION50_FOREIGN}" yiaddr "${free_address}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_CLIENTID_RESERVED}" DISCOVER \
+      client_id "${reserved_cid}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_CLIENTID_RESERVED}" OFFER yiaddr "${reserved_a}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_CLIENTID_UNKNOWN}" DISCOVER \
+      mac "${DHCP_WIRE_UNKNOWN_MAC}" &&
+    dhcp_wire_on_wire "${DHCP_WIRE_XID_CLIENTID_UNKNOWN}" DISCOVER \
+      client_id "${unknown_cid}" &&
+    dhcp_wire_no_reply_on_wire "${DHCP_WIRE_XID_CLIENTID_UNKNOWN}"
+}
+
+dhcp_wire_option50_foreign() { # <output> <address>
+  dhcp_wire_client_no_value "$1" "${DHCP_WIRE_XID_OPTION50_FOREIGN}" yiaddr "$2" &&
+    pool_address_free "${KIH_IPPOOL_NAME}" "$2" &&
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 2 9
+}
+
+dhcp_wire_clientid_ignored() { # <output> <reserved-b>
+  dhcp_wire_client_no_reply "$1" "${DHCP_WIRE_XID_CLIENTID_UNKNOWN}" &&
+    [ "$(pool_address_owner "${KIH_IPPOOL_NAME}" "$2")" = \
+      "${KIH_WORKLOAD_NAMESPACE}/${DHCP_WIRE_CLIENTID_VM} [${DHCP_WIRE_CLIENTID_MAC}]" ] &&
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 2 9
+}
+
+run_dhcp_wire_checks() {
+  local deadline manifest out wire_events spec_send elapsed
+  local reserved_a reserved_b free_address reserved_cid unknown_cid
+  local started=${SECONDS}
+  deadline=$((SECONDS + 900))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the guest-side DHCP wire paths (release, requested address, client identifier)"
+  out="${E2E_ARTIFACTS_DIR}/dhcp-wire-client.jsonl"
+  wire_events="${E2E_ARTIFACTS_DIR}/dhcp-wire-events.jsonl"
+  : > "${out}"
+  assert_case CORE-DHCP-WIRE-NAME-FREE \
+    "the wire fixture starts from the empty pool" static_ip_start_clean
+  assert_case CORE-DHCP-WIRE-LEADER-SERVING \
+    "the leader owns the DHCP server and the metrics endpoint before the injected packets" \
+    leader_services_healthy
+
+  log "core: reserving two controller-owned addresses for the wire fixture"
+  manifest="${E2E_ARTIFACTS_DIR}/37-dhcp-wire-vm.yaml"
+  render_halted_vm "${DHCP_WIRE_VM}" "${DHCP_WIRE_MAC}" "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline CORE-DHCP-WIRE-RESERVED "${deadline}" 120 \
+    "the halted wire vm holds a controller-owned reservation" \
+    named_reservation_kept "${DHCP_WIRE_VM}" "${DHCP_WIRE_MAC}"
+  manifest="${E2E_ARTIFACTS_DIR}/37-dhcp-wire-clientid-vm.yaml"
+  render_halted_vm "${DHCP_WIRE_CLIENTID_VM}" "${DHCP_WIRE_CLIENTID_MAC}" "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline CORE-DHCP-WIRE-CLIENTID-RESERVED "${deadline}" 120 \
+    "the second halted wire vm holds a controller-owned reservation" \
+    named_reservation_kept "${DHCP_WIRE_CLIENTID_VM}" "${DHCP_WIRE_CLIENTID_MAC}"
+  reserved_a="$(named_row_address "${DHCP_WIRE_VM}")" ||
+    die "cannot read the wire reservation of ${DHCP_WIRE_VM}"
+  reserved_b="$(named_row_address "${DHCP_WIRE_CLIENTID_VM}")" ||
+    die "cannot read the wire reservation of ${DHCP_WIRE_CLIENTID_VM}"
+  free_address="$(dhcp_wire_free_address "${reserved_a}" "${reserved_b}")" ||
+    die "cannot name a free address of ${KIH_IPPOOL_NAME}"
+  assert_case CORE-DHCP-WIRE-FIXTURE \
+    "the fixture reserves ${reserved_a} and ${reserved_b} and leaves ${free_address} free" \
+    dhcp_wire_fixture_ready "${reserved_a}" "${reserved_b}" "${free_address}"
+  capture_checkpoint 37-dhcp-wire \
+    "two controller-owned reservations ready for the synthetic client"
+
+  guard_case CORE-DHCP-WIRE-CAPTURE-START \
+    "passive captures start before the injected packets" \
+    start_dhcp_captures dhcp-wire "${deadline}" "${KIH_BRIDGE_NAME}"
+  wait_before_deadline CORE-DHCP-WIRE-CAPTURE-READY "${deadline}" 30 \
+    "all node bridges are being recorded before the injected packets" capture_streams_ready
+
+  log "core: a DHCPRELEASE leaves the controller-owned reservation of ${reserved_a} untouched"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg ciaddr "${reserved_a}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"release",chaddr:$chaddr,ciaddr:$ciaddr,server_id:$server}')"
+  guard_case CORE-DHCP-WIRE-RELEASE-SENT \
+    "the synthetic client releases ${reserved_a} and the server stays silent" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_RELEASE}" 3 none "${spec_send}"
+  assert_case CORE-DHCP-WIRE-RELEASE-UNCHANGED \
+    "the release leaves the counters, the ledger entry and the row of ${reserved_a} untouched" \
+    dhcp_wire_reservation_kept "${DHCP_WIRE_VM}" "${DHCP_WIRE_MAC}" "${reserved_a}" 2 9
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" '{type:"discover",chaddr:$chaddr}')"
+  guard_case CORE-DHCP-WIRE-RELEASE-DISCOVER \
+    "the released mac is answered again" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_RELEASE_DISCOVER}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-RELEASE-OFFERED \
+    "the discovery after the release is offered the reserved ${reserved_a}" \
+    dhcp_wire_client_reply_is "${out}" "${DHCP_WIRE_XID_RELEASE_DISCOVER}" OFFER yiaddr "${reserved_a}"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg requested "${reserved_a}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-DHCP-WIRE-RELEASE-REQUEST \
+    "the request for the reserved address is answered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_RELEASE_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-RELEASE-ACKED \
+    "the request after the release is acked with the reserved ${reserved_a}" \
+    dhcp_wire_client_reply_is "${out}" "${DHCP_WIRE_XID_RELEASE_REQUEST}" ACK yiaddr "${reserved_a}"
+  assert_case CORE-DHCP-WIRE-RELEASE-STATE \
+    "the discovery and the request left the reservation and its accounting unchanged" \
+    dhcp_wire_reservation_kept "${DHCP_WIRE_VM}" "${DHCP_WIRE_MAC}" "${reserved_a}" 2 9
+
+  log "core: option 50 of a reserved mac is ignored in favour of ${reserved_a}"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg requested "${free_address}" \
+    '{type:"discover",chaddr:$chaddr,requested_ip:$requested}')"
+  guard_case CORE-DHCP-WIRE-OPTION50-DISCOVER \
+    "the discover naming ${free_address} is answered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_OPTION50_DISCOVER}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-OPTION50-OFFER \
+    "the offer carries the reserved ${reserved_a}, not the requested ${free_address}" \
+    dhcp_wire_client_reply_is "${out}" "${DHCP_WIRE_XID_OPTION50_DISCOVER}" OFFER yiaddr "${reserved_a}"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg requested "${reserved_a}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-DHCP-WIRE-OPTION50-REQUEST \
+    "the request naming the offered address is answered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_OPTION50_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-OPTION50-ACK \
+    "the ack carries the reserved ${reserved_a}" \
+    dhcp_wire_client_reply_is "${out}" "${DHCP_WIRE_XID_OPTION50_REQUEST}" ACK yiaddr "${reserved_a}"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg requested "${free_address}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-DHCP-WIRE-OPTION50-FOREIGN \
+    "the request naming the foreign address is answered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_OPTION50_FOREIGN}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-OPTION50-UNALLOCATED \
+    "the requested ${free_address} is never carried in a reply and stays unallocated" \
+    dhcp_wire_option50_foreign "${out}" "${free_address}"
+
+  log "core: option 61 does not identify a client"
+  reserved_cid="$(dhcp_wire_client_id "${DHCP_WIRE_UNKNOWN_MAC}")"
+  unknown_cid="$(dhcp_wire_client_id "${DHCP_WIRE_CLIENTID_MAC}")"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_MAC}" --arg cid "${reserved_cid}" \
+    '{type:"discover",chaddr:$chaddr,client_id:$cid}')"
+  guard_case CORE-DHCP-WIRE-CLIENTID-DISCOVER \
+    "the reservation holder presenting a foreign client identifier is answered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_CLIENTID_RESERVED}" 6 any "${spec_send}"
+  assert_case CORE-DHCP-WIRE-CLIENTID-MAC-WINS \
+    "the chaddr reservation ${reserved_a} is offered although the client identifier names ${DHCP_WIRE_UNKNOWN_MAC}" \
+    dhcp_wire_client_reply_is "${out}" "${DHCP_WIRE_XID_CLIENTID_RESERVED}" OFFER yiaddr "${reserved_a}"
+  spec_send="$(jq -cn --arg chaddr "${DHCP_WIRE_UNKNOWN_MAC}" --arg cid "${unknown_cid}" \
+    '{type:"discover",chaddr:$chaddr,client_id:$cid}')"
+  guard_case CORE-DHCP-WIRE-CLIENTID-UNKNOWN \
+    "the unknown mac presenting a reservation owner's client identifier stays unanswered" \
+    dhcp_wire_send "${out}" "${DHCP_WIRE_XID_CLIENTID_UNKNOWN}" 6 none "${spec_send}"
+  assert_case CORE-DHCP-WIRE-CLIENTID-IGNORED \
+    "the unknown mac gets no reply and consumes no address although its client identifier names ${DHCP_WIRE_CLIENTID_MAC}" \
+    dhcp_wire_clientid_ignored "${out}" "${reserved_b}"
+  assert_case CORE-DHCP-WIRE-CLIENTID-STATE \
+    "both client-identifier transactions left the two reservations and the accounting unchanged" \
+    dhcp_wire_fixture_ready "${reserved_a}" "${reserved_b}" "${free_address}"
+
+  guard_case CORE-DHCP-WIRE-CAPTURE-CLOSE \
+    "the injected packets and their replies are decoded from the node captures" \
+    finish_guest_evidence "${deadline}"
+  guard_case CORE-DHCP-WIRE-EVENTS \
+    "the decoded node captures merge into one event stream" \
+    dhcp_wire_events "${wire_events}"
+  DHCP_WIRE_EVENTS="${wire_events}"
+  assert_case CORE-DHCP-WIRE-ON-WIRE \
+    "every injected packet and the helper's reply to it are on the recorded bridge" \
+    dhcp_wire_evidence_complete "${reserved_a}" "${free_address}" \
+    "${reserved_cid}" "${unknown_cid}"
+
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm \
+    "${DHCP_WIRE_VM}" "${DHCP_WIRE_CLIENTID_VM}" \
+    --wait=true --timeout=180s > /dev/null
+  wait_before_deadline CORE-DHCP-WIRE-CLEANED "${deadline}" 180 \
+    "the wire fixtures release both reservations and return the empty pool" pool_initialized
+  guard_case CORE-DHCP-WIRE-DEADLINE \
+    "wire scenarios completed within their own deadline" test "${SECONDS}" -lt "${deadline}"
+  elapsed=$((SECONDS - started))
+  printf '%s\n' "${elapsed}" > "${E2E_ARTIFACTS_DIR}/dhcp-wire-cost-seconds.txt"
+  log "core: dhcp wire checks completed in ${elapsed}s"
+  SCENARIO_DEADLINE=0
+}
+
+# ---------------------------------------------------------------------------
 # Admission-entry reconciliation and pool identity
 #
 # The webhook registers four admission entries and reconciles their content at
@@ -4034,6 +4412,7 @@ main() {
   run_static_ip_checks
   run_static_ip_release_checks
   run_declared_address_race_checks
+  run_dhcp_wire_checks
   run_webhook_reconciliation_checks
   run_orphan_sweep_checks
 

@@ -231,6 +231,19 @@ def _decode_dhcp(data, timestamp, ip_src, ip_dst, where):
         where,
         expected_length=4,
     )
+    # The synthetic wire client sends these two options and no native client
+    # does, so they are decoded whenever they are present: option 50 (requested
+    # address) is what the requested-address case names, and option 61 (client
+    # identifier) is what the identity cases present. Both are optional, and a
+    # malformed requested address is still a decode failure.
+    requested_value = _option_value(
+        options,
+        50,
+        "requested address",
+        where,
+        expected_length=4,
+    )
+    client_id_value = _option_value(options, 61, "client identifier", where)
 
     flags = _u16(data, 10)
     return {
@@ -250,6 +263,12 @@ def _decode_dhcp(data, timestamp, ip_src, ip_dst, where):
         "routers": _option_ips(options, 3, "router", where),
         "dns": _option_ips(options, 6, "DNS server", where),
         "server_id": _ipv4(server_value) if server_value is not None else None,
+        "requested_ip": (
+            _ipv4(requested_value) if requested_value is not None else None
+        ),
+        "client_id": (
+            client_id_value.hex() if client_id_value is not None else None
+        ),
     }
 
 
