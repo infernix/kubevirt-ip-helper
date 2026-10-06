@@ -3087,6 +3087,226 @@ run_declared_address_race_checks() {
   SCENARIO_DEADLINE=0
 }
 
+# ---------------------------------------------------------------------------
+# Admission-entry reconciliation and pool identity
+#
+# The webhook registers four admission entries and reconciles their content at
+# every startup: a drifted owned entry (failurePolicy, rule, path, bundle) is
+# repaired, an entry of a previous namespace is pruned, a converged
+# configuration is not rewritten, and the admission index resolves a network to
+# the pool which carries the helper's own registration identity.
+# ---------------------------------------------------------------------------
+
+webhook_vwc_resource_version() {
+  kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" \
+    -o jsonpath='{.metadata.resourceVersion}' 2> /dev/null
+}
+
+webhook_pod_replaced() { # <old-uid>
+  local pods
+  pods="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook -o json)" || return 1
+  jq -e --arg uid "$1" '
+    [.items[] | select(.metadata.deletionTimestamp == null)] as $live
+    | ($live | length) == 1
+    and all($live[];
+      .metadata.uid != $uid
+      and any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+  ' <<< "${pods}" > /dev/null
+}
+
+# Restart the singleton webhook and wait until the replacement is Ready and its
+# entries and serving identity are canonical again.
+webhook_restart() { # <case-prefix> <deadline>
+  local prefix="$1" deadline="$2" old_pod old_uid
+  old_pod="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook \
+    -o jsonpath='{.items[0].metadata.name}')" || return 1
+  old_uid="$(kubectl -n "${KIH_WEBHOOK_NAMESPACE}" get pod "${old_pod}" \
+    -o jsonpath='{.metadata.uid}')" || return 1
+  command_before_deadline "${prefix}-DELETE" "${deadline}" \
+    "the singleton webhook accepts deletion" \
+    kubectl -n "${KIH_WEBHOOK_NAMESPACE}" delete pod "${old_pod}" --wait=false
+  wait_before_deadline "${prefix}-REPLACED" "${deadline}" 180 \
+    "a replacement webhook pod is Ready" webhook_pod_replaced "${old_uid}"
+  wait_before_deadline "${prefix}-READY" "${deadline}" 180 \
+    "the replacement registers the canonical entries and serving identity" webhook_ready
+}
+
+webhook_entry_drift_live() {
+  local config
+  config="$(kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" -o json)" || return 1
+  jq -e --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_WEBHOOK_NAMESPACE}.svc" \
+    --arg stale "${WEBHOOK_PREVIOUS_ENTRY}" '
+    ([.webhooks[] | select(.name == $vmname and .clientConfig.service.path == "/validate-vm-drifted")] | length) == 1
+    and ([.webhooks[] | select(.name == $stale)] | length) == 1
+  ' <<< "${config}" > /dev/null
+}
+
+webhook_entries_reconciled() {
+  local config
+  config="$(kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" -o json)" || return 1
+  jq -e --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_WEBHOOK_NAMESPACE}.svc" \
+    --arg ns "${KIH_WEBHOOK_NAMESPACE}" --arg stale "${WEBHOOK_PREVIOUS_ENTRY}" '
+    (.webhooks | length) == 4
+    and all(.webhooks[];
+      .clientConfig.service.namespace == $ns
+      and .clientConfig.service.port == 8080
+      and (.clientConfig.caBundle | length > 0))
+    and ([.webhooks[] | select(.name == $vmname and .clientConfig.service.path == "/validate-vm")] | length) == 1
+    and ([.webhooks[] | select(.name == $stale)] | length) == 0
+  ' <<< "${config}" > /dev/null
+}
+
+admission_admits() { # <manifest>
+  local response
+  if response="$(kubectl create --dry-run=server -f "$1" 2>&1)"; then
+    printf '%s\n' "${response}" > "${1}.admission.txt"
+    return 0
+  fi
+  printf '%s\n' "${response}" > "${1}.admission.txt"
+  return 1
+}
+
+# The denial has to name the serving pool's range, not the decoy's: the range in
+# the message proves which pool the admission index resolved for the network. The
+# optional interface name is only carried by the virtualmachine entry's message.
+admission_denies_with_serving_range() { # <manifest> [interface-name]
+  local manifest="$1" nic="${2:-}" response
+  admission_rejects "${manifest}" || return 1
+  response="$(cat "${manifest}.admission.txt")" || return 1
+  [[ "${response}" == *"10.77.0.100..10.77.0.110"* ]] || return 1
+  [[ "${response}" == *"${KIH_IPPOOL_NAME}"* ]] || return 1
+  [ -z "${nic}" ] || [[ "${response}" == *"${nic}"* ]]
+}
+
+run_webhook_reconciliation_checks() {
+  local deadline drift stale_name previous_ns rv_before rv_after decoy
+  local vwc_json probe_admit probe_deny vm_probe
+  deadline=$((SECONDS + 600))
+  SCENARIO_DEADLINE="${deadline}"
+  previous_ns="${KIH_HELPER_NAMESPACE}"
+  stale_name="${KIH_WEBHOOK_SERVICE}.${previous_ns}.svc"
+  WEBHOOK_PREVIOUS_ENTRY="${stale_name}"
+  log "core: qualifying the admission-entry reconciliation"
+  assert_case CORE-WEBHOOK-ENTRY-BASELINE \
+    "the serving configuration carries the four canonical entries" webhook_ready
+  drift="${E2E_ARTIFACTS_DIR}/webhook-vwc-drifted.json"
+  vwc_json="$(kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" -o json)" ||
+    die "cannot read ${KIH_WEBHOOK_CONFIGURATION}"
+  jq --arg vmname "${KIH_WEBHOOK_SERVICE}-vm.${KIH_WEBHOOK_NAMESPACE}.svc" \
+    --arg stale "${stale_name}" --arg svc "${KIH_WEBHOOK_SERVICE}" --arg ns "${previous_ns}" '
+    (.webhooks[] | select(.name == $vmname) | .clientConfig.service.path) = "/validate-vm-drifted"
+    | (.webhooks[0].clientConfig.caBundle) as $ca
+    | .webhooks += [{
+        name: $stale,
+        clientConfig: {
+          service: {name: $svc, namespace: $ns, path: "/validate-ippool", port: 8080},
+          caBundle: $ca
+        },
+        rules: [{
+          apiGroups: ["kubevirtiphelper.k8s.binbash.org"],
+          apiVersions: ["v1"],
+          operations: ["DELETE"],
+          resources: ["ippools"],
+          scope: "*"
+        }],
+        failurePolicy: "Fail",
+        sideEffects: "None",
+        admissionReviewVersions: ["v1"]
+      }]
+  ' <<< "${vwc_json}" > "${drift}"
+  guard_case CORE-WEBHOOK-ENTRY-DRIFT-SUBMITTED \
+    "the drifted entry and the previous-namespace entry are accepted by the API server" \
+    kubectl replace -f "${drift}"
+  assert_case CORE-WEBHOOK-ENTRY-DRIFTED \
+    "the drifted path and the stale previous-namespace entry are live on the configuration" \
+    webhook_entry_drift_live
+  webhook_restart CORE-WEBHOOK-RECONCILE "${deadline}"
+  wait_before_deadline CORE-WEBHOOK-ENTRY-REPAIRED "${deadline}" 180 \
+    "the restart repairs the drifted entry and prunes the previous-namespace entry" \
+    webhook_entries_reconciled
+  assert_case CORE-WEBHOOK-ADMISSION-AFTER-RECONCILE \
+    "live admission still rejects invalid input after the entry reconciliation" \
+    webhook_admission_qualified
+  rv_before="$(webhook_vwc_resource_version)" || die "cannot read the configuration's resourceVersion"
+  webhook_restart CORE-WEBHOOK-IDEMPOTENT "${deadline}"
+  rv_after="$(webhook_vwc_resource_version)" || die "cannot read the configuration's resourceVersion"
+  assert_case CORE-WEBHOOK-ENTRY-IDEMPOTENT \
+    "a second restart of the converged webhook leaves the configuration untouched" \
+    test "${rv_before}" = "${rv_after}"
+  capture_checkpoint 34-webhook-entries-reconciled \
+    "drifted entry repaired, previous-namespace entry pruned, converged configuration stable"
+
+  log "core: qualifying the admission index against a same-networkname decoy pool"
+  decoy="${E2E_ARTIFACTS_DIR}/35-legacy-pool.yaml"
+  cat > "${decoy}" <<EOF
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
+metadata:
+  name: ${POOL_DECOY_NAME}
+spec:
+  ipv4config:
+    serverip: 10.77.0.3
+    subnet: 10.77.0.0/24
+    pool:
+      start: ${POOL_DECOY_START}
+      end: ${POOL_DECOY_END}
+    router: 10.77.0.1
+    dns:
+      - 10.77.0.1
+    domainname: primary.e2e.test
+    leasetime: 300
+  networkname: ${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}
+  bindinterface: ${KIH_HELPER_INTERFACE}
+EOF
+  kubectl apply -f "${decoy}" > /dev/null
+  assert_case CORE-WEBHOOK-POOL-DECOY-PRESENT \
+    "the unlabelled ${POOL_DECOY_NAME} carries the served networkname and a disjoint range" \
+    test "$(kubectl get ippool "${POOL_DECOY_NAME}" \
+      -o jsonpath='{.spec.networkname}')" = "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}"
+  probe_admit="${E2E_ARTIFACTS_DIR}/36-served-range-vmnetcfg.json"
+  jq -n --arg ns "${KIH_WORKLOAD_NAMESPACE}" --arg network "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" \
+    --arg ip "${POOL_DECOY_SERVED_ONLY_ADDRESS}" '
+    {apiVersion:"kubevirtiphelper.k8s.binbash.org/v1",kind:"VirtualMachineNetworkConfig",
+     metadata:{name:"webhook-pool-identity-probe",namespace:$ns},
+     spec:{vmname:"webhook-pool-identity-probe",networkconfig:[
+       {macaddress:"02:00:00:00:ff:11",networkname:$network,ipaddress:$ip}]}}
+  ' > "${probe_admit}"
+  assert_case CORE-WEBHOOK-POOL-IDENTITY-ADMITS \
+    "an address only the serving pool carries (${POOL_DECOY_SERVED_ONLY_ADDRESS}) is admitted while the decoy exists" \
+    admission_admits "${probe_admit}"
+  probe_deny="${E2E_ARTIFACTS_DIR}/37-decoy-range-vmnetcfg.json"
+  jq -n --arg ns "${KIH_WORKLOAD_NAMESPACE}" --arg network "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" \
+    --arg ip "${POOL_DECOY_ONLY_ADDRESS}" '
+    {apiVersion:"kubevirtiphelper.k8s.binbash.org/v1",kind:"VirtualMachineNetworkConfig",
+     metadata:{name:"webhook-pool-decoy-probe",namespace:$ns},
+     spec:{vmname:"webhook-pool-decoy-probe",networkconfig:[
+       {macaddress:"02:00:00:00:ff:12",networkname:$network,ipaddress:$ip}]}}
+  ' > "${probe_deny}"
+  assert_case CORE-WEBHOOK-POOL-IDENTITY-DENIES \
+    "an address only the decoy pool carries (${POOL_DECOY_ONLY_ADDRESS}) is denied against the serving range" \
+    admission_denies_with_serving_range "${probe_deny}"
+  vm_probe="${E2E_ARTIFACTS_DIR}/38-decoy-range-vm.yaml"
+  render_static_ip_vm "webhook-pool-decoy-vm" "02:00:00:00:ff:13" \
+    "${POOL_DECOY_ONLY_ADDRESS}" "${vm_probe}"
+  assert_case CORE-WEBHOOK-POOL-IDENTITY-VM-DENIES \
+    "the static-ip vm entry denies the same decoy-only address against the serving range" \
+    admission_denies_with_serving_range "${vm_probe}" "${KIH_HELPER_INTERFACE}"
+  assert_case CORE-WEBHOOK-POOL-IDENTITY-UNAFFECTED \
+    "the decoy pool leaves the serving pool and its helper untouched" \
+    pool_initialized
+  assert_case CORE-WEBHOOK-POOL-IDENTITY-UNSERVED \
+    "the helper never registers the decoy: its status stays untouched" \
+    decoy_pool_unserved "${POOL_DECOY_NAME}"
+  kubectl delete ippool "${POOL_DECOY_NAME}" --wait=true --timeout=120s > /dev/null
+  assert_case CORE-WEBHOOK-POOL-DECOY-REMOVED \
+    "the decoy pool is removed again" \
+    object_absent_not_found get ippool "${POOL_DECOY_NAME}"
+  guard_case CORE-WEBHOOK-RECONCILE-DEADLINE \
+    "webhook reconciliation scenarios completed within their own deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+}
+
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
   local image_id webhook_image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
@@ -3417,6 +3637,7 @@ main() {
   run_static_ip_checks
   run_static_ip_release_checks
   run_declared_address_race_checks
+  run_webhook_reconciliation_checks
 
   case "${E2E_GROUP}" in
     all)
