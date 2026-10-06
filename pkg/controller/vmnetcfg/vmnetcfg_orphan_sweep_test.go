@@ -386,3 +386,72 @@ func TestVMNetCfgOrphanSweepRetriesAFailedDelete(t *testing.T) {
 		t.Error("the failed delete must surface the failure as an error")
 	}
 }
+
+// a transient verification failure must not convert the cleanup of an
+// orphaned binding into a re-claim: the caller used to treat the sweep's
+// overloaded "false" as "not an orphan, allocate", so the released address
+// of a deleted vm came back (the measured bulk-teardown resurrection). the
+// unverified verdict must skip the allocation path entirely, and the next
+// resync with a working verifier must sweep the binding.
+func TestVMNetCfgOrphanSweepUnverifiedDoesNotReclaim(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(nil)
+
+	// the binding outlived its vm: its spec records the address while the
+	// lease, the claim and the ledger record are already released - the
+	// state a bulk teardown leaves behind
+	vmnetcfg := newOrphanVMNetCfg()
+	e.seedVMNetCfg(vmnetcfg)
+
+	parentExists := true
+	verificationErr := errors.New("api read failed")
+	e.controller.verifyVM = func(namespace string, name string) (bool, error) {
+		if namespace != testNamespace || name != testVMName {
+			t.Errorf("the vm verification queried %s/%s, want %s/%s", namespace, name, testNamespace, testVMName)
+		}
+
+		return parentExists, verificationErr
+	}
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+		t.Fatalf("the unverified sweep must not fail the sync: %s", err)
+	}
+
+	// no delete and no allocation write: the sync stopped at the verdict
+	if n := e.countRequests(http.MethodDelete, vmnetcfgMainPath); n != 0 {
+		t.Fatalf("delete requests = %d, want 0 while the vm is unverified", n)
+	}
+	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
+		t.Errorf("spec writes = %d, want 0: an unverified vm must not fall through to allocation", n)
+	}
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
+		t.Errorf("status writes = %d, want 0: an unverified vm must not fall through to allocation", n)
+	}
+
+	// no ledger record, no lease, no claim: the released address stays released
+	if allocated := e.getStoredPool().Status.IPv4.Allocated; len(allocated) != 0 {
+		t.Errorf("ledger = %v, want no record for an unverified vm", allocated)
+	}
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("no lease may be published for a vm whose existence is unverified")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0: the released address must stay released", used)
+	}
+
+	// the next resync verifies the vm is definitively gone and sweeps it
+	verificationErr = nil
+	parentExists = false
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+		t.Fatalf("the retried sweep failed: %s", err)
+	}
+	if n := e.countRequests(http.MethodDelete, vmnetcfgMainPath); n != 1 {
+		t.Fatalf("delete requests = %d, want the swept 1", n)
+	}
+	if stored := e.getStoredVMNetCfg(); stored.DeletionTimestamp == nil {
+		t.Error("the retried sweep must route the orphan into the deletion flow")
+	}
+}

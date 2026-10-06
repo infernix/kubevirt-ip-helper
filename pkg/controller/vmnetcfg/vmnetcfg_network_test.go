@@ -68,6 +68,12 @@ func TestVMNetCfgTwoNetworksRebaseInterleavedCommits(t *testing.T) {
 	a := newTestEnv(t)
 	a.appStatus.Store(APP_RUNNING)
 	b := networkPeer(t, a, "net-other")
+	// both helpers reconcile a live vm's binding: the orphan sweep verifies
+	// the vm and lets the allocation path proceed. without a verifier a
+	// managed binding is unverified, so neither helper would allocate
+	liveVM := func(string, string) (bool, error) { return true, nil }
+	a.controller.verifyVM = liveVM
+	b.controller.verifyVM = liveVM
 	seedNetworkPool(t, a, testPoolName, nil)
 	seedNetworkPool(t, b, "pool-other", nil)
 	obj := newVMNetCfg("", testMAC)
@@ -381,6 +387,9 @@ func TestVMNetCfgLiveStatusCommitRejectsDeletionRace(t *testing.T) {
 	obj := newVMNetCfg("10.0.0.1", testMAC)
 	obj.Finalizers = []string{networkCleanupFinalizer}
 	e.seedVMNetCfg(obj)
+	// the vm is live: the orphan sweep must let the allocation path (and its
+	// status commit) proceed
+	e.controller.verifyVM = func(string, string) (bool, error) { return true, nil }
 	e.api.vmnetcfgStatusPutConflict = 1
 	e.api.vmnetcfgStatusPutConflictFn = func(current *kihv1.VirtualMachineNetworkConfig) {
 		now := metav1.Now()
