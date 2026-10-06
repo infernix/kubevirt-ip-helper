@@ -1665,11 +1665,28 @@ cleanup_pool_group() {
     --ignore-not-found --wait=true --timeout=120s > /dev/null
 }
 cleanup_stale_expanded_resources() {
+  local i name
   cleanup_pool_group
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm \
     multipool-vm multipool-guest multipool-shared multipool-primary-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg \
     multipool-vm multipool-guest multipool-shared multipool-primary-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
+  # The static-ip withdrawal, declared-address and batch-teardown fixtures of an
+  # interrupted run, plus the unlabelled decoy pool the admission index probe
+  # creates: they are named after their scenario and deleted here so a retained
+  # cluster never starts the next run with a reservation or a decoy in the way.
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm \
+    "${STATIC_IP_RELEASE_VM}" "${STATIC_IP_RECLAIM_VM}" pool-vm-drain \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
+  for i in $(seq 1 "${STATIC_IP_FILL_COUNT}"); do
+    name="$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" "${i}")"
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${name}" \
+      --ignore-not-found --wait=true --timeout=120s > /dev/null
+  done
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${DECLARED_RACE_VM}" \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
+  kubectl delete ippool "${POOL_DECOY_NAME}" \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl delete ippool e2e-pool-second \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl -n "${KIH_HELPER_NAMESPACE}" delete network-attachment-definition \
@@ -1680,6 +1697,85 @@ cleanup_stale_expanded_resources() {
     --ignore-not-found > /dev/null
 }
 
+
+# The pool group's batch teardown. Ten of the eleven reservations are deleted
+# together, the eleventh is held back until the drain has demonstrably served a
+# new reservation, and then it is deleted too: that keeps the "a new reservation
+# is served while the drain runs" observation deterministic instead of a race
+# between the helper's cleanup queue and the new object. Afterwards the pool's
+# durable counter must never rise again, and no batch vmnetcfg may outlive its
+# own vm beyond the drain bound.
+pool_bulk_drain_serves() { # <held-member> <batch-member>...
+  local held="$1" name drained=0
+  shift
+  for name in "$@"; do
+    if ! kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vm "${name}" > /dev/null 2>&1 &&
+      ! kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${name}" > /dev/null 2>&1; then
+      drained=$((drained + 1))
+    fi
+  done
+  [ "${drained}" -ge 1 ] || return 1
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vm "${held}" > /dev/null 2>&1 || return 1
+  vm_managed_reservation pool-vm-drain OK
+}
+
+pool_bulk_drain_complete() { # <batch-member>...
+  local name
+  for name in "$@"; do
+    vm_absent_named "${name}" || return 1
+    vmnetcfg_absent_named "${name}" || return 1
+  done
+  vm_managed_reservation pool-vm-drain OK &&
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 1 10
+}
+
+# Sample the durable counter repeatedly: a released reservation which an orphan
+# sweep or a delayed cleanup re-adds would raise used again after the drain
+# converged, which a single post-drain read cannot see.
+pool_used_stable() { # <expected-used> <samples> <interval-seconds>
+  local expected="$1" samples="$2" interval="$3" i snapshot used
+  for i in $(seq 1 "${samples}"); do
+    snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+    used="$(jq -r '.used' <<< "${snapshot}")" || return 1
+    [ "${used}" = "${expected}" ] || return 1
+    [ "${i}" = "${samples}" ] || sleep "${interval}"
+  done
+}
+
+run_pool_bulk_teardown() {
+  local deadline="$1" i name held="pool-vm-reclaim" drain_mac="02:00:00:00:01:dd"
+  local -a batch=()
+  for i in $(seq 1 10); do
+    batch+=("$(printf 'pool-vm-%02d' "${i}")")
+  done
+  assert_case POOL-BULK-BASELINE \
+    "the batch teardown starts from the full pool with eleven named reservations" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
+  capture_checkpoint 35-pool-bulk-before "eleven reservations before the batch teardown"
+  command_before_deadline POOL-BULK-DELETE "${deadline}" \
+    "ten reservations accept asynchronous deletion as one batch" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${batch[@]}" --wait=false
+  render_halted_vm pool-vm-drain "${drain_mac}" "${E2E_ARTIFACTS_DIR}/36-pool-vm-drain.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/36-pool-vm-drain.yaml" > /dev/null
+  wait_before_deadline POOL-BULK-DRAIN-SERVES "${deadline}" 180 \
+    "a new reservation is served while the batch drain is still running" \
+    pool_bulk_drain_serves "${held}" "${batch[@]}"
+  command_before_deadline POOL-BULK-DELETE-HELD "${deadline}" \
+    "the held reservation accepts asynchronous deletion once the drain served the new one" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${held}" --wait=false
+  wait_before_deadline POOL-BULK-DRAIN-COMPLETE "${deadline}" 240 \
+    "no batch vmnetcfg outlives its vm and the drain releases every batch address" \
+    pool_bulk_drain_complete "${batch[@]}" "${held}"
+  assert_case POOL-BULK-USED-STABLE \
+    "the pool's used count never rises again after the drain converged" \
+    pool_used_stable 1 5 6
+  capture_checkpoint 36-pool-bulk-drained \
+    "batch drained to the new reservation without a resurrected allocation"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-drain \
+    --wait=true --timeout=120s > /dev/null
+  wait_before_deadline POOL-BULK-CLEANUP "${deadline}" 180 \
+    "the batch teardown returns the empty pool" pool_initialized
+}
 
 run_pool_group() {
   report_group pool
@@ -1824,6 +1920,7 @@ EOF
   wait_before_deadline POOL-RECLAIM-COUNTS "${deadline}" 60 "reclaim fills the pool again" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
 
+  run_pool_bulk_teardown "${deadline}"
   cleanup_pool_group
   wait_before_deadline POOL-CLEANUP-CAPACITY "${deadline}" 180 \
     "pool group cleanup returns exact capacity" pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
@@ -1831,7 +1928,7 @@ EOF
   guard_case POOL-DEADLINE "pool scenarios completed within their original deadline" \
     test "${SECONDS}" -lt "${deadline}"
   SCENARIO_DEADLINE=0
-  printf 'PASS pool group: exhaustion, refusal, duplicate MAC, reclaim, and out-of-range request\n' \
+  printf 'PASS pool group: exhaustion, refusal, duplicate MAC, reclaim, out-of-range request, and batch teardown\n' \
     > "${E2E_ARTIFACTS_DIR}/11-pool-group.txt"
 }
 
