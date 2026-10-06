@@ -1779,7 +1779,7 @@ run_pool_bulk_teardown() {
 
 run_pool_group() {
   report_group pool
-  local deadline i name mac manifest refused_ip reclaim_ip old_vm old_mac duplicate_before duplicate_marker
+  local deadline i name mac manifest refused_ip reclaim_ip old_vm old_mac duplicate_before duplicate_marker log_baseline
   deadline=$((SECONDS + 720))
   SCENARIO_DEADLINE="${deadline}"
   log "group pool: filling all eleven addresses"
@@ -1795,6 +1795,9 @@ run_pool_group() {
     pool_group_allocations_ready
   wait_before_deadline POOL-EXHAUSTION "${deadline}" 60 "pool reports exhaustion" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
+  assert_case POOL-EXHAUSTION-ZERO-COUNTERS-PUBLISHED \
+    "the exhausted pool publishes available 0 rather than omitting it" \
+    test "$(pool_status_counter "${KIH_IPPOOL_NAME}" available)" = "0"
   capture_checkpoint 11-pool-filled "eleven reservations fill ${KIH_IPPOOL_NAME}"
 
   log "group pool: refusing a twelfth reservation without disturbing existing leases"
@@ -1832,12 +1835,16 @@ run_pool_group() {
     "${E2E_ARTIFACTS_DIR}/13-duplicate-mac.yaml"
   duplicate_marker='belongs to e2e/pool-vm-01 instead of e2e/pool-vm-duplicate'
   duplicate_before="$(reload_snapshot "${duplicate_marker}")"
+  log_baseline="$(app_logs_total)" || die "cannot read the application log counter"
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/13-duplicate-mac.yaml" > /dev/null
   wait_before_deadline POOL-DUPLICATE-REFUSED "${deadline}" 90 \
     "the VM controller refuses the duplicate before creating a reservation" \
     duplicate_mac_refused "${duplicate_before}" "${duplicate_marker}"
   wait_before_deadline POOL-DUPLICATE-ACCOUNTING "${deadline}" 60 "duplicate MAC leaves pool accounting unchanged" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
+  wait_before_deadline POOL-LOG-COUNTER "${deadline}" 60 \
+    "the refusal is counted in the application log metric the leader serves" \
+    app_logs_risen "${log_baseline}"
   assert_case POOL-DUPLICATE-ORIGINAL-RESERVATION \
     "pool-vm-01 keeps its address and accounting entry" \
     named_reservation_kept pool-vm-01 02:00:00:00:01:01
@@ -3551,6 +3558,9 @@ main() {
 
   kubectl apply -f "${E2E_DIR}/manifests/pool.yaml"
   wait_for CORE-POOL-INITIALIZED 120 "IPPool initialized with 11 available addresses" pool_initialized
+  assert_case CORE-POOL-ZERO-COUNTERS-PUBLISHED \
+    "the fresh pool publishes used 0 and available 11 rather than omitting them" \
+    test "$(pool_status_counter "${KIH_IPPOOL_NAME}" used)" = "0"
   assert_case CORE-WEBHOOK-VMNETCFG-ADMISSION \
     "VMNetCfg range validation uses live admission and the configured pool" webhook_vmnetcfg_admission_qualified
   wait_for CORE-LEADER-SERVICES 120 "leader owns ${KIH_IPPOOL_SERVER}/24 and UDP/67" leader_services_healthy
