@@ -1685,6 +1685,20 @@ cleanup_stale_expanded_resources() {
   done
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${DECLARED_RACE_VM}" \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
+  # The orphan-sweep fixture of an interrupted run: its batch VMs are deleted
+  # while the helper is absent, so a retained cluster can hold their stranded
+  # bindings; both the VMs and the bindings are removed here.
+  for i in $(seq 1 "${ORPHAN_SWEEP_BATCH}"); do
+    name="$(printf '%s-%02d' "${ORPHAN_SWEEP_VM_PREFIX}" "${i}")"
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${name}" \
+      --ignore-not-found --wait=true --timeout=120s > /dev/null
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg "${name}" \
+      --ignore-not-found --wait=true --timeout=120s > /dev/null
+  done
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${ORPHAN_SWEEP_LIVE_VM}" \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg "${ORPHAN_SWEEP_LIVE_VM}" \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl delete ippool "${POOL_DECOY_NAME}" \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl delete ippool e2e-pool-second \
@@ -2683,6 +2697,36 @@ POOL_DECOY_END="10.77.0.210"
 POOL_DECOY_ONLY_ADDRESS="${POOL_DECOY_START}"
 POOL_DECOY_SERVED_ONLY_ADDRESS="10.77.0.105"
 
+# ---------------------------------------------------------------------------
+# Orphan sweep with the helper absent
+#
+# The vm controller is the only writer which deletes a VMNetCfg when its
+# VirtualMachine goes away, so a VM deleted while the helper is down produces no
+# event any restart could replay: the fresh informer lists only what still
+# exists. Such a binding keeps its cleanup finalizer and its address stays
+# allocated to a deleted VM until the pass-level sweep recovers it. This scenario
+# is the one place which creates that state: it scales the helper deployment to
+# zero, deletes a batch of halted reservations while no controller can observe
+# them, and then requires the returning helper to sweep every stranded binding.
+#
+# The batch is halted reservations rather than guests, because the harness already
+# proves that a halted VM reserves through the same controller path, so no guest
+# has to boot for a helper outage. One further halted VM stays live throughout as
+# the negative control: the pass considers its binding and must leave it, its
+# address and its ledger owner untouched.
+ORPHAN_SWEEP_BATCH=3
+ORPHAN_SWEEP_VM_PREFIX="orphan-sweep-vm"
+ORPHAN_SWEEP_LIVE_VM="orphan-sweep-live"
+ORPHAN_SWEEP_LIVE_MAC="02:00:00:00:0e:10"
+ORPHAN_SWEEP_MAC_PREFIX="02:00:00:00:0e"
+# Every stranded binding must be swept and the pool must be back at its baseline
+# within this bound. The bound covers the returning leader's scheduling, its Lease
+# acquisition (the outgoing leader releases explicitly, but a lost release waits
+# out the 60s lease duration), the immediate pass and the finalizer cleanup the
+# sweep routes each orphan through - never the pass's own drain rate, which is one
+# listing of the informer store.
+ORPHAN_SWEEP_BOUND=240
+
 # The request is the annotation of the VirtualMachine metadata, next to the
 # ordinary metadata of the rendered guest template.
 render_static_ip_vm() { # <name> <mac> <address> <output>
@@ -3189,6 +3233,252 @@ run_declared_address_race_checks() {
     "declared-address scenarios completed within their own deadline" \
     test "${SECONDS}" -lt "${deadline}"
   SCENARIO_DEADLINE=0
+}
+
+# ---------------------------------------------------------------------------
+# Orphan sweep with the helper absent
+#
+# The scenario body is run_orphan_sweep_checks below; the fixture constants sit
+# with the other scenario fixtures.
+# ---------------------------------------------------------------------------
+
+# The pool's used counter against the capacity derived from the pool's own spec,
+# so a batch size can never disagree with the available side of the assertion.
+pool_used_is() { # <pool> <used>
+  local capacity
+  capacity="$(capacity_from_spec "$1")" || return 1
+  pool_counts_equal "$1" "$2" "$((capacity - $2))"
+}
+
+# The fixture the scenario later has to return to: every named binding exists, is
+# controller-managed (the recorded reservation and the cleanup finalizer), and the
+# pool's used counter equals the number of those bindings. Both numbers are read
+# from the API and written next to the report, so the baseline the scenario
+# returns to is evidence rather than an assumption about the batch size.
+orphan_sweep_fixture_ready() { # <expected-used> <name>...
+  local expected="$1" name bindings=0
+  shift
+  for name in "$@"; do
+    vm_managed_reservation "${name}" OK || return 1
+    bindings=$((bindings + 1))
+  done
+  printf '%s\t%s\n' "${expected}" "${bindings}" > "${E2E_ARTIFACTS_DIR}/orphan-sweep-fixture.tsv"
+  pool_used_is "${KIH_IPPOOL_NAME}" "${expected}"
+}
+
+# No helper pod at all - not merely an unready one - is the deterministic form of
+# "no controller is watching": the deployment is scaled to zero and the last
+# terminating pod has left the API, so no process can observe the deletions which
+# follow. Waiting for the pods to be unready instead would leave a SIGTERM'd
+# controller able to deliver the very events this scenario has to withhold.
+helper_pods_absent() {
+  local pods replicas
+  replicas="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${HELPER_DEPLOYMENT}" \
+    -o jsonpath='{.spec.replicas}' 2> /dev/null)" || return 1
+  [ "${replicas}" = "0" ] || return 1
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
+    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
+  [ -z "${pods}" ]
+}
+
+orphan_sweep_vms_gone() { # <name>...
+  local name
+  for name in "$@"; do
+    vm_absent_named "${name}" || return 1
+  done
+}
+
+# The stranded state: the batch VMs are gone while no helper pod exists, yet every
+# controller-managed binding is still there with its cleanup finalizer and its
+# single recorded row, because nothing ever observed the deletion.
+orphan_sweep_stranded() { # <name>...
+  local name object
+  for name in "$@"; do
+    vm_absent_named "${name}" || return 1
+    object="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${name}" -o json)" || return 1
+    jq -e '
+      .metadata.deletionTimestamp == null
+      and ((.metadata.finalizers // []) | index("kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup") != null)
+      and ((.spec.networkconfig // []) | length) == 1
+    ' <<< "${object}" > /dev/null || return 1
+  done
+}
+
+# The recovery: every named binding is gone and the pool is back at its baseline,
+# which is the live control's single reservation.
+orphan_sweep_drained() { # <baseline-used> <name>...
+  local baseline="$1" name
+  shift
+  for name in "$@"; do
+    vmnetcfg_absent_named "${name}" || return 1
+  done
+  pool_used_is "${KIH_IPPOOL_NAME}" "${baseline}"
+}
+
+# The negative control: the live VM's binding, its recorded reservation and the
+# ledger entry which names its owner all survive the pass, and its address is
+# still the one it held before the outage.
+orphan_sweep_live_kept() { # <vm> <mac> <address>
+  named_reservation_kept "$1" "$2" || return 1
+  [ "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "$1" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null)" = "$3" ]
+}
+
+# The pass's own log line is the only evidence which separates the pass-level
+# recovery from the per-object reconcile that also runs when a restarted
+# controller replays its informer, so the magnitudes are parsed out of the line
+# rather than merely matched: every accepted line has to have considered at least
+# as many bindings as it swept, and the sweep of this scenario's stranded batch
+# has to be covered by the lines the returning leader logged. Summing over the
+# leader's lines keeps a pass that hit a transient verification error and left a
+# binding for the next pass covered, while a drain the pass never reported at all
+# still fails. The parsed lines are written next to the report, so a failure shows
+# what the pass actually said.
+orphan_sweep_pass_log() { # <minimum-swept>
+  local minimum="$1" pods pod logs line considered swept total=0 lines=0
+  local evidence="${E2E_ARTIFACTS_DIR}/orphan-sweep-pass.tsv"
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
+    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
+  [ -n "${pods}" ] || return 1
+  : > "${evidence}"
+  for pod in ${pods}; do
+    logs="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" 2> /dev/null)" || return 1
+    while IFS= read -r line; do
+      [ -n "${line}" ] || continue
+      considered="${line#*considered }"
+      considered="${considered%% binding*}"
+      swept="${line#*and swept }"
+      swept="${swept%% orphaned*}"
+      case "${considered}" in '' | *[!0-9]*) continue ;; esac
+      case "${swept}" in '' | *[!0-9]*) continue ;; esac
+      [ "${considered}" -ge "${swept}" ] || continue
+      printf '%s\t%s\t%s\n' "${pod}" "${considered}" "${swept}" >> "${evidence}"
+      total=$((total + swept))
+      lines=$((lines + 1))
+    done < <(grep -F 'one sweep pass considered ' <<< "${logs}" || true)
+  done
+  [ "${lines}" -gt 0 ] || return 1
+  [ "${total}" -ge "${minimum}" ]
+}
+
+# The happy path never has to skip a classification: a pass which cannot verify a
+# VirtualMachine warns and leaves that binding alone, so the absence of that line
+# proves every stranded binding was classified against the authoritative read.
+orphan_sweep_no_unverified_warn() {
+  local pods pod logs
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
+    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
+  [ -n "${pods}" ] || return 1
+  for pod in ${pods}; do
+    logs="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" 2> /dev/null)" || return 1
+    ! grep -qF 'cannot verify the VirtualMachine' <<< "${logs}" || return 1
+  done
+  return 0
+}
+
+# The helper-absent bulk deletion: allocate a batch of halted reservations plus a
+# live control, scale the helper to zero, delete the batch with no controller
+# watching, and require the returning helper to sweep every stranded binding in
+# one pass while the live control survives it.
+run_orphan_sweep_checks() {
+  local deadline i name live_ip
+  local -a batch=()
+  deadline=$((SECONDS + 480))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: orphan sweep while the helper is absent"
+  for i in $(seq 1 "${ORPHAN_SWEEP_BATCH}"); do
+    batch+=("$(printf '%s-%02d' "${ORPHAN_SWEEP_VM_PREFIX}" "${i}")")
+  done
+
+  # The sweep's fixture is the pool's own baseline: it starts empty and has to
+  # return to empty, so the stranded batch is the only variable of the scenario.
+  wait_before_deadline CORE-ORPHAN-SWEEP-BASELINE "${deadline}" 90 \
+    "orphan sweep starts from an empty pool" pool_initialized
+
+  # Halted reservations, not guests: the harness already proves that a halted VM
+  # reserves through the ordinary controller path, so no guest has to boot for a
+  # helper outage. The live control is created here and not deleted before the
+  # pass, so the pass has to classify a live binding beside the orphans.
+  for i in $(seq 1 "${ORPHAN_SWEEP_BATCH}"); do
+    name="${batch[$((i - 1))]}"
+    render_halted_vm "${name}" "$(printf '%s:%02x' "${ORPHAN_SWEEP_MAC_PREFIX}" "${i}")" \
+      "${E2E_ARTIFACTS_DIR}/37-${name}.yaml"
+    kubectl apply -f "${E2E_ARTIFACTS_DIR}/37-${name}.yaml" > /dev/null
+  done
+  render_halted_vm "${ORPHAN_SWEEP_LIVE_VM}" "${ORPHAN_SWEEP_LIVE_MAC}" \
+    "${E2E_ARTIFACTS_DIR}/37-orphan-sweep-live.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/37-orphan-sweep-live.yaml" > /dev/null
+  wait_before_deadline CORE-ORPHAN-SWEEP-FIXTURE "${deadline}" 180 \
+    "the ${ORPHAN_SWEEP_BATCH}-VM batch and the live control reserve one address each" \
+    orphan_sweep_fixture_ready "$((ORPHAN_SWEEP_BATCH + 1))" "${batch[@]}" "${ORPHAN_SWEEP_LIVE_VM}"
+  live_ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${ORPHAN_SWEEP_LIVE_VM}" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
+  report_note ORPHAN-SWEEP-FIXTURE \
+    "used $((ORPHAN_SWEEP_BATCH + 1)) over $((ORPHAN_SWEEP_BATCH + 1)) controller-managed bindings before the helper outage"
+  capture_checkpoint 37-orphan-sweep-fixture \
+    "${ORPHAN_SWEEP_BATCH} halted batch reservations and one live control hold the pool"
+
+  log "core: deleting the batch while no helper can observe it"
+  guard_case CORE-ORPHAN-SWEEP-SCALE-DOWN "the helper deployment scales to zero replicas" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" scale deployment "${HELPER_DEPLOYMENT}" --replicas=0
+  wait_before_deadline CORE-ORPHAN-SWEEP-HELPER-ABSENT "${deadline}" 120 \
+    "every helper pod has left, so no controller can observe the deletions" helper_pods_absent
+  command_before_deadline CORE-ORPHAN-SWEEP-VM-DELETE "${deadline}" \
+    "the batch accepts asynchronous deletion with the helper absent" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${batch[@]}" --wait=false
+  wait_before_deadline CORE-ORPHAN-SWEEP-VM-GONE "${deadline}" 120 \
+    "the batch VirtualMachines are gone and nothing observed it" orphan_sweep_vms_gone "${batch[@]}"
+  assert_case CORE-ORPHAN-SWEEP-STRANDED \
+    "the batch bindings keep their finalizer and allocation with no helper running" \
+    orphan_sweep_stranded "${batch[@]}"
+  assert_case CORE-ORPHAN-SWEEP-STRANDED-ACCOUNTING \
+    "the stranded bindings still hold their addresses in the pool" \
+    pool_used_is "${KIH_IPPOOL_NAME}" "$((ORPHAN_SWEEP_BATCH + 1))"
+  # No object checkpoint is captured while the helper is absent: the evidence
+  # layer's topology expectation requires helper pods for the primary network, so
+  # the stranded state is recorded as an explicit artifact instead of as a
+  # checkpoint whose own contract would have to be relaxed for it.
+  jq -n \
+    --argjson vmnetcfgs "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg -o json)" \
+    --argjson pool "$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o json)" \
+    '{vmnetcfgs:$vmnetcfgs, pool:$pool}' \
+    > "${E2E_ARTIFACTS_DIR}/38-orphan-sweep-stranded.json"
+
+  log "core: the returning helper sweeps the stranded bindings"
+  guard_case CORE-ORPHAN-SWEEP-SCALE-UP "the helper deployment scales back to two replicas" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" scale deployment "${HELPER_DEPLOYMENT}" --replicas=2
+  wait_before_deadline CORE-ORPHAN-SWEEP-HELPER-RETURNED "${deadline}" 180 \
+    "two helper replicas are Ready again" helper_pods_ready
+  wait_before_deadline CORE-ORPHAN-SWEEP-SERVICES "${deadline}" 180 \
+    "the returning leader owns the server address, UDP/67 and the metrics service" leader_services_healthy
+  wait_before_deadline CORE-ORPHAN-SWEEP-DRAINED "${deadline}" "${ORPHAN_SWEEP_BOUND}" \
+    "every stranded binding is swept and the pool returns to the live control's reservation within ${ORPHAN_SWEEP_BOUND}s" \
+    orphan_sweep_drained 1 "${batch[@]}"
+  assert_case CORE-ORPHAN-SWEEP-USED-STABLE \
+    "the pool's used count never rises again after the sweep converged" \
+    pool_used_stable 1 5 6
+  assert_case CORE-ORPHAN-SWEEP-LIVE-KEPT \
+    "the live VM's binding, address and ledger owner survive the pass" \
+    orphan_sweep_live_kept "${ORPHAN_SWEEP_LIVE_VM}" "${ORPHAN_SWEEP_LIVE_MAC}" "${live_ip}"
+  assert_case CORE-ORPHAN-SWEEP-PASS-LOG \
+    "the returning leader logged the pass which swept the stranded batch, not a per-object reconcile" \
+    orphan_sweep_pass_log "${ORPHAN_SWEEP_BATCH}"
+  assert_case CORE-ORPHAN-SWEEP-NO-UNVERIFIED-WARN \
+    "the happy path never skipped a binding for an unverifiable VirtualMachine" \
+    orphan_sweep_no_unverified_warn
+  capture_checkpoint 38-orphan-sweep-recovered \
+    "stranded bindings swept, live control intact, pool back at its baseline"
+
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${ORPHAN_SWEEP_LIVE_VM}" \
+    --wait=true --timeout=120s > /dev/null
+  wait_before_deadline CORE-ORPHAN-SWEEP-TEARDOWN "${deadline}" 120 \
+    "deleting the live control returns the empty pool" pool_initialized
+  guard_case CORE-ORPHAN-SWEEP-DEADLINE \
+    "orphan sweep scenarios completed within their own deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+  printf 'PASS orphan sweep: helper-absent batch deletion recovered by one pass; live control intact\n' \
+    > "${E2E_ARTIFACTS_DIR}/15-orphan-sweep.txt"
 }
 
 # ---------------------------------------------------------------------------
@@ -3745,6 +4035,7 @@ main() {
   run_static_ip_release_checks
   run_declared_address_race_checks
   run_webhook_reconciliation_checks
+  run_orphan_sweep_checks
 
   case "${E2E_GROUP}" in
     all)
