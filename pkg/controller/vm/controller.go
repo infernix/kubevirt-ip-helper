@@ -149,6 +149,21 @@ func (c *Controller) handleErr(err error, key interface{}) {
 		return
 	}
 
+	// a DELETE whose teardown failed must never be forgotten: the object is
+	// already gone from the informer store, so a forgotten key is never
+	// delivered again and the binding - with its lease, claim and ledger
+	// record - stays stranded until the next process era. the delete path
+	// converges (a NotFound is success) and the same-name-replacement guard
+	// of sync re-checks the informer store on every retry, so an unbounded
+	// retry is safe; the rate limiter bounds the attempt interval.
+	if event, isEvent := key.(Event); isEvent && event.action == DELETE {
+		log.Errorf("(vm.handleErr) retrying the deletion of VirtualMachine %v: %v", key, err)
+
+		c.queue.AddRateLimited(key)
+
+		return
+	}
+
 	if c.queue.NumRequeues(key) < 5 {
 		log.Errorf("(vm.handleErr) syncing VirtualMachine %v: %v", key, err)
 

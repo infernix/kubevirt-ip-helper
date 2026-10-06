@@ -2604,3 +2604,72 @@ func TestEnqueueVirtualMachineUpdateRecordsStaticIPReleases(t *testing.T) {
 		t.Errorf("queue length = %d, want 0: foreign objects must stay dropped", queue.Len())
 	}
 }
+
+// a DELETE whose teardown keeps failing must never be forgotten: the object
+// is already gone from the informer store, so a forgotten key is never
+// delivered again and the binding - with its lease, claim and ledger record
+// - stays stranded with nobody to delete it. the retained key must keep
+// retrying beyond the five-attempt budget and converge once the api
+// recovers, without any new event.
+func TestHandleErrRetriesFailedDeleteBeyondTheRequeueBudget(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	queue := newTestQueue()
+	c.queue = queue
+	c.indexer = newTestIndexer()
+	t.Cleanup(queue.ShutDown)
+
+	f.mu.Lock()
+	f.vmnetcfgs["default/vm-test"] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "vm-test",
+			Namespace:  "default",
+			Finalizers: []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"},
+		},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{
+			VMName:        "vm-test",
+			NetworkConfig: []kihv1.NetworkConfig{testNetCfg("aa:bb:cc:00:00:01", "default/net-a", "")},
+		},
+	}
+	f.mu.Unlock()
+
+	f.vmnetcfgDeleteStatus = http.StatusInternalServerError
+	f.vmnetcfgDeleteErr = "boom"
+
+	event := testEvent(DELETE)
+	queue.Add(event)
+
+	// drive more attempts than the requeue budget allows: the object is
+	// gone from the store, so only the retained key can drive the deletion
+	for i := 0; i < 7 && queue.Len() > 0; i++ {
+		if !c.processNextItem() {
+			t.Fatal("the queue shut down while the delete was being retried")
+		}
+	}
+
+	if n := queue.Len(); n != 1 {
+		t.Fatalf("queue length after 7 failed delete attempts = %d, want 1 (the delete must not be forgotten)", n)
+	}
+	if n := queue.NumRequeues(event); n < 6 {
+		t.Errorf("requeues of the retained delete = %d, want >= 6 (beyond the budget)", n)
+	}
+	if f.storedVMNetCfg("default/vm-test") == nil {
+		t.Fatal("the binding must survive the failed deletes")
+	}
+
+	// the api recovers: the retained key converges without any new event
+	f.vmnetcfgDeleteStatus = 0
+
+	for i := 0; i < 5 && queue.Len() > 0; i++ {
+		if !c.processNextItem() {
+			break
+		}
+	}
+
+	if f.storedVMNetCfg("default/vm-test") != nil {
+		t.Error("the retained delete must converge once the api recovers")
+	}
+	if n := queue.Len(); n != 0 {
+		t.Errorf("queue length after the converged delete = %d, want 0", n)
+	}
+}
