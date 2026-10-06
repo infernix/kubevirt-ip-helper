@@ -2961,6 +2961,132 @@ pool_has_free_slot() {
   pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1
 }
 
+# ---------------------------------------------------------------------------
+# Declared-address exclusion
+#
+# One halted vm carries ten dynamic interfaces followed by one declaring
+# interface on the same NAD, so a single reconciliation allocates the dynamic
+# interfaces before the declaring one. Every dynamic row must carry an in-range
+# address other than the declared one, the declaring row must carry exactly the
+# declared address, and the pool must be exactly full: a helper which let a
+# fresh allocation take a declared address would hand that address to a dynamic
+# interface and refuse the declaring one instead.
+# ---------------------------------------------------------------------------
+
+render_declared_race_vm() { # <name> <declared-address> <output>
+  local name="$1" declared="$2" output="$3" i
+  {
+    cat <<EOF
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ${name}
+  namespace: ${KIH_WORKLOAD_NAMESPACE}
+  annotations:
+    ${KIH_STATIC_IP_ANNOTATION}: '{"${DECLARED_RACE_DECLARING_NIC}":"${declared}"}'
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-e2e
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 256Mi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+EOF
+    for i in $(seq 0 $((DECLARED_RACE_DYNAMIC_NICS - 1))); do
+      printf '            - name: racedyn%s\n              bridge: {}\n              macAddress: %s:%02x\n' \
+        "${i}" "${DECLARED_RACE_DYNAMIC_MAC_PREFIX}" "$((i + 1))"
+    done
+    printf '            - name: %s\n              bridge: {}\n              macAddress: %s\n' \
+      "${DECLARED_RACE_DECLARING_NIC}" "${DECLARED_RACE_DECLARING_MAC}"
+    printf '      networks:\n'
+    for i in $(seq 0 $((DECLARED_RACE_DYNAMIC_NICS - 1))); do
+      printf '        - name: racedyn%s\n          multus:\n            networkName: %s/%s\n' \
+        "${i}" "${KIH_HELPER_NAMESPACE}" "${KIH_NAD_NAME}"
+    done
+    printf '        - name: %s\n          multus:\n            networkName: %s/%s\n' \
+      "${DECLARED_RACE_DECLARING_NIC}" "${KIH_HELPER_NAMESPACE}" "${KIH_NAD_NAME}"
+    cat <<EOF
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: ${KIH_GUEST_IMAGE}
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: ${KIH_GUEST_USERDATA_SECRET}
+EOF
+  } > "${output}"
+}
+
+declared_race_converged() {
+  local config snapshot declared="${DECLARED_RACE_ADDRESS}"
+  config="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${DECLARED_RACE_VM}" -o json)" || return 1
+  jq -e --arg declared "${declared}" --arg declaring "${DECLARED_RACE_DECLARING_MAC}" \
+    --argjson nics "${DECLARED_RACE_DYNAMIC_NICS}" '
+    . as $c
+    | ($c.spec.networkconfig // []) as $rows
+    | ($c.status.networkconfig // []) as $status
+    | ($rows | length) == ($nics + 1)
+    and ($status | length) == ($nics + 1)
+    and all($status[]; .status == "OK")
+    and ([$rows[] | select(.macaddress == $declaring)] | length) == 1
+    and ([$rows[] | select(.macaddress == $declaring)][0].ipaddress) == $declared
+    and ([$rows[] | select(.macaddress != $declaring) | .ipaddress] | length) == $nics
+    and ([$rows[] | select(.macaddress != $declaring) | .ipaddress] | unique | length) == $nics
+    and all($rows[] | select(.macaddress != $declaring); .ipaddress != $declared)
+    and all($rows[]; (.ipaddress | test("^10\\.77\\.0\\.(10[0-9]|110)$")))
+  ' <<< "${config}" > /dev/null || return 1
+  snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  jq -e --arg ip "${declared}" \
+    --arg owner "${KIH_WORKLOAD_NAMESPACE}/${DECLARED_RACE_VM} [${DECLARED_RACE_DECLARING_MAC}]" \
+    '.used == 11 and .available == 0 and .allocated[$ip] == $owner' <<< "${snapshot}" > /dev/null
+}
+
+run_declared_address_race_checks() {
+  local deadline manifest
+  deadline=$((SECONDS + 420))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the declared-address exclusion of a fresh allocation"
+  assert_case DECLARED-ADDRESS-RACE-NAME-FREE \
+    "the declared-address fixture starts from the empty pool" static_ip_start_clean
+  manifest="${E2E_ARTIFACTS_DIR}/33-declared-race-vm.yaml"
+  render_declared_race_vm "${DECLARED_RACE_VM}" "${DECLARED_RACE_ADDRESS}" "${manifest}"
+  assert_case DECLARED-ADDRESS-RACE-RENDERED \
+    "the rendered vm declares ${DECLARED_RACE_ADDRESS} on its last interface behind ${DECLARED_RACE_DYNAMIC_NICS} dynamic interfaces" \
+    grep -qF "${KIH_STATIC_IP_ANNOTATION}: '{\"${DECLARED_RACE_DECLARING_NIC}\":\"${DECLARED_RACE_ADDRESS}\"}'" \
+    "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline DECLARED-ADDRESS-RACE-EXCLUDED "${deadline}" 180 \
+    "the dynamic interfaces skip the declared address and the declaring one claims it" \
+    declared_race_converged
+  capture_checkpoint 33-declared-address-race \
+    "${DECLARED_RACE_DYNAMIC_NICS} dynamic reservations excluded the declared ${DECLARED_RACE_ADDRESS}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${DECLARED_RACE_VM}" \
+    --wait=true --timeout=180s > /dev/null
+  wait_before_deadline DECLARED-ADDRESS-RACE-CLEANED "${deadline}" 180 \
+    "the declared-address fixture releases all eleven reservations" pool_initialized
+  guard_case DECLARED-ADDRESS-RACE-DEADLINE \
+    "declared-address scenarios completed within their own deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+}
+
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
   local image_id webhook_image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
@@ -3290,6 +3416,7 @@ main() {
   capture_checkpoint 10-cleanup "VM deletion released ${RESERVED_IP} and its metric"
   run_static_ip_checks
   run_static_ip_release_checks
+  run_declared_address_race_checks
 
   case "${E2E_GROUP}" in
     all)
