@@ -2534,9 +2534,50 @@ EOF
 # would answer ${KIH_IPPOOL_START} instead, and the boot helper compares both
 # the DHCP ACK and the guest's installed address with the requested one.
 KIH_STATIC_IP_ANNOTATION="kubevirtiphelper.k8s.binbash.org/static-ip"
+# The durable release marker the vm controller writes on the vmnetcfg object it
+# owns when a static ip request is withdrawn or changed: its value names the
+# released binding and address, the vmnetcfg controller consumes it, and its
+# presence is what tells a withdrawal apart from a commit which failed before the
+# spec recorded the assignment.
+KIH_STATIC_IP_RELEASE_ANNOTATION="kubevirtiphelper.k8s.binbash.org/static-ip-release"
 STATIC_IP_RESERVATION="${KIH_IPPOOL_END}"
 STATIC_IP_TAKEN_VM="static-ip-taken-vm"
 STATIC_IP_TAKEN_MAC="02:00:00:00:00:21"
+
+# Withdrawal fixture: one declared reservation, nine dynamic neighbours, and the
+# reclaim reservation which takes the withdrawn address back through the ordinary
+# dynamic allocation path.
+STATIC_IP_RELEASE_VM="static-ip-release-vm"
+STATIC_IP_RELEASE_MAC="02:00:00:00:00:31"
+STATIC_IP_RECLAIM_VM="static-ip-reclaim-vm"
+STATIC_IP_RECLAIM_MAC="02:00:00:00:00:41"
+STATIC_IP_FILL_PREFIX="static-ip-fill-"
+STATIC_IP_FILL_COUNT=9
+
+# Declared-address race fixture: one halted vm whose eleven interfaces are all on
+# the primary NAD. The first ten are dynamic and the last one declares the last
+# address of the range, so the vm's single reconciliation allocates the dynamic
+# interfaces before the declaring one (the row order is the interface order of the
+# vm spec). A helper which let a fresh allocation take a declared address would
+# hand the declared address to a dynamic interface and refuse the declaring one.
+DECLARED_RACE_VM="declared-race-vm"
+DECLARED_RACE_DYNAMIC_NICS=10
+DECLARED_RACE_DECLARING_NIC="racedecl"
+DECLARED_RACE_DECLARING_MAC="02:00:00:00:03:ff"
+DECLARED_RACE_ADDRESS="${KIH_IPPOOL_END}"
+DECLARED_RACE_DYNAMIC_MAC_PREFIX="02:00:00:00:03"
+
+# Admission pool-identity fixture: a legacy pool which reuses the served network's
+# qualified spec.networkname but carries none of the registration identity (no
+# network or network-namespace label) and a different range. The name sorts before
+# the serving pool, so a first-match admission index would let it supply the range
+# to the vmnetcfg and static-vm checks. Its range is deliberately outside the
+# serving range in both directions so the two can never agree on an address.
+POOL_DECOY_NAME="aaa-legacy-pool"
+POOL_DECOY_START="10.77.0.200"
+POOL_DECOY_END="10.77.0.210"
+POOL_DECOY_ONLY_ADDRESS="${POOL_DECOY_START}"
+POOL_DECOY_SERVED_ONLY_ADDRESS="10.77.0.105"
 
 # The request is the annotation of the VirtualMachine metadata, next to the
 # ordinary metadata of the rendered guest template.
@@ -2636,6 +2677,288 @@ run_static_ip_checks() {
   guard_case STATIC-IP-DEADLINE "static ip scenarios completed within their own deadline" \
     test "${SECONDS}" -lt "${deadline}"
   SCENARIO_DEADLINE=0
+}
+
+# ---------------------------------------------------------------------------
+# Named-row and ledger predicates shared by the withdrawal, race and teardown
+# scenarios. Every one of them reads the live API object, never a cached value.
+# ---------------------------------------------------------------------------
+
+# Read one named row's address from a vmnetcfg object. A missing object or a row
+# without an address yields the empty string; the caller distinguishes "cleared"
+# from "unreadable" by the exit status of the kubectl call it makes itself.
+named_row_address() { # <name>
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "$1" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null
+}
+
+# The single free address of a pool, computed from its own spec range and the
+# durable ledger. The withdrawal scenario drives the pool to exactly one free
+# address and then asserts which address that is, so the target of a changed
+# request is a property of the ledger rather than of allocation order.
+pool_single_free_address() { # <pool>
+  local object
+  object="$(kubectl get ippool "$1" -o json)" || return 1
+  jq -er '
+    def ip_number:
+      split(".") | map(tonumber) |
+      .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3];
+    def ip_text($n):
+      [($n / 16777216 | floor % 256), ($n / 65536 | floor % 256),
+       ($n / 256 | floor % 256), ($n | floor % 256)]
+      | map(tostring) | join(".");
+    (.spec.ipv4config.pool.start | ip_number) as $start
+    | (.spec.ipv4config.pool.end | ip_number) as $end
+    | ((.status.ipv4.allocated // {}) | keys | map(ip_number)) as $taken
+    | [range($start; $end + 1) | select(. as $n | ($taken | index($n) | not))] as $free
+    | if ($free | length) == 1 then ($free[0] | ip_text(.))
+      else error("pool does not carry exactly one free address") end
+  ' <<< "${object}"
+}
+
+# The owner the durable ledger records for one address, empty when the address
+# carries no entry at all.
+pool_address_owner() { # <pool> <ip>
+  local snapshot
+  snapshot="$(pool_snapshot "$1")" || return 1
+  jq -r --arg ip "$2" '.allocated[$ip] // ""' <<< "${snapshot}"
+}
+
+# A released address must leave the durable ledger entirely: a row which keeps
+# serving it, or a stale ownership entry, would leave the address unavailable to
+# a competing dynamic allocation.
+pool_address_free() { # <pool> <ip>
+  local snapshot
+  snapshot="$(pool_snapshot "$1")" || return 1
+  jq -e --arg ip "$2" '(.allocated[$ip] // null) == null' <<< "${snapshot}" > /dev/null
+}
+
+# The raw stored value of one published pool counter, empty when the field is
+# absent. The status fields used to be omitempty, which made a full, an empty and
+# an unset pool the same stored object; a decoded client cannot tell a present 0
+# from an absent field, so the presence of the zero is asserted on the raw value.
+pool_status_counter() { # <pool> <field>
+  kubectl get ippool "$1" -o jsonpath="{.status.ipv4.$2}" 2> /dev/null
+}
+
+# The sum of the application log counter over every level. The metric counts
+# every warning-or-above line the helper writes, wherever it is written from, so a
+# package which holds no metrics handle still moves it; a level with no line yet
+# simply contributes nothing.
+app_logs_total() {
+  local text lines total
+  text="$(metrics_text)" || return 1
+  lines="$(printf '%s\n' "${text}" | grep '^kubevirtiphelper_app_logs{' || true)"
+  total="$(printf '%s\n' "${lines}" | sed -e 's/^[^}]*} *//' |
+    awk '{ sum += $1 } END { printf "%d", sum + 0 }')" || return 1
+  case "${total}" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s\n' "${total}"
+}
+
+app_logs_risen() { # <baseline>
+  local total
+  total="$(app_logs_total)" || return 1
+  [ "${total}" -gt "$1" ]
+}
+
+# A pool which carries none of the helper's registration identity is never
+# discovered by its label-selected watch, so the helper must leave its status
+# untouched: the decoy must stay unserved while the serving pool keeps serving.
+decoy_pool_unserved() { # <pool>
+  local status
+  status="$(kubectl get ippool "$1" -o jsonpath='{.status.ipv4}' 2> /dev/null)" || return 1
+  [ -z "${status}" ]
+}
+
+# ---------------------------------------------------------------------------
+# Static ip withdrawal
+#
+# Removing or changing the static ip request of a live vm has to release the
+# declared address through the durable release marker instead of letting the
+# F02 quarantined-lease branch adopt the withdrawn address: the row must return
+# to dynamic service, the released address must leave the ledger, and a later
+# dynamic allocation must be able to take it. A helper which kept the withdrawn
+# binding shows the leaked address as used forever, which the accounting
+# assertions below turn into a deterministic failure.
+# ---------------------------------------------------------------------------
+
+# The nine dynamic neighbours plus the declared reservation fill ten of the
+# eleven addresses, so the pool carries exactly one free address: that address
+# is the target of the changed request, and the released one becomes the only
+# free address of the pool afterwards.
+static_ip_release_filled() {
+  local i name
+  for i in $(seq 1 "${STATIC_IP_FILL_COUNT}"); do
+    name="$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" "${i}")"
+    vm_managed_reservation "${name}" OK || return 1
+  done
+  pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1 &&
+    pool_single_free_address "${KIH_IPPOOL_NAME}" > /dev/null
+}
+
+static_ip_release_declared() {
+  [ "$(named_row_address "${STATIC_IP_RELEASE_VM}")" = "${STATIC_IP_RESERVATION}" ] &&
+    named_reservation_kept "${STATIC_IP_RELEASE_VM}" "${STATIC_IP_RELEASE_MAC}"
+}
+
+# The changed request must claim exactly the new address and give the old one
+# back: the row carries the new address with OK status, the ledger names this vm
+# and mac for it, the pool is back to one free address, and the withdrawn
+# address has left the ledger entirely. A helper which kept the withdrawn
+# binding shows eleven used addresses with none free.
+static_ip_release_changed() { # <claimed-address>
+  local claimed="$1" snapshot
+  [ "$(named_row_address "${STATIC_IP_RELEASE_VM}")" = "${claimed}" ] || return 1
+  vmnetcfg_status_is "${STATIC_IP_RELEASE_VM}" OK || return 1
+  snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  jq -e --arg ip "${claimed}" \
+    --arg owner "${KIH_WORKLOAD_NAMESPACE}/${STATIC_IP_RELEASE_VM} [${STATIC_IP_RELEASE_MAC}]" \
+    '.used == 10 and .available == 1 and .allocated[$ip] == $owner' <<< "${snapshot}" > /dev/null &&
+    pool_address_free "${KIH_IPPOOL_NAME}" "${STATIC_IP_RESERVATION}"
+}
+
+# The only free address of the pool is the withdrawn one, so a dynamic vm
+# created afterwards has to receive exactly it: an address released by the
+# withdrawal is available to the ordinary dynamic allocation path.
+static_ip_reclaim_took() { # <address>
+  [ "$(named_row_address "${STATIC_IP_RECLAIM_VM}")" = "$1" ] &&
+    vmnetcfg_status_is "${STATIC_IP_RECLAIM_VM}" OK &&
+    vm_managed_reservation "${STATIC_IP_RECLAIM_VM}" OK &&
+    [ "$(pool_address_owner "${KIH_IPPOOL_NAME}" "$1")" = \
+      "${KIH_WORKLOAD_NAMESPACE}/${STATIC_IP_RECLAIM_VM} [${STATIC_IP_RECLAIM_MAC}]" ]
+}
+
+# Removing the request must release the declared address through the durable
+# marker and return the interface to dynamic service. A removal is deliberately
+# not observable as a lower used count: the row re-allocates in the same
+# reconcile, so the released address is freed and a fresh one is claimed, and the
+# count stays one binding per holder. The predicate therefore asserts what the
+# removal has to converge to - the row served from the pool with OK status, the
+# ledger naming this vm and mac for exactly its own address, the pool at the
+# fixture's expected occupancy, and the consumed marker gone from the object -
+# while the changed-request case below carries the deterministic leak detector
+# (a helper which kept the withdrawn binding shows eleven used addresses with
+# none free there, because a changed request moves the row instead of
+# re-allocating it).
+static_ip_release_withdrawn() { # <expected-used> <expected-available>
+  local expected_used="$1" expected_available="$2" address snapshot marker
+  address="$(named_row_address "${STATIC_IP_RELEASE_VM}")" || return 1
+  case "${address}" in
+    10.77.0.1[0-9][0-9] | 10.77.0.110) ;;
+    *) return 1 ;;
+  esac
+  vmnetcfg_status_is "${STATIC_IP_RELEASE_VM}" OK || return 1
+  snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  jq -e --argjson used "${expected_used}" --argjson available "${expected_available}" \
+    --arg ip "${address}" \
+    --arg owner "${KIH_WORKLOAD_NAMESPACE}/${STATIC_IP_RELEASE_VM} [${STATIC_IP_RELEASE_MAC}]" \
+    '.used == $used and .available == $available and .allocated[$ip] == $owner' \
+    <<< "${snapshot}" > /dev/null || return 1
+  marker="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${STATIC_IP_RELEASE_VM}" \
+    -o jsonpath="{.metadata.annotations['${KIH_STATIC_IP_RELEASE_ANNOTATION}']}" 2> /dev/null)"
+  [ -z "${marker}" ]
+}
+
+run_static_ip_release_checks() {
+  local deadline manifest target fill i name mac old_leader old_id
+  deadline=$((SECONDS + 900))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the withdrawal of a static ip request"
+  assert_case STATIC-IP-WITHDRAWN-NAME-FREE \
+    "the withdrawal fixture starts from the empty pool" static_ip_start_clean
+  manifest="${E2E_ARTIFACTS_DIR}/30-static-ip-release-vm.yaml"
+  render_static_ip_vm "${STATIC_IP_RELEASE_VM}" "${STATIC_IP_RELEASE_MAC}" \
+    "${STATIC_IP_RESERVATION}" "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-DECLARED "${deadline}" 120 \
+    "the halted vm holds exactly the declared ${STATIC_IP_RESERVATION}" \
+    static_ip_release_declared
+
+  log "core: filling the pool around the declared reservation"
+  for i in $(seq 1 "${STATIC_IP_FILL_COUNT}"); do
+    name="$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" "${i}")"
+    mac="$(printf '02:00:00:00:02:%02x' "${i}")"
+    manifest="${E2E_ARTIFACTS_DIR}/31-${name}.yaml"
+    render_halted_vm "${name}" "${mac}" "${manifest}"
+    kubectl apply -f "${manifest}" > /dev/null
+  done
+  wait_before_deadline STATIC-IP-WITHDRAWN-FILLED "${deadline}" 180 \
+    "nine dynamic reservations leave exactly one free address" \
+    static_ip_release_filled
+  target="$(pool_single_free_address "${KIH_IPPOOL_NAME}")" ||
+    die "cannot read the single free address of ${KIH_IPPOOL_NAME}"
+  assert_case STATIC-IP-WITHDRAWN-TARGET \
+    "the changed request targets ${target}, the pool's only free address" \
+    test -n "${target}"
+  capture_checkpoint 30-static-ip-declared \
+    "${STATIC_IP_RESERVATION} declared with ${target} the only free address"
+
+  log "core: changing the request releases ${STATIC_IP_RESERVATION}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" annotate vm "${STATIC_IP_RELEASE_VM}" \
+    "${KIH_STATIC_IP_ANNOTATION}={\"${KIH_HELPER_INTERFACE}\":\"${target}\"}" --overwrite > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-CHANGED "${deadline}" 120 \
+    "the changed request claims ${target} and releases ${STATIC_IP_RESERVATION}" \
+    static_ip_release_changed "${target}"
+
+  log "core: the released ${STATIC_IP_RESERVATION} is taken by a dynamic vm"
+  render_halted_vm "${STATIC_IP_RECLAIM_VM}" "${STATIC_IP_RECLAIM_MAC}" \
+    "${E2E_ARTIFACTS_DIR}/32-static-ip-reclaim-vm.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/32-static-ip-reclaim-vm.yaml" > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-RECLAIMED "${deadline}" 120 \
+    "a subsequent dynamic vm takes the released ${STATIC_IP_RESERVATION}" \
+    static_ip_reclaim_took "${STATIC_IP_RESERVATION}"
+  capture_checkpoint 31-static-ip-released \
+    "withdrawn ${STATIC_IP_RESERVATION} reclaimed by a dynamic reservation"
+
+  log "core: removing the request returns the interface to dynamic service"
+  fill="$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" "${STATIC_IP_FILL_COUNT}")"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${fill}" --wait=true --timeout=120s > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-SLOT "${deadline}" 120 \
+    "deleting one dynamic vm frees its address again" pool_has_free_slot
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" annotate vm "${STATIC_IP_RELEASE_VM}" \
+    "${KIH_STATIC_IP_ANNOTATION}-" > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-CONVERGED "${deadline}" 120 \
+    "the removed request releases ${target} and the row returns to dynamic service" \
+    static_ip_release_withdrawn 10 1
+
+  log "core: the release survives a helper restart"
+  assert_case STATIC-IP-WITHDRAWN-LEADER-BEFORE \
+    "the active helper is consistent before the restart" leader_consistent
+  old_leader="${LEADER_POD}"
+  old_id="${LEADER_ID}"
+  command_before_deadline STATIC-IP-WITHDRAWN-LEADER-DELETE "${deadline}" \
+    "the active helper accepts deletion while the release stays durable" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" delete pod "${old_leader}" --wait=false
+  wait_before_deadline STATIC-IP-WITHDRAWN-LEADER-TRANSFER "${deadline}" 180 \
+    "a replacement helper takes the Lease and the metrics endpoint" \
+    new_leader_elected "${old_leader}" "${old_id}"
+  wait_before_deadline STATIC-IP-WITHDRAWN-DURABLE "${deadline}" 120 \
+    "the withdrawn binding stays released across the helper restart" \
+    static_ip_release_withdrawn 10 1
+  capture_checkpoint 32-static-ip-withdrawn \
+    "withdrawn binding stayed released across a helper restart"
+
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${STATIC_IP_RELEASE_VM}" \
+    "${STATIC_IP_RECLAIM_VM}" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 1)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 2)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 3)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 4)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 5)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 6)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 7)" \
+    "$(printf '%s%02d' "${STATIC_IP_FILL_PREFIX}" 8)" \
+    --wait=true --timeout=180s > /dev/null
+  wait_before_deadline STATIC-IP-WITHDRAWN-CLEANED "${deadline}" 180 \
+    "the withdrawal fixtures release every address" pool_initialized
+  guard_case STATIC-IP-WITHDRAWN-DEADLINE \
+    "withdrawal scenarios completed within their own deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+}
+
+pool_has_free_slot() {
+  pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1
 }
 
 main() {
@@ -2966,6 +3289,7 @@ main() {
   wait_for CORE-VM-METRIC-REMOVED 60 "cleanup removes VM metric" metric_vm_absent
   capture_checkpoint 10-cleanup "VM deletion released ${RESERVED_IP} and its metric"
   run_static_ip_checks
+  run_static_ip_release_checks
 
   case "${E2E_GROUP}" in
     all)
