@@ -419,7 +419,10 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	// exclusions could durably take a declared address, so an unknown
 	// declaration set must not allocate. the failure is bounded by a short
 	// retry inside the sync; a failure which survives it is cached for the
-	// remaining nics of the reconciliation.
+	// remaining nics of the reconciliation. while a sweep pass is active,
+	// the pass's memo is consulted first and the read is recorded there:
+	// every reconciliation which runs during the pass shares one
+	// cluster-wide LIST per network, so N orphans do not become N LISTs.
 	declarationsByNetwork := make(map[string][]declaredAddress)
 	declarationFailures := make(map[string]error)
 	declaredAddressesFor := func(networkName string) ([]declaredAddress, error) {
@@ -435,25 +438,20 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			return nil, nil
 		}
 
-		var declared []declaredAddress
-		var declarationErr error
+		pass := c.activeDeclarationPass()
+		if pass != nil {
+			if declared, recorded := pass.lookup(networkName); recorded {
+				declarationsByNetwork[networkName] = declared
 
-	lookup:
-		for attempt := range staticIPDeclarationLookupAttempts {
-			declared, declarationErr = c.staticIPDeclarations(networkName)
-			if declarationErr == nil {
-				break
-			}
-			if attempt < staticIPDeclarationLookupAttempts-1 {
-				select {
-				case <-c.ctx.Done():
-					declarationErr = c.ctx.Err()
-
-					break lookup
-				case <-time.After(staticIPDeclarationLookupBackoff):
-				}
+				return declared, nil
 			}
 		}
+
+		declared, declarationErr := c.readStaticIPDeclarations(networkName)
+		if pass != nil {
+			pass.record(networkName, declared, declarationErr)
+		}
+
 		if declarationErr != nil {
 			log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot read the static ip declarations of network %s, failing the sync closed: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, networkName, declarationErr)
@@ -2121,6 +2119,15 @@ func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkC
 	// unverifiable: the fail-closed verdict neither sweeps nor allocates
 	if c.verifyVM == nil || vmnetcfg.Spec.VMName == "" {
 		return bindingUnverified, nil
+	}
+
+	// existence from the informer store first: a vm the store positively
+	// holds is live without an api round trip. every other case (a store
+	// miss, or a store which says gone) falls back to the authoritative
+	// live read, which is the tie-breaker - a vm which merely lags in the
+	// store is found live by it, so a lagging cache can never cause a sweep
+	if cached, known := c.vmExistsInCache(vmnetcfg.Namespace, vmnetcfg.Spec.VMName); known && cached {
+		return bindingLive, nil
 	}
 
 	vmExists, vmErr := c.verifyVM(vmnetcfg.Namespace, vmnetcfg.Spec.VMName)

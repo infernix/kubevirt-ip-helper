@@ -2,10 +2,13 @@ package vmnetcfg
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
@@ -453,5 +456,144 @@ func TestVMNetCfgOrphanSweepUnverifiedDoesNotReclaim(t *testing.T) {
 	}
 	if stored := e.getStoredVMNetCfg(); stored.DeletionTimestamp == nil {
 		t.Error("the retried sweep must route the orphan into the deletion flow")
+	}
+}
+
+// one sweep pass covers every managed binding whose vm is gone: K orphans
+// are swept by one pass, the authoritative live reads are bounded by the
+// cache misses, and the pass pays one cluster-wide declaration LIST per
+// network instead of one per orphan.
+func TestVMNetCfgOrphanSweepPassSweepsEveryOrphan(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+
+	const (
+		orphanBindings = 6
+		liveBindings   = 2
+	)
+
+	// the vm informer store holds the live vms; the orphaned vms are
+	// absent, so only they fall back to the authoritative live read
+	vmIndexer := newTestIndexer()
+	for i := 0; i < liveBindings; i++ {
+		vm := &kubevirtv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      fmt.Sprintf("live-vm-%d", i),
+		}}
+		if err := vmIndexer.Add(vm); err != nil {
+			t.Fatalf("seeding the vm store: %s", err)
+		}
+	}
+	e.controller.vmIndexer = vmIndexer
+
+	liveReads := 0
+	e.controller.verifyVM = func(namespace string, name string) (bool, error) {
+		liveReads++
+
+		// the authoritative read confirms what the store holds: a vm the
+		// store has is live, the absent ones are gone
+		_, exists, _ := vmIndexer.GetByKey(namespace + "/" + name)
+
+		return exists, nil
+	}
+
+	for i := 0; i < orphanBindings; i++ {
+		obj := newOrphanVMNetCfg()
+		obj.Name = fmt.Sprintf("orphan-%d", i)
+		obj.Spec.VMName = fmt.Sprintf("orphan-vm-%d", i)
+		obj.UID = types.UID(fmt.Sprintf("orphan-uid-%d", i))
+		e.seedVMNetCfg(obj)
+
+		if err := e.indexer.Add(obj); err != nil {
+			t.Fatalf("seeding the binding store: %s", err)
+		}
+	}
+
+	for i := 0; i < liveBindings; i++ {
+		obj := newOrphanVMNetCfg()
+		obj.Name = fmt.Sprintf("live-binding-%d", i)
+		obj.Spec.VMName = fmt.Sprintf("live-vm-%d", i)
+		obj.UID = types.UID(fmt.Sprintf("live-uid-%d", i))
+		e.seedVMNetCfg(obj)
+
+		if err := e.indexer.Add(obj); err != nil {
+			t.Fatalf("seeding the binding store: %s", err)
+		}
+	}
+
+	declarationLists := 0
+	e.controller.staticIPDeclarations = func(string) ([]declaredAddress, error) {
+		declarationLists++
+
+		return nil, nil
+	}
+
+	swept := e.controller.sweepOrphanedBindings()
+	if swept != orphanBindings {
+		t.Errorf("swept bindings = %d, want %d in one pass", swept, orphanBindings)
+	}
+	if liveReads != orphanBindings {
+		t.Errorf("authoritative live reads = %d, want %d (one per cache miss)", liveReads, orphanBindings)
+	}
+	if declarationLists != 1 {
+		t.Errorf("declaration LISTs = %d, want 1 for the whole pass", declarationLists)
+	}
+
+	for i := 0; i < orphanBindings; i++ {
+		key := fmt.Sprintf("%s/orphan-%d", testNamespace, i)
+		if _, exists, err := e.indexer.GetByKey(key); err != nil || !exists {
+			t.Fatalf("the store entry %s vanished: exists=%v err=%v", key, exists, err)
+		}
+		if stored := e.storedBinding(fmt.Sprintf("orphan-%d", i)); stored.DeletionTimestamp == nil {
+			t.Errorf("orphan-%d was not routed into the deletion flow", i)
+		}
+	}
+
+	for i := 0; i < liveBindings; i++ {
+		if stored := e.storedBinding(fmt.Sprintf("live-binding-%d", i)); stored.DeletionTimestamp != nil {
+			t.Errorf("live-binding-%d must not be swept: its vm is live", i)
+		}
+	}
+}
+
+// a vm which merely lags in the informer store is never swept: the store
+// holds it, so the sweep classifies it live without any live read, and the
+// authoritative read would confirm it even on a store miss.
+func TestVMNetCfgOrphanSweepPassTrustsTheVmCacheForLiveVms(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+
+	vmIndexer := newTestIndexer()
+	if err := vmIndexer.Add(&kubevirtv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{
+		Namespace: testNamespace,
+		Name:      testVMName,
+	}}); err != nil {
+		t.Fatalf("seeding the vm store: %s", err)
+	}
+	e.controller.vmIndexer = vmIndexer
+
+	liveReads := 0
+	e.controller.verifyVM = func(namespace string, name string) (bool, error) {
+		liveReads++
+
+		_, exists, _ := vmIndexer.GetByKey(namespace + "/" + name)
+
+		return exists, nil
+	}
+
+	obj := newOrphanVMNetCfg()
+	e.seedVMNetCfg(obj)
+	if err := e.indexer.Add(obj); err != nil {
+		t.Fatalf("seeding the binding store: %s", err)
+	}
+
+	if swept := e.controller.sweepOrphanedBindings(); swept != 0 {
+		t.Errorf("swept bindings = %d, want 0 for a vm the store holds", swept)
+	}
+	if liveReads != 0 {
+		t.Errorf("authoritative live reads = %d, want 0 for a store hit", liveReads)
+	}
+	if stored := e.getStoredVMNetCfg(); stored.DeletionTimestamp != nil {
+		t.Error("the binding of a live vm must not be marked for deletion")
 	}
 }

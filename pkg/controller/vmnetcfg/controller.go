@@ -62,6 +62,25 @@ type Controller struct {
 	// fails closed: no vm existence is verified, so nothing is swept.
 	verifyVM func(namespace string, name string) (bool, error)
 
+	// vmIndexer is the informer store of the cluster's VirtualMachines,
+	// consulted by the orphan sweep before the authoritative live read:
+	// a vm the store positively holds is live without an api round trip,
+	// and only a store miss (or a store which says gone) falls back to
+	// verifyVM. the store is never the tie-breaker - a vm which lags in
+	// it is still found live by the authoritative read - so a lagging
+	// cache can never cause a sweep. nil (tests, a controller without a
+	// kubevirt watch) disables the cache hop.
+	vmIndexer cache.Indexer
+
+	// declarationMu guards declarationPass.
+	declarationMu sync.Mutex
+	// declarationPass memoizes the static-ip declarations of the sweep
+	// pass currently running (nil outside a pass): every reconciliation
+	// which runs while the pass is active shares the pass's read, so the
+	// pass's N orphans cost one cluster-wide VirtualMachine LIST per
+	// network instead of N.
+	declarationPass *declarationMemo
+
 	// staticIPDeclarations reports the static-ip declarations which the
 	// virtual machines of the cluster carry for one network: the declaring
 	// vm, its interface and macaddress, and the declared address. it is an
@@ -748,6 +767,12 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	// the initialization phase settled every object's durable
 	// assignments
 	go c.runDeferredInitAllocations(stopCh)
+
+	// the sweep passes recover the orphans a dropped delete event or a
+	// restart inherited: one pass covers every managed binding whose vm
+	// is gone, so the recovery is bounded by the pass, not by the resync
+	// cadence and the rate limiter
+	go c.runOrphanSweep(stopCh)
 
 	<-stopCh
 	log.Infof("(vmnetcfg.Run) stopping the VirtualMachineNetworkConfig controller")

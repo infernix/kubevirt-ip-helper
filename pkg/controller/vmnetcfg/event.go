@@ -17,6 +17,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"kubevirt.io/client-go/kubecli"
 
+	kubevirtv1 "kubevirt.io/api/core/v1"
+
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -242,7 +244,34 @@ func (e *EventHandler) EventListener() (err error) {
 
 		return declaredAddresses(vms, networkName), nil
 	}
+
+	// the orphan sweep consults the vm informer store before its
+	// authoritative live read: a vm the store positively holds is live
+	// without an api round trip, and every other case (a store miss, or a
+	// store which says gone) falls back to the live read. the live read
+	// stays the tie-breaker - a vm which merely lags in the store is still
+	// found live by it, so a lagging store can never cause a sweep. a
+	// handler without a kubevirt client (the tests, a failed Init) keeps
+	// the cache hop disabled and falls back to the live read alone.
+	var vmInformer cache.Controller
+	if e.kcli != nil {
+		var vmIndexer cache.Indexer
+
+		vmIndexer, vmInformer = cache.NewIndexerInformer(
+			cache.NewListWatchFromClient(e.kcli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything()),
+			&kubevirtv1.VirtualMachine{}, resyncPeriod, cache.ResourceEventHandlerFuncs{}, cache.Indexers{})
+		controller.vmIndexer = vmIndexer
+	}
+
 	stop := make(chan struct{})
+
+	// the store is an optimization, not a gate: a store which has not
+	// synced yet answers "miss" and the sweep falls back to the live read,
+	// so the informer runs alongside the controller without delaying the
+	// startup
+	if vmInformer != nil {
+		go vmInformer.Run(stop)
+	}
 
 	// join the controller on shutdown: EventListener only returns after
 	// Controller.Run has fully stopped (its worker has drained the queue), so
