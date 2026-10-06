@@ -660,6 +660,12 @@ func TestGetKubeConfigLoadsTempKubeconfig(t *testing.T) {
 	if cfg.Host != server.URL {
 		t.Errorf("expected host %s, got %s", server.URL, cfg.Host)
 	}
+	// the vm clientset and its kubevirt client are built from this config,
+	// so the release path must carry the shared rate limits instead of
+	// client-go's 5 QPS/burst 10 default
+	if cfg.QPS != 50 || cfg.Burst != 100 {
+		t.Errorf("config QPS/Burst = %v/%v, want the 50/100 of util.GetKubeConfig", cfg.QPS, cfg.Burst)
+	}
 }
 
 func TestGetKubeConfigMissingFileFallsBackToInCluster(t *testing.T) {

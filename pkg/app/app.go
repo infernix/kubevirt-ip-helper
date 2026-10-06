@@ -29,13 +29,10 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/retry"
@@ -114,28 +111,12 @@ func (h *handler) getKubeConfig() (config *rest.Config, err error) {
 	// startup gathers: without a timeout a tcp blackhole against the api
 	// hangs those calls forever, which would keep a lost leader running
 	// its dhcp servers on the segment (the standby acquires after the
-	// lease expires and starts a second one). 30s stays below the renew
-	// deadline, so the election loop's own deadlines keep winning
-	const configTimeout = 30 * time.Second
-
-	if !util.FileExists(h.kubeConfigFile) {
-		if config, err = rest.InClusterConfig(); err != nil {
-			return
-		}
-		config.Timeout = configTimeout
-
-		return
-	}
-
-	config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: h.kubeConfigFile},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: h.kubeContext},
-	).ClientConfig()
-	if err == nil {
-		config.Timeout = configTimeout
-	}
-
-	return
+	// lease expires and starts a second one). the shared builder's 30s
+	// stays below the renew deadline, so the election loop's own
+	// deadlines keep winning, and its client rate limits keep the
+	// leader-election traffic (renewals plus the startup gathers) inside
+	// the same documented ceiling as every other client of the process
+	return util.GetKubeConfig(h.kubeConfigFile, h.kubeContext)
 }
 
 func (h *handler) Init() {

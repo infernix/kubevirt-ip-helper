@@ -9,10 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
-
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
@@ -121,27 +118,11 @@ func (e *EventHandler) Init() (err error) {
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	// bound every controller api call: a hang against the api must not
-	// wedge the reconcilers behind an unresponsive transport
-	const configTimeout = 30 * time.Second
-
-	if !util.FileExists(e.kubeConfig) {
-		if config, err = rest.InClusterConfig(); err != nil {
-			return
-		}
-		config.Timeout = configTimeout
-
-		return
-	}
-
-	config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: e.kubeConfig},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: e.kubeContext},
-	).ClientConfig()
-	if err == nil {
-		config.Timeout = configTimeout
-	}
-
-	return
+	// wedge the reconcilers behind an unresponsive transport. the shared
+	// builder also carries the client rate limits, so the reconcilers'
+	// twelve-request releases are not throttled by client-go's 5 QPS
+	// default
+	return util.GetKubeConfig(e.kubeConfig, e.kubeContext)
 }
 
 func (e *EventHandler) EventListener() (err error) {

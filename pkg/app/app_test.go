@@ -175,6 +175,12 @@ func TestHandler_getKubeConfig(t *testing.T) {
 		if cfg.Host != srv.URL {
 			t.Errorf("config Host = %q, want %q", cfg.Host, srv.URL)
 		}
+		// the leader-election and startup clients are built from this
+		// config, so they must carry the shared rate limits instead of
+		// client-go's 5 QPS/burst 10 default
+		if cfg.QPS != 50 || cfg.Burst != 100 {
+			t.Errorf("config QPS/Burst = %v/%v, want the 50/100 of util.GetKubeConfig", cfg.QPS, cfg.Burst)
+		}
 	})
 
 	t.Run("missing kubeconfig falls back to in-cluster and fails outside a cluster", func(t *testing.T) {

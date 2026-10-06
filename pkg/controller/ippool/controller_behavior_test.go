@@ -806,6 +806,11 @@ func TestEventHandlerGetKubeConfigLoadsExplicitFile(t *testing.T) {
 	if config.Host != "https://127.0.0.1:6443" {
 		t.Errorf("config host = %q, want https://127.0.0.1:6443", config.Host)
 	}
+	// the ippool clientset is built from this config, so it must carry the
+	// shared rate limits instead of client-go's 5 QPS/burst 10 default
+	if config.QPS != 50 || config.Burst != 100 {
+		t.Errorf("config QPS/Burst = %v/%v, want the 50/100 of util.GetKubeConfig", config.QPS, config.Burst)
+	}
 }
 
 func TestEventHandlerGetKubeConfigMissingFileFallsBackToInCluster(t *testing.T) {
