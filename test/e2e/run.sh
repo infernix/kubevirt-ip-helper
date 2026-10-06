@@ -1685,6 +1685,25 @@ cleanup_stale_expanded_resources() {
   done
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${DECLARED_RACE_VM}" \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
+  # The scaled drain-rate batch of an interrupted run: its VMs carry their own
+  # label and its bindings are named after them. The batch is released through
+  # the helper's own cleanup (bounded), so a retained cluster never starts the
+  # next run with reservations of the widened range in the way.
+  local -a drain_batch=()
+  local drain_i
+  for drain_i in $(seq 1 "${POOL_DRAIN_RATE_BATCH}"); do
+    drain_batch+=("$(pool_drain_rate_batch_name "${drain_i}")")
+  done
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${drain_batch[@]}" \
+    --ignore-not-found --wait=false > /dev/null
+  for drain_i in $(seq 1 60); do
+    if [ "$(pool_drain_rate_vmnetcfgs)" = "0" ]; then
+      break
+    fi
+    sleep 2
+  done
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg "${drain_batch[@]}" \
+    --ignore-not-found --wait=false > /dev/null
   # The orphan-sweep fixture of an interrupted run: its batch VMs are deleted
   # while the helper is absent, so a retained cluster can hold their stranded
   # bindings; both the VMs and the bindings are removed here.
@@ -1789,6 +1808,191 @@ run_pool_bulk_teardown() {
     --wait=true --timeout=120s > /dev/null
   wait_before_deadline POOL-BULK-CLEANUP "${deadline}" 180 \
     "the batch teardown returns the empty pool" pool_initialized
+}
+
+# The pool's scaled drain-rate case. The bulk teardown above proves the release
+# contract on ten reservations; it cannot show the cost of a realistic batch,
+# because the pool contract holds eleven addresses. A production analysis
+# measured ~22 released addresses per minute and a fresh reservation waiting
+# 138s behind a 100-VM drain, so this case widens the primary pool to
+# POOL_DRAIN_RATE_BATCH addresses inside the pool's own /24
+# (KIH_IPPOOL_SUBNET), reserves them with halted VMs (which reserve without
+# booting), deletes them as one batch, and requires the batch to drain within
+# POOL_DRAIN_RATE_SECONDS - a stated floor of
+# POOL_DRAIN_RATE_BATCH * 60 / POOL_DRAIN_RATE_SECONDS = 12 addresses per
+# minute. The bound comes from the measured release cost: the helper's
+# clientset carries client-go's default rate limiter (5 QPS, burst 10) and one
+# release costs 12 sequential API requests, i.e. ~2.4s per address (~25/min)
+# once the burst is spent. The lane itself measures ~2.9s per reservation for
+# the fill and the drain alike (48 reservations drained in ~140s, 21/min), so
+# 12/min leaves ~1.7x headroom for a loaded runner while still failing on any
+# regression which makes the drain quadratic or halves the rate.
+# POOL_DRAIN_RATE_BATCH is bounded by the lane's 40-minute execution budget:
+# the fill and the drain each cost one serialized reconcile per reservation, so
+# this case adds ~5 minutes to the pool lane.
+POOL_DRAIN_RATE_BATCH=48
+POOL_DRAIN_RATE_SECONDS=240
+POOL_DRAIN_RATE_START="10.77.0.10"
+POOL_DRAIN_RATE_END="10.77.0.57"
+POOL_DRAIN_RATE_RESTORE_START="10.77.0.100"
+POOL_DRAIN_RATE_RESTORE_END="10.77.0.110"
+POOL_DRAIN_RATE_LABEL="pool-drain-rate"
+
+pool_drain_rate_batch_name() { printf 'pool-drain-%03d' "$1"; }
+pool_drain_rate_batch_mac() { printf '02:00:00:04:00:%02x' "$1"; }
+
+# The batch VMs carry their own label so the stale-resource cleanup can remove
+# an interrupted run's batch without touching another group's fixtures.
+pool_drain_rate_render_batch() { # <output>
+  local i name mac single="${E2E_ARTIFACTS_DIR}/.pool-drain-rate-single.yaml"
+  : > "$1"
+  for i in $(seq 1 "${POOL_DRAIN_RATE_BATCH}"); do
+    name="$(pool_drain_rate_batch_name "${i}")"
+    mac="$(pool_drain_rate_batch_mac "${i}")"
+    render_halted_vm "${name}" "${mac}" "${single}"
+    sed -e "/^  labels:\$/a\\    kubevirtiphelper/e2e-batch: ${POOL_DRAIN_RATE_LABEL}" \
+      "${single}" >> "$1"
+    printf -- '---\n' >> "$1"
+  done
+}
+
+# The number of batch bindings which still exist. `grep -c` exits 1 on no match,
+# so the printed count (0) is the value and the status is absorbed.
+pool_drain_rate_vmnetcfgs() {
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg -o name 2> /dev/null |
+    grep -c "/pool-drain-" || true
+}
+
+pool_drain_rate_filled() {
+  pool_counts_equal "${KIH_IPPOOL_NAME}" "${POOL_DRAIN_RATE_BATCH}" 0 &&
+    test "$(pool_drain_rate_vmnetcfgs)" = "${POOL_DRAIN_RATE_BATCH}"
+}
+
+pool_drain_rate_drained() {
+  pool_counts_equal "${KIH_IPPOOL_NAME}" 0 "${POOL_DRAIN_RATE_BATCH}" &&
+    test "$(pool_drain_rate_vmnetcfgs)" = "0"
+}
+
+# One sample of the drain timeline: the durable used counter and the number of
+# surviving batch bindings. Written to the run's artifact directory, so a rate
+# regression is visible in the collected evidence and not only in the report.
+pool_drain_rate_sampler() { # <file> <stop-at-seconds>
+  local file="$1" deadline="$2" snapshot used
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    used="?"
+    if snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}" 2> /dev/null)"; then
+      used="$(jq -r '.used' <<< "${snapshot}" 2> /dev/null)" || used="?"
+    fi
+    printf 't=%s used=%s vmnetcfgs=%s\n' \
+      "${SECONDS}" "${used:-?}" "$(pool_drain_rate_vmnetcfgs)" >> "${file}"
+    sleep 2
+  done
+}
+
+# The resurrection guard over the sampled series: once used has fallen below the
+# batch size it must never rise again. A delayed cleanup or an orphan sweep which
+# re-adds a released reservation would raise it after the drain converged.
+pool_drain_rate_no_resurrection() { # <file>
+  awk -v batch="${POOL_DRAIN_RATE_BATCH}" '
+    {
+      used = ""
+      for (i = 1; i <= NF; i++) { if ($i ~ /^used=/) { used = substr($i, 6) } }
+      if (used == "" || used == "?") { next }
+      samples++
+      if (!fell && used + 0 < batch + 0) { fell = 1 }
+      if (fell) {
+        if (prev != "" && used + 0 > prev + 0) {
+          printf "used rose from %s to %s at %s\n", prev, used, $1
+          bad = 1
+        }
+        prev = used
+      }
+    }
+    END {
+      if (samples == 0) { print "the timeline carries no sample"; exit 1 }
+      if (!fell) { print "used never fell below the batch size"; exit 1 }
+      exit bad
+    }
+  ' "$1"
+}
+
+run_pool_drain_rate() {
+  local i name mac manifest="${E2E_ARTIFACTS_DIR}/37-pool-drain-rate-batch.yaml"
+  local timeline="${E2E_ARTIFACTS_DIR}/pool-drain-rate-timeline.txt"
+  local deadline sampler_pid="" drained_seconds rate_per_min
+  local -a batch=()
+
+  # A range change forces the helper's application reinitialization, and the
+  # fill and the drain each cost one reconcile per reservation against the
+  # helper's 5 QPS clientset, so this case carries a budget of its own.
+  deadline=$((SECONDS + 900))
+  SCENARIO_DEADLINE="${deadline}"
+  : > "${timeline}"
+
+  assert_case POOL-DRAIN-RATE-SUBNET \
+    "the scaled batch is drawn from the pool's own ${KIH_IPPOOL_SUBNET} /24" \
+    test "$(kubectl get ippool "${KIH_IPPOOL_NAME}" \
+      -o jsonpath='{.spec.ipv4config.subnet}')" = "${KIH_IPPOOL_SUBNET}"
+  assert_case POOL-DRAIN-RATE-BASELINE \
+    "the scaled drain starts from the empty eleven-address pool" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
+
+  log "group pool: widening ${KIH_IPPOOL_NAME} to ${POOL_DRAIN_RATE_BATCH} addresses of ${KIH_IPPOOL_SUBNET}"
+  command_before_deadline POOL-DRAIN-RATE-WIDEN "${deadline}" \
+    "the pool accepts a ${POOL_DRAIN_RATE_BATCH}-address range inside its own /24" \
+    kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+    -p "{\"spec\":{\"ipv4config\":{\"pool\":{\"start\":\"${POOL_DRAIN_RATE_START}\",\"end\":\"${POOL_DRAIN_RATE_END}\"}}}}"
+  wait_before_deadline POOL-DRAIN-RATE-CAPACITY "${deadline}" 180 \
+    "the helper re-registers the widened range with ${POOL_DRAIN_RATE_BATCH} free addresses" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 0 "${POOL_DRAIN_RATE_BATCH}"
+
+  pool_drain_rate_render_batch "${manifest}"
+  command_before_deadline POOL-DRAIN-RATE-FILL "${deadline}" \
+    "${POOL_DRAIN_RATE_BATCH} halted reservations are applied as one batch" \
+    kubectl apply -f "${manifest}"
+  wait_before_deadline POOL-DRAIN-RATE-RESERVED "${deadline}" 240 \
+    "every one of the ${POOL_DRAIN_RATE_BATCH} addresses is reserved before the batch deletion" \
+    pool_drain_rate_filled
+  capture_checkpoint 37-pool-drain-rate-filled \
+    "${POOL_DRAIN_RATE_BATCH} reservations hold the widened pool"
+
+  for i in $(seq 1 "${POOL_DRAIN_RATE_BATCH}"); do
+    batch+=("$(pool_drain_rate_batch_name "${i}")")
+  done
+  # The sampler runs from the delete to the bound, so its series never mixes the
+  # fill (used rising) into the resurrection guard.
+  pool_drain_rate_sampler "${timeline}" "$((SECONDS + POOL_DRAIN_RATE_SECONDS + 20))" &
+  sampler_pid=$!
+  local drain_start="${SECONDS}"
+  command_before_deadline POOL-DRAIN-RATE-DELETE "${deadline}" \
+    "the ${POOL_DRAIN_RATE_BATCH} reservations accept asynchronous deletion as one batch" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${batch[@]}" --wait=false
+  wait_before_deadline POOL-DRAIN-RATE-BOUND "${deadline}" "${POOL_DRAIN_RATE_SECONDS}" \
+    "the ${POOL_DRAIN_RATE_BATCH}-reservation batch drains within ${POOL_DRAIN_RATE_SECONDS}s, a floor of $((POOL_DRAIN_RATE_BATCH * 60 / POOL_DRAIN_RATE_SECONDS)) addresses/min" \
+    pool_drain_rate_drained
+  drained_seconds=$((SECONDS - drain_start))
+  [ "${drained_seconds}" -gt 0 ] || drained_seconds=1
+  rate_per_min=$((POOL_DRAIN_RATE_BATCH * 60 / drained_seconds))
+  kill "${sampler_pid}" 2> /dev/null || true
+  wait "${sampler_pid}" 2> /dev/null || true
+  report_note POOL-DRAIN-RATE \
+    "the ${POOL_DRAIN_RATE_BATCH}-reservation batch drained in ${drained_seconds}s (${rate_per_min} addresses/min); timeline in pool-drain-rate-timeline.txt"
+  assert_case POOL-DRAIN-RATE-NO-RESURRECTION \
+    "the sampled used= series never rises again after it falls" \
+    pool_drain_rate_no_resurrection "${timeline}"
+  assert_case POOL-DRAIN-RATE-MEASURED \
+    "the measured drain rate ${rate_per_min}/min is at or above the stated $((POOL_DRAIN_RATE_BATCH * 60 / POOL_DRAIN_RATE_SECONDS))/min floor" \
+    test "${drained_seconds}" -le "${POOL_DRAIN_RATE_SECONDS}"
+  capture_checkpoint 38-pool-drain-rate-drained \
+    "the ${POOL_DRAIN_RATE_BATCH}-reservation batch drained without a resurrected allocation"
+
+  command_before_deadline POOL-DRAIN-RATE-RESTORE "${deadline}" \
+    "the pool range returns to its eleven-address contract" \
+    kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+    -p "{\"spec\":{\"ipv4config\":{\"pool\":{\"start\":\"${POOL_DRAIN_RATE_RESTORE_START}\",\"end\":\"${POOL_DRAIN_RATE_RESTORE_END}\"}}}}"
+  wait_before_deadline POOL-DRAIN-RATE-RESTORED "${deadline}" 180 \
+    "the restored pool reports the empty eleven-address contract" pool_initialized
+  SCENARIO_DEADLINE=0
 }
 
 run_pool_group() {
@@ -1942,6 +2146,12 @@ EOF
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
 
   run_pool_bulk_teardown "${deadline}"
+  # The scaled drain-rate case carries its own budget: it reserves and drains a
+  # batch far larger than the eleven-address pool contract, so the group's
+  # original deadline cannot bound it. Cleanup and the group guard get a fresh
+  # window after it.
+  run_pool_drain_rate
+  deadline=$((SECONDS + 300))
   cleanup_pool_group
   wait_before_deadline POOL-CLEANUP-CAPACITY "${deadline}" 180 \
     "pool group cleanup returns exact capacity" pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
@@ -1949,7 +2159,7 @@ EOF
   guard_case POOL-DEADLINE "pool scenarios completed within their original deadline" \
     test "${SECONDS}" -lt "${deadline}"
   SCENARIO_DEADLINE=0
-  printf 'PASS pool group: exhaustion, refusal, duplicate MAC, reclaim, out-of-range request, and batch teardown\n' \
+  printf 'PASS pool group: exhaustion, refusal, duplicate MAC, reclaim, out-of-range request, batch teardown, and scaled drain rate\n' \
     > "${E2E_ARTIFACTS_DIR}/11-pool-group.txt"
 }
 
