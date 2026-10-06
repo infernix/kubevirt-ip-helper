@@ -116,8 +116,11 @@ func TestVMNetCfgWithdrawalMarkerIsDurableAndIdempotent(t *testing.T) {
 	}
 
 	stored := e.getStoredVMNetCfg()
-	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" {
-		t.Errorf("spec ip = %q, want a fresh dynamic address (10.0.0.1)", got)
+	// the pool holds two free addresses and AllocateIP ranges over a map, so
+	// either address is a valid fresh dynamic allocation; the idempotent
+	// no-op release is what this test pins, not the address choice
+	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" && got != "10.0.0.2" {
+		t.Errorf("spec ip = %q, want a fresh dynamic address of the pool", got)
 	}
 
 	marker, err := util.ParseStaticIPReleaseMarker(stored.Annotations)
