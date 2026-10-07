@@ -556,9 +556,14 @@ _evidence_observations() { # <dir>
   fi
 
   # Use the captured inventory, not a single primary selector or every pod in the
-  # namespace (which now also contains the standalone admission service).
+  # namespace (which now also contains the standalone admission service). The
+  # observation execs into each pod, so a pod that a scale-down is still terminating
+  # must be skipped: its container is gone, the exec fails, and the checkpoint would
+  # be marked incomplete even though the non-terminating replica it describes is fine.
+  # The raw capture keeps every pod, so the terminating one is still in the evidence.
   pods="$(jq -er '.["helper-pods"].items
     | [.[] | select(.metadata.labels.app == "kubevirt-ip-helper")
+      | select(.metadata.deletionTimestamp == null)
       | [.metadata.name, (.metadata.labels["kubevirtiphelper/network"] // "MISSING"),
          (.metadata.labels["kubevirtiphelper/leader"] // "standby")] | @tsv]
     | join("\n")' "${dir}/raw.json")" || {
