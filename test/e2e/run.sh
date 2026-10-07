@@ -1813,25 +1813,28 @@ run_pool_bulk_teardown() {
 # The pool's scaled drain-rate case. The bulk teardown above proves the release
 # contract on ten reservations; it cannot show the cost of a realistic batch,
 # because the pool contract holds eleven addresses. A production analysis
-# measured ~22 released addresses per minute and a fresh reservation waiting
+# measured ~21 released addresses per minute and a fresh reservation waiting
 # 138s behind a 100-VM drain, so this case widens the primary pool to
 # POOL_DRAIN_RATE_BATCH addresses inside the pool's own /24
 # (KIH_IPPOOL_SUBNET), reserves them with halted VMs (which reserve without
 # booting), deletes them as one batch, and requires the batch to drain within
 # POOL_DRAIN_RATE_SECONDS - a stated floor of
-# POOL_DRAIN_RATE_BATCH * 60 / POOL_DRAIN_RATE_SECONDS = 12 addresses per
-# minute. The bound comes from the measured release cost: the helper's
-# clientset carries client-go's default rate limiter (5 QPS, burst 10) and one
-# release costs 12 sequential API requests, i.e. ~2.4s per address (~25/min)
-# once the burst is spent. The lane itself measures ~2.9s per reservation for
-# the fill and the drain alike (48 reservations drained in ~140s, 21/min), so
-# 12/min leaves ~1.7x headroom for a loaded runner while still failing on any
-# regression which makes the drain quadratic or halves the rate.
+# POOL_DRAIN_RATE_BATCH * 60 / POOL_DRAIN_RATE_SECONDS = 48 addresses per
+# minute. The bound was 12/min (240s) while the helper's clientset carried
+# client-go's default rate limiter (5 QPS, burst 10): one release costs 12
+# sequential API requests, i.e. ~2.4s per address once the burst was spent, and
+# the lane measured 144s for 48 reservations (20/min, 3.0s each). The clientset
+# now carries explicit 50 QPS/burst 100 limits (util.GetKubeConfig), which
+# turns a release into 12/50 = 0.24s of limiter wait, and the drain follows
+# that pace exactly: the sampled timeline falls 48 -> 40 -> 32 -> ... -> 0 in
+# eight-address steps every two seconds (4 addresses/s = 0.25s each) and the
+# batch drains in 14s (205/min). 60s keeps ~4x headroom over that while still
+# failing any regression which re-binds the release path to a 5 QPS limiter
+# (144s) or halves the rate.
 # POOL_DRAIN_RATE_BATCH is bounded by the lane's 40-minute execution budget:
-# the fill and the drain each cost one serialized reconcile per reservation, so
-# this case adds ~5 minutes to the pool lane.
+# the fill and the drain each cost one serialized reconcile per reservation.
 POOL_DRAIN_RATE_BATCH=48
-POOL_DRAIN_RATE_SECONDS=240
+POOL_DRAIN_RATE_SECONDS=60
 POOL_DRAIN_RATE_START="10.77.0.10"
 POOL_DRAIN_RATE_END="10.77.0.57"
 POOL_DRAIN_RATE_RESTORE_START="10.77.0.100"
@@ -1924,7 +1927,7 @@ run_pool_drain_rate() {
 
   # A range change forces the helper's application reinitialization, and the
   # fill and the drain each cost one reconcile per reservation against the
-  # helper's 5 QPS clientset, so this case carries a budget of its own.
+  # helper's 50 QPS clientset, so this case carries a budget of its own.
   deadline=$((SECONDS + 900))
   SCENARIO_DEADLINE="${deadline}"
   : > "${timeline}"
