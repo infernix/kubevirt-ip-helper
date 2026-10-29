@@ -97,12 +97,46 @@ func TestMetricsIPPoolUsedAvailable(t *testing.T) {
 	}
 }
 
+func TestMetricsIPPoolNTP(t *testing.T) {
+	m := NewMetricsAllocator()
+
+	labels := map[string]string{
+		LabelIPPoolName:  "pool-a",
+		LabelSubnet:      "10.0.0.0/24",
+		LabelNetworkName: "net-a",
+	}
+
+	m.UpdateIPPoolNTP("pool-a", "10.0.0.0/24", "net-a", 2, true)
+
+	serversFam := gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_servers")
+	if v, ok := metricValue(t, serversFam, labels); !ok || v != 2 {
+		t.Errorf("ntp servers = %v (found=%v), want 2", v, ok)
+	}
+	failedFam := gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_resolution_failed")
+	if v, ok := metricValue(t, failedFam, labels); !ok || v != 1 {
+		t.Errorf("ntp resolution failed = %v (found=%v), want 1", v, ok)
+	}
+
+	// A successful attempt clears the failure flag on the same series.
+	m.UpdateIPPoolNTP("pool-a", "10.0.0.0/24", "net-a", 3, false)
+	failedFam = gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_resolution_failed")
+	if v, ok := metricValue(t, failedFam, labels); !ok || v != 0 {
+		t.Errorf("ntp resolution failed after success = %v (found=%v), want 0", v, ok)
+	}
+	serversFam = gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_servers")
+	if v, ok := metricValue(t, serversFam, labels); !ok || v != 3 {
+		t.Errorf("ntp servers after success = %v (found=%v), want 3", v, ok)
+	}
+}
+
 func TestMetricsDeleteIPPool(t *testing.T) {
 	m := NewMetricsAllocator()
 	m.UpdateIPPoolUsed("pool-a", "10.0.0.0/24", "net-a", 12)
 	m.UpdateIPPoolAvailable("pool-a", "10.0.0.0/24", "net-a", 240)
+	m.UpdateIPPoolNTP("pool-a", "10.0.0.0/24", "net-a", 1, false)
 	m.UpdateIPPoolUsed("pool-b", "10.0.1.0/24", "net-b", 3)
 	m.UpdateIPPoolAvailable("pool-b", "10.0.1.0/24", "net-b", 250)
+	m.UpdateIPPoolNTP("pool-b", "10.0.1.0/24", "net-b", 2, false)
 
 	labelsA := map[string]string{
 		LabelIPPoolName:  "pool-a",
@@ -127,6 +161,17 @@ func TestMetricsDeleteIPPool(t *testing.T) {
 	availFam := gatherFamily(t, m, "kubevirtiphelper_ippool_available")
 	if _, ok := metricValue(t, availFam, labelsA); ok {
 		t.Error("available series for pool-a still present after delete")
+	}
+	serversFam := gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_servers")
+	if _, ok := metricValue(t, serversFam, labelsA); ok {
+		t.Error("ntp servers series for pool-a still present after delete")
+	}
+	if v, ok := metricValue(t, serversFam, labelsB); !ok || v != 2 {
+		t.Errorf("ntp servers series for pool-b lost after delete of pool-a: %v (found=%v)", v, ok)
+	}
+	failedFam := gatherFamily(t, m, "kubevirtiphelper_ippool_ntp_resolution_failed")
+	if _, ok := metricValue(t, failedFam, labelsA); ok {
+		t.Error("ntp resolution failures series for pool-a still present after delete")
 	}
 
 	// Deleting a pool with no series is a no-op.

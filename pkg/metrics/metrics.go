@@ -27,12 +27,14 @@ var (
 )
 
 type MetricsAllocator struct {
-	httpServer                      http.Server
-	kubevirtiphelperAppLogs         *prometheus.GaugeVec
-	kubevirtiphelperIPPoolUsed      *prometheus.GaugeVec
-	kubevirtiphelperIPPoolAvailable *prometheus.GaugeVec
-	kubevirtiphelperVmNetCfgStatus  *prometheus.GaugeVec
-	registry                        *prometheus.Registry
+	httpServer                       http.Server
+	kubevirtiphelperAppLogs          *prometheus.GaugeVec
+	kubevirtiphelperIPPoolUsed       *prometheus.GaugeVec
+	kubevirtiphelperIPPoolAvailable  *prometheus.GaugeVec
+	kubevirtiphelperIPPoolNTPServers *prometheus.GaugeVec
+	kubevirtiphelperIPPoolNTPFailed  *prometheus.GaugeVec
+	kubevirtiphelperVmNetCfgStatus   *prometheus.GaugeVec
+	registry                         *prometheus.Registry
 	// healthChecks are registered by the application and evaluated by the
 	// /healthz and /ready endpoints: the liveness probe of the pod checks
 	// the leader-election freshness through them, so a stale leader is
@@ -83,6 +85,28 @@ func NewMetricsAllocator() *MetricsAllocator {
 				LabelNetworkName,
 			},
 		),
+		kubevirtiphelperIPPoolNTPFailed: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kubevirtiphelper_ippool_ntp_resolution_failed",
+				Help: "Whether the last ntp resolution attempt of an IPPool had a failure (1) or not (0)",
+			},
+			[]string{
+				LabelIPPoolName,
+				LabelSubnet,
+				LabelNetworkName,
+			},
+		),
+		kubevirtiphelperIPPoolNTPServers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kubevirtiphelper_ippool_ntp_servers",
+				Help: "Amount of ipv4 ntp servers currently served in dhcp option 42",
+			},
+			[]string{
+				LabelIPPoolName,
+				LabelSubnet,
+				LabelNetworkName,
+			},
+		),
 		kubevirtiphelperVmNetCfgStatus: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "kubevirtiphelper_vmnetcfg_status",
@@ -102,6 +126,8 @@ func NewMetricsAllocator() *MetricsAllocator {
 	m.registry.MustRegister(m.kubevirtiphelperAppLogs)
 	m.registry.MustRegister(m.kubevirtiphelperIPPoolUsed)
 	m.registry.MustRegister(m.kubevirtiphelperIPPoolAvailable)
+	m.registry.MustRegister(m.kubevirtiphelperIPPoolNTPServers)
+	m.registry.MustRegister(m.kubevirtiphelperIPPoolNTPFailed)
 	m.registry.MustRegister(m.kubevirtiphelperVmNetCfgStatus)
 
 	return m
@@ -129,6 +155,27 @@ func (m *MetricsAllocator) UpdateIPPoolAvailable(ippoolName string, subnet strin
 	}).Set(float64(available))
 }
 
+// UpdateIPPoolNTP publishes the ntp resolution state of a pool: the amount
+// of ipv4 servers currently served in option 42 and whether the last
+// resolution attempt had a failure. unlike the used/available gauges it is
+// written from the resolution path itself, so a blackholed resolver or a
+// dropped hostname is observable instead of only inferable from clients.
+func (m *MetricsAllocator) UpdateIPPoolNTP(ippoolName string, subnet string, networkName string, servers int, failed bool) {
+	labels := prometheus.Labels{
+		LabelIPPoolName:  ippoolName,
+		LabelSubnet:      subnet,
+		LabelNetworkName: networkName,
+	}
+
+	m.kubevirtiphelperIPPoolNTPServers.With(labels).Set(float64(servers))
+
+	failedValue := float64(0)
+	if failed {
+		failedValue = 1
+	}
+	m.kubevirtiphelperIPPoolNTPFailed.With(labels).Set(failedValue)
+}
+
 func (m *MetricsAllocator) DeleteIPPool(ippoolName string, subnet string, networkName string) {
 	m.kubevirtiphelperIPPoolUsed.Delete(prometheus.Labels{
 		LabelIPPoolName:  ippoolName,
@@ -137,6 +184,18 @@ func (m *MetricsAllocator) DeleteIPPool(ippoolName string, subnet string, networ
 	})
 
 	m.kubevirtiphelperIPPoolAvailable.Delete(prometheus.Labels{
+		LabelIPPoolName:  ippoolName,
+		LabelSubnet:      subnet,
+		LabelNetworkName: networkName,
+	})
+
+	m.kubevirtiphelperIPPoolNTPServers.Delete(prometheus.Labels{
+		LabelIPPoolName:  ippoolName,
+		LabelSubnet:      subnet,
+		LabelNetworkName: networkName,
+	})
+
+	m.kubevirtiphelperIPPoolNTPFailed.Delete(prometheus.Labels{
 		LabelIPPoolName:  ippoolName,
 		LabelSubnet:      subnet,
 		LabelNetworkName: networkName,
