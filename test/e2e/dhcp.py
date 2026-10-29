@@ -245,8 +245,15 @@ def _decode_dhcp(data, timestamp, ip_src, ip_dst, where):
     )
     client_id_value = _option_value(options, 61, "client identifier", where)
 
+    # Option 42 is the ntp projection of the pool spec: the helper serves the
+    # literals and the last-good addresses of the configured entries. It is
+    # optional and recorded only when the option is present, so a capture from
+    # a pool which carried no ntp servers decodes exactly as it did before the
+    # option was understood: the same keys and no `ntp`.
+    ntp = _option_ips(options, 42, "NTP server", where)
+
     flags = _u16(data, 10)
-    return {
+    event = {
         "time": timestamp,
         "message": message,
         "mac": ":".join(f"{octet:02x}" for octet in data[28:34]),
@@ -270,6 +277,9 @@ def _decode_dhcp(data, timestamp, ip_src, ip_dst, where):
             client_id_value.hex() if client_id_value is not None else None
         ),
     }
+    if ntp:
+        event["ntp"] = ntp
+    return event
 
 
 def _decode_ipv4(packet, timestamp, where):

@@ -4073,6 +4073,344 @@ run_dhcp_wire_checks() {
 }
 
 # ---------------------------------------------------------------------------
+# NTP resolution of the pool projection (option 42)
+#
+# A pool registration must never depend on the resolver: the controller builds
+# option 42 from the literal entries of the spec plus the addresses the live
+# pool already serves, and a background refresh re-resolves the hostname
+# entries. This scenario patches the served pool's spec.ntp and asserts both
+# ends of that contract: the published gauges
+# (kubevirtiphelper_ippool_ntp_servers / _ntp_resolution_failed) and the option
+# 42 of the synthetic client's OFFER/ACK on the recorded bridge. The pool is
+# restored to its no-ntp spec in the tail, so the orphan sweep that follows
+# still starts from the empty pool.
+#
+# Cost: it reuses the synthetic client and the observer captures of the DHCP
+# wire scenario rather than adding a second client, and needs one halted VM for
+# a controller-owned reservation. It is placed directly after the wire
+# scenario: the pool is empty and the leader is already qualified there, no
+# guest boots, and the captures this scenario takes are the same three node
+# bridges.
+NTP_LITERAL_A="10.77.0.1"
+NTP_LITERAL_B="10.77.0.2"
+NTP_BAD_NAME="ntp.invalid"
+NTP_VM="dhcp-ntp-vm"
+NTP_VM_MAC="02:00:00:00:00:53"
+NTP_XID_LITERALS_DISCOVER=218103856
+NTP_XID_LITERALS_REQUEST=218103857
+NTP_XID_BADNAME_SERVING=218103872
+NTP_XID_BADNAME_REQUEST=218103873
+NTP_XID_RECOVERY_REQUEST=218103888
+NTP_XID_CLEANUP_REQUEST=218103904
+# The spec.ntp projection the pool carried before the scenario patched it, so
+# the tail can restore exactly that. Empty until the scenario reads it.
+NTP_SPEC_ORIGINAL=""
+# Every log assertion reads only the lines written after this instant: the
+# per-entry failure is new, and a registration failure written during the
+# scenario is what the no-registration-failure case excludes.
+NTP_LOG_SINCE=""
+
+# The published ntp gauges of the served pool, read through the metrics
+# Service from the current leader. Both series use the same label set as
+# kubevirtiphelper_ippool_used.
+ntp_gauges_are() { # <servers> <failed>
+  local text servers failed
+  text="$(metrics_text)" || return 1
+  servers="$(metric_value_for "${text}" kubevirtiphelper_ippool_ntp_servers \
+    "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
+  failed="$(metric_value_for "${text}" kubevirtiphelper_ippool_ntp_resolution_failed \
+    "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
+  [ "${servers}" = "$1" ] && [ "${failed}" = "$2" ]
+}
+
+# A pool without ntp servers may leave both series out or publish them as 0/0;
+# the absence of option 42 is the observable either way.
+ntp_gauges_absent_or_zero() {
+  local text
+  text="$(metrics_text)" || return 1
+  if ! printf '%s\n' "${text}" | grep -q '^kubevirtiphelper_ippool_ntp_'; then
+    return 0
+  fi
+  ntp_gauges_are 0 0
+}
+
+ntp_spec_ntp() {
+  kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
+    jq -ce '.spec.ipv4config.ntp // null'
+}
+
+ntp_spec_has_no_ntp() {
+  kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
+    jq -e '.spec.ipv4config | has("ntp") | not' > /dev/null
+}
+
+# A merge patch replaces the ntp list; the null of a JSON merge patch removes
+# the key, which is how a pool which never carried ntp is restored.
+ntp_spec_set() { # <json array or null>
+  kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+    -p "{\"spec\":{\"ipv4config\":{\"ntp\":$1}}}" > /dev/null
+}
+
+helper_log_since() { # <RFC3339 instant>
+  local pod
+  pod="$(current_leader_pod)" || return 1
+  kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" --since-time="$1" 2> /dev/null
+}
+
+# The per-entry failure is an error line which names the entry and the pool;
+# it must not be a silent drop of the entry.
+ntp_failure_logged() {
+  helper_log_since "${NTP_LOG_SINCE}" |
+    grep -F "cannot resolve the ntp entry ${NTP_BAD_NAME} of pool ${KIH_IPPOOL_NAME}" |
+    grep -F 'level=error' > /dev/null
+}
+
+# A resolver failure must never reject the registration (the pre-fix behaviour
+# rejected the whole pool reload) nor reject the reload of the same object.
+ntp_no_registration_failure() {
+  local logs
+  logs="$(helper_log_since "${NTP_LOG_SINCE}")" || return 1
+  ! printf '%s\n' "${logs}" | grep -E \
+    'cannot register the dhcp pool of network|error while registering DHCP pool for network|error while updating dhcppool' \
+    > /dev/null
+}
+
+# Exact option 42 of one recorded reply: the order of the served servers is part
+# of the assertion, so a helper which dropped one, reordered them or kept a
+# stale address fails here instead of showing a plausible list.
+dhcp_wire_ntp_is() { # <xid> <message> <json array>
+  jq -se --argjson xid "$1" --arg message "$2" --argjson ntp "$3" '
+    any(.[]; .xid == $xid and .message == $message and .ntp == $ntp)' \
+    "${DHCP_WIRE_EVENTS}" > /dev/null
+}
+
+# The reply exists and carries no option 42 at all.
+dhcp_wire_ntp_absent() { # <xid> <message>
+  jq -se --argjson xid "$1" --arg message "$2" '
+    any(.[]; .xid == $xid and .message == $message and (has("ntp") | not))' \
+    "${DHCP_WIRE_EVENTS}" > /dev/null
+}
+
+# Re-decode a capture taken before the pool carried any ntp server with this
+# checkout's decoder: the event keys must be exactly the ones the decoder has
+# always emitted, and no `ntp` key may appear, so an old capture decodes as it
+# did before option 42 was understood.
+decoder_old_capture_unchanged() {
+  local capture
+  for capture in "${E2E_ARTIFACTS_DIR}"/dhcp-failover-*.pcap; do
+    [ -s "${capture}" ] || continue
+    python3 "${E2E_DIR}/dhcp.py" "${capture}" || return 1
+  done | jq -se '
+    length > 0
+    and all(.[];
+      (has("ntp") | not)
+      and (keys | sort) == (["broadcast","ciaddr","client_id","dns","ip_dst",
+        "ip_src","lease_seconds","mac","message","requested_ip","routers",
+        "server_id","subnet","time","xid","yiaddr"] | sort))
+  ' > /dev/null
+}
+
+# The recorded option 42 of one exchange, in the served order: the two literals
+# of the spec, the last-good pair kept through the failing name, the recovered
+# single server, and no option 42 after the restore.
+ntp_offer_ack_literals() {
+  local pair
+  pair="$(jq -cn --arg a "${NTP_LITERAL_A}" --arg b "${NTP_LITERAL_B}" '[$a, $b]')" || return 1
+  dhcp_wire_ntp_is "${NTP_XID_LITERALS_DISCOVER}" OFFER "${pair}" &&
+    dhcp_wire_ntp_is "${NTP_XID_LITERALS_REQUEST}" ACK "${pair}"
+}
+
+ntp_badname_wire_kept() {
+  local pair
+  pair="$(jq -cn --arg a "${NTP_LITERAL_A}" --arg b "${NTP_LITERAL_B}" '[$a, $b]')" || return 1
+  dhcp_wire_ntp_is "${NTP_XID_BADNAME_SERVING}" ACK "${pair}" &&
+    dhcp_wire_ntp_is "${NTP_XID_BADNAME_REQUEST}" ACK "${pair}"
+}
+
+ntp_recovery_wire_served() {
+  local single
+  single="$(jq -cn --arg a "${NTP_LITERAL_A}" '[$a]')" || return 1
+  dhcp_wire_ntp_is "${NTP_XID_RECOVERY_REQUEST}" ACK "${single}"
+}
+
+ntp_cleanup_wire_cleared() {
+  dhcp_wire_ntp_absent "${NTP_XID_CLEANUP_REQUEST}" ACK
+}
+
+run_ntp_checks() {
+  local deadline out wire_events manifest reserved elapsed spec_send
+  local started=${SECONDS}
+  deadline=$((SECONDS + 600))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the pool ntp resolution (literals, failing name, recovery)"
+  out="${E2E_ARTIFACTS_DIR}/ntp-client.jsonl"
+  : > "${out}"
+
+  assert_case CORE-NTP-BASELINE \
+    "the served pool carries no ntp servers and publishes 0/0 (or no series) before the scenario patches it" \
+    ntp_gauges_absent_or_zero
+  # The cleanup case restores this exact projection, so the baseline is also the
+  # expected end state: a pool which already carried ntp would make the restored
+  # gauge ambiguous.
+  assert_case CORE-NTP-BASELINE-SPEC \
+    "the served pool starts without an ntp key in its spec" ntp_spec_has_no_ntp
+  NTP_SPEC_ORIGINAL="$(ntp_spec_ntp)" ||
+    die "cannot read the ntp projection of ${KIH_IPPOOL_NAME}"
+  [ "${NTP_SPEC_ORIGINAL}" = "null" ] ||
+    die "the ntp scenario requires a pool without a configured ntp projection, got ${NTP_SPEC_ORIGINAL}"
+
+  log "core: reserving one controller-owned address for the ntp wire steps"
+  manifest="${E2E_ARTIFACTS_DIR}/39-ntp-vm.yaml"
+  render_halted_vm "${NTP_VM}" "${NTP_VM_MAC}" "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline CORE-NTP-FIXTURE "${deadline}" 120 \
+    "the halted ntp vm holds a controller-owned reservation" \
+    named_reservation_kept "${NTP_VM}" "${NTP_VM_MAC}"
+  reserved="$(named_row_address "${NTP_VM}")" ||
+    die "cannot read the ntp wire reservation of ${NTP_VM}"
+  [ -n "${reserved}" ] || die "the ntp wire reservation of ${NTP_VM} is empty"
+
+  guard_case CORE-NTP-CAPTURE-START \
+    "passive captures start before the ntp exchanges" \
+    start_dhcp_captures ntp "${deadline}" "${KIH_BRIDGE_NAME}"
+  wait_before_deadline CORE-NTP-CAPTURE-READY "${deadline}" 30 \
+    "all node bridges are being recorded before the ntp exchanges" capture_streams_ready
+
+  NTP_LOG_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  log "core: literal ntp servers are served in option 42"
+  ntp_spec_set "[\"${NTP_LITERAL_A}\",\"${NTP_LITERAL_B}\"]"
+  wait_before_deadline CORE-NTP-LITERALS-GAUGE "${deadline}" 60 \
+    "the literal ntp servers are published as ntp_servers=2 and resolution_failed=0" \
+    ntp_gauges_are 2 0
+  spec_send="$(jq -cn --arg chaddr "${NTP_VM_MAC}" '{type:"discover",chaddr:$chaddr}')"
+  guard_case CORE-NTP-LITERALS-DISCOVER \
+    "the synthetic client discovers for the reserved mac" \
+    dhcp_wire_send "${out}" "${NTP_XID_LITERALS_DISCOVER}" 6 any "${spec_send}"
+  assert_case CORE-NTP-LITERALS-OFFER \
+    "the offer carries the reserved ${reserved}" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_LITERALS_DISCOVER}" OFFER yiaddr "${reserved}"
+  spec_send="$(jq -cn --arg chaddr "${NTP_VM_MAC}" --arg requested "${reserved}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-NTP-LITERALS-REQUEST \
+    "the synthetic client requests the reserved ${reserved}" \
+    dhcp_wire_send "${out}" "${NTP_XID_LITERALS_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-NTP-LITERALS-ACK \
+    "the ack carries the reserved ${reserved}" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_LITERALS_REQUEST}" ACK yiaddr "${reserved}"
+
+  log "core: an unresolvable ntp name keeps the last-good servers and keeps serving"
+  ntp_spec_set "[\"${NTP_BAD_NAME}\"]"
+  # The request is sent while the reload is in flight: the registration of the
+  # unchanged pool must not reject or drop the option 42 of the network.
+  spec_send="$(jq -cn --arg chaddr "${NTP_VM_MAC}" --arg requested "${reserved}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-NTP-BADNAME-SERVING-REQUEST \
+    "the request right after the reload is answered" \
+    dhcp_wire_send "${out}" "${NTP_XID_BADNAME_SERVING}" 6 any "${spec_send}"
+  assert_case CORE-NTP-BADNAME-SERVING-ACK \
+    "the pool still acks the reserved ${reserved} while the ntp name is being resolved" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_BADNAME_SERVING}" ACK yiaddr "${reserved}"
+  # Bound: the registration spawns the refresh without waiting for it, so a
+  # refresh which races the cache replacement aborts unrecorded and the informer
+  # resync (one minute) drives the retry. 120s leaves the resync, the 5s refresh
+  # budget and a slow resolver inside the bound; the gauge is polled, never slept on.
+  wait_before_deadline CORE-NTP-BADNAME-GAUGE "${deadline}" 120 \
+    "the failed resolution is published as resolution_failed=1 while ntp_servers stays 2 (last-good)" \
+    ntp_gauges_are 2 1
+  wait_before_deadline CORE-NTP-BADNAME-LOG "${deadline}" 30 \
+    "the helper logs the per-entry failure naming ${NTP_BAD_NAME} as an error" \
+    ntp_failure_logged
+  assert_case CORE-NTP-BADNAME-NO-REGISTRATION-FAILURE \
+    "the resolver failure never rejected the registration or the reload" \
+    ntp_no_registration_failure
+  guard_case CORE-NTP-BADNAME-REQUEST \
+    "a request after the failed resolution is answered" \
+    dhcp_wire_send "${out}" "${NTP_XID_BADNAME_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-NTP-BADNAME-ACK \
+    "the pool still acks ${reserved} after the failed resolution" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_BADNAME_REQUEST}" ACK yiaddr "${reserved}"
+
+  log "core: a recovered literal set replaces the last-good servers"
+  ntp_spec_set "[\"${NTP_LITERAL_A}\"]"
+  wait_before_deadline CORE-NTP-RECOVERY-GAUGE "${deadline}" 60 \
+    "the single literal server is published as ntp_servers=1 and resolution_failed=0" \
+    ntp_gauges_are 1 0
+  spec_send="$(jq -cn --arg chaddr "${NTP_VM_MAC}" --arg requested "${reserved}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-NTP-RECOVERY-REQUEST \
+    "the request after the recovery is answered" \
+    dhcp_wire_send "${out}" "${NTP_XID_RECOVERY_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-NTP-RECOVERY-ACK \
+    "the ack after the recovery carries the reserved ${reserved}" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_RECOVERY_REQUEST}" ACK yiaddr "${reserved}"
+
+  log "core: restoring the pool without ntp servers clears option 42 and the gauges"
+  ntp_spec_set "${NTP_SPEC_ORIGINAL}"
+  wait_before_deadline CORE-NTP-CLEANUP-GAUGE "${deadline}" 60 \
+    "the restored pool publishes 0/0 (or no ntp series)" ntp_gauges_absent_or_zero
+  spec_send="$(jq -cn --arg chaddr "${NTP_VM_MAC}" --arg requested "${reserved}" \
+    --arg server "${KIH_IPPOOL_SERVER}" \
+    '{type:"request",chaddr:$chaddr,requested_ip:$requested,server_id:$server}')"
+  guard_case CORE-NTP-CLEANUP-REQUEST \
+    "the request on the restored pool is answered" \
+    dhcp_wire_send "${out}" "${NTP_XID_CLEANUP_REQUEST}" 6 any "${spec_send}"
+  assert_case CORE-NTP-CLEANUP-ACK \
+    "the restored pool still acks ${reserved}" \
+    dhcp_wire_client_reply_is "${out}" "${NTP_XID_CLEANUP_REQUEST}" ACK yiaddr "${reserved}"
+  assert_case CORE-NTP-CLEANUP-SPEC \
+    "the pool spec is back to its original projection without an ntp key" \
+    ntp_spec_has_no_ntp
+
+  guard_case CORE-NTP-CAPTURE-CLOSE \
+    "the ntp exchanges are decoded from the node captures" \
+    finish_guest_evidence "${deadline}"
+  wire_events="${E2E_ARTIFACTS_DIR}/ntp-events.jsonl"
+  guard_case CORE-NTP-EVENTS \
+    "the decoded node captures merge into one event stream" \
+    dhcp_wire_events "${wire_events}"
+  DHCP_WIRE_EVENTS="${wire_events}"
+
+  # Every synthetic reply on the recorded bridge carries exactly the option 42
+  # the pool serves: the two literals in their configured order, the last-good
+  # set while the name fails, the recovered literal alone, and nothing after the
+  # restore. A helper which resolved the registration path (and rejected it), or
+  # dropped option 42 when the name failed, or kept the stale set after the
+  # recovery, fails on this stream.
+  assert_case CORE-NTP-ON-WIRE-LITERALS \
+    "the offer and ack carry exactly [${NTP_LITERAL_A}, ${NTP_LITERAL_B}] in that order" \
+    ntp_offer_ack_literals
+  assert_case CORE-NTP-ON-WIRE-LAST-GOOD \
+    "both acks during and after the failed resolution carry the last-good [${NTP_LITERAL_A}, ${NTP_LITERAL_B}]" \
+    ntp_badname_wire_kept
+  assert_case CORE-NTP-ON-WIRE-RECOVERY \
+    "the ack after the recovery carries exactly [${NTP_LITERAL_A}] and no stale server" \
+    ntp_recovery_wire_served
+  assert_case CORE-NTP-ON-WIRE-CLEANUP \
+    "the ack of the restored pool carries no option 42" \
+    ntp_cleanup_wire_cleared
+  assert_case CORE-NTP-DECODER-COMPAT \
+    "an older capture without option 42 decodes to the unchanged keys and no ntp" \
+    decoder_old_capture_unchanged
+
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${NTP_VM}" \
+    --wait=true --timeout=180s > /dev/null
+  wait_before_deadline CORE-NTP-CLEANED "${deadline}" 180 \
+    "the ntp fixture releases its reservation and returns the empty pool" pool_initialized
+  guard_case CORE-NTP-DEADLINE \
+    "ntp scenarios completed within their own deadline" test "${SECONDS}" -lt "${deadline}"
+  elapsed=$((SECONDS - started))
+  printf '%s\n' "${elapsed}" > "${E2E_ARTIFACTS_DIR}/ntp-cost-seconds.txt"
+  log "core: ntp checks completed in ${elapsed}s"
+  SCENARIO_DEADLINE=0
+}
+
+# ---------------------------------------------------------------------------
 # Admission-entry reconciliation and pool identity
 #
 # The webhook registers four admission entries and reconciles their content at
@@ -4626,6 +4964,7 @@ main() {
   run_static_ip_release_checks
   run_declared_address_race_checks
   run_dhcp_wire_checks
+  run_ntp_checks
   run_webhook_reconciliation_checks
   run_orphan_sweep_checks
 
