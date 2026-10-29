@@ -2371,6 +2371,28 @@ EOF
     > "${E2E_ARTIFACTS_DIR}/14-multipool-group.txt"
 }
 
+# image_content_matches reports whether a node's loaded image is the image the
+# runtime built: <built-image-inspect-json> <loaded-crictl-inspecti-json>.
+# the runtime and the node's containerd do not always identify the same image
+# with the same digest (docker's config digest vs the node's target digest, and
+# the two representations differ between docker's image stores), so compare the
+# digest first and the content - the rootfs diff ids and the non-zero image
+# config - when they disagree. the content is what "the exact built image" means.
+image_content_matches() {
+  local record="$1" loaded="$2" built_id loaded_id built_layers loaded_layers
+  local built_config loaded_config normalized
+  built_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")' <<< "${record}")" || return 1
+  loaded_id="$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" || return 1
+  [ "${loaded_id}" != "${built_id}" ] || return 0
+  built_layers="$(jq -Ser '.[0].RootFS.Layers | sort' <<< "${record}")" || return 1
+  loaded_layers="$(jq -Ser '.info.imageSpec.rootfs.diff_ids | sort' <<< "${loaded}")" || return 1
+  [ "${built_layers}" = "${loaded_layers}" ] || return 1
+  normalized='walk(if type == "object" then with_entries(select(.value != null and .value != false and .value != "" and .value != {} and .value != [])) else . end)'
+  built_config="$(jq -Ser ".[0].Config | ${normalized}" <<< "${record}")" || return 1
+  loaded_config="$(jq -Ser ".info.imageSpec.config | ${normalized}" <<< "${loaded}")" || return 1
+  [ "${built_config}" = "${loaded_config}" ]
+}
+
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
   local image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
@@ -2420,7 +2442,7 @@ main() {
   for node in "${kind_nodes[@]}"; do
     loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_IMAGE}")"
     assert_case "CORE-IMAGE-${node}" "node ${node} loaded the exact built image content" \
-      test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${image_id}"
+      image_content_matches "${image_record}" "${loaded}"
     printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-image-${node}.json"
   done
   report_case_start CORE-BOOTSTRAP-JOURNAL \
