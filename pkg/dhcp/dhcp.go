@@ -197,11 +197,11 @@ func (a *DHCPAllocator) AddPool(
 	}
 	pool.DomainName = domainName
 	pool.DomainSearch = domainSearch
-	// copy the ntp addresses: the caller (and its cached pool) must not be
-	// able to rewrite the served option 42 through the slice it passed in
-	if len(NTP) > 0 {
-		pool.NTP = append([]net.IP(nil), NTP...)
-	}
+	// copy the ntp addresses by value: net.IP is a byte slice, so copying
+	// only the outer slice would still share the served option 42 with the
+	// caller (and its cached pool), which could then rewrite the bytes of a
+	// live reply
+	pool.NTP = copyNTPAddresses(NTP)
 	pool.LeaseTime = leaseTime
 	pool.Nic = nic
 
@@ -268,12 +268,30 @@ func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
 	return a.pools[name]
 }
 
+// copyNTPAddresses copies an ntp address list by value. net.IP is a byte
+// slice, so an outer-slice copy alone still shares every address with the
+// caller: a caller which rewrites ip[3] of an address it handed in (or of an
+// address it read back) would rewrite the bytes of the served option 42.
+// the served state therefore owns its own bytes in both directions.
+func copyNTPAddresses(addresses []net.IP) []net.IP {
+	if len(addresses) == 0 {
+		return nil
+	}
+
+	copied := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		copied = append(copied, append(net.IP(nil), address...))
+	}
+
+	return copied
+}
+
 // SetPoolNTP replaces the served ntp addresses (option 42) of a registered
 // pool in one atomic step and reports whether the pool exists. the live
 // pool is the last-good cache of the ntp resolution: the ippool controller
 // refreshes the addresses after a successful lookup, while a failed lookup
-// simply leaves the previously served set in place. a slice copy keeps the
-// caller's buffer out of the served state.
+// simply leaves the previously served set in place. the addresses are copied
+// by value, so the caller's buffer never reaches the served state.
 func (a *DHCPAllocator) SetPoolNTP(name string, ntp []net.IP) bool {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -283,19 +301,16 @@ func (a *DHCPAllocator) SetPoolNTP(name string, ntp []net.IP) bool {
 		return false
 	}
 
-	if len(ntp) == 0 {
-		pool.NTP = nil
-	} else {
-		pool.NTP = append([]net.IP(nil), ntp...)
-	}
+	pool.NTP = copyNTPAddresses(ntp)
 	a.pools[name] = pool
 
 	return true
 }
 
 // PoolNTP returns a copy of the ntp addresses a registered pool currently
-// serves and reports whether the pool exists. the copy keeps a caller from
-// mutating the served option 42 through the returned slice.
+// serves and reports whether the pool exists. the addresses are copied by
+// value, so a caller can neither reach the served option 42 through the
+// returned slice nor through the bytes of one of its addresses.
 func (a *DHCPAllocator) PoolNTP(name string) ([]net.IP, bool) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -305,7 +320,7 @@ func (a *DHCPAllocator) PoolNTP(name string) ([]net.IP, bool) {
 		return nil, false
 	}
 
-	return append([]net.IP(nil), pool.NTP...), true
+	return copyNTPAddresses(pool.NTP), true
 }
 
 func (a *DHCPAllocator) DeletePool(name string) (err error) {
