@@ -1492,17 +1492,23 @@ cleanup_stale_expanded_resources() {
 # entries. This scenario patches the served pool's spec.ipv4config.ntp through
 # four projections and asserts both ends of that contract: the published gauges
 # (kubevirtiphelper_ippool_ntp_servers / _ntp_resolution_failed), the option 42
-# of the lane's first guest boot as decoded from its recorded ACK, and that the
-# pool keeps serving addresses while a hostname fails.
+# of every guest ACK decoded from that boot's own capture - the literals, the
+# last-good pair after the failed name, the single recovered literal, and the
+# absent option after the restore - and that the pool keeps serving addresses
+# while a hostname fails.
 #
-# Cost: the one guest boot it needs is the lane's existing first boot, because
-# the literal projection is patched before it - no VM lifecycle is added. The
-# bad-name projection adds one halted fixture VM (a controller-owned
-# reservation, no VMI) which is deleted again before the scenario returns the
-# pool to its no-ntp projection, and the wire proof reuses the guest node
-# capture of that boot. The three reloads and the fixture are seconds each, so
-# the typical added wall clock is under a minute; the polling bounds keep the
-# worst case inside this scenario's 900s and the suite's 40-minute budget.
+# Cost: the wire proof is carried by three guest boots. The first is the lane's
+# existing first boot, because the literal projection is patched before it. The
+# bad-name and recovery projections each restart that same guest: its VM is
+# Halted and already holds its reservation, so the harness's ordinary stop/start
+# boots the pinned image again without adding a VM, a manifest or an address.
+# The restored no-ntp projection is proven by the core lifecycle's next boot,
+# which happens anyway. The bad-name projection also adds one halted fixture VM
+# (a controller-owned reservation, no VMI) which is deleted again before the
+# pool is restored. The reloads and the fixture are seconds each, so the typical
+# added wall clock over a single-boot scenario is about two minutes; the
+# per-boot timeouts bound the worst case, which is why this scenario's own
+# deadline is 1200s inside the suite's 40-minute budget.
 NTP_LITERAL_A="10.77.0.1"
 NTP_LITERAL_B="10.77.0.2"
 NTP_BAD_NAME="ntp.invalid"
@@ -1581,15 +1587,28 @@ ntp_no_registration_failure() {
     > /dev/null
 }
 
-# The ACK of the first guest boot carries exactly the pool's two literal ntp
-# servers, in their configured order: a helper which dropped one, reordered
-# them or served a stale address fails here instead of showing a plausible
-# list. The exchange is the guest's own, so it also proves the served option 42
-# reaches a stock client without any synthetic packet.
-ntp_boot_ack_option42() {
+# The ACK recorded in ${GUEST_EVENTS} for the current guest boot carries
+# exactly the expected option 42 servers, in that order - or no option 42 at all
+# when the expectation is `none`. A helper which dropped an entry, reordered
+# them, served a stale address or kept an option from an earlier projection
+# fails here instead of showing a plausible list or gauge. The exchange is the
+# guest's own REQUEST/ACK pair, so it also proves the served option 42 reaches a
+# stock client without any synthetic packet.
+#
+# ${GUEST_EVENTS} is the capture of one boot (start_guest_and_assert renames it
+# per label), so a restart that follows a reload can only satisfy this predicate
+# from packets sent after that reload.
+ntp_ack_option42() { # <none> | <server> [server...]
+  local expected
+  [ "$#" -ge 1 ] || return 1
+  if [ "$1" = none ]; then
+    expected="null"
+  else
+    expected="$(jq -cn --args '$ARGS.positional' "$@")" || return 1
+  fi
   refresh_dhcp_events || return 1
   jq -se --arg mac "${KIH_VM_MAC}" --arg ip "${RESERVED_IP}" \
-    --arg a "${NTP_LITERAL_A}" --arg b "${NTP_LITERAL_B}" '
+    --argjson expected "${expected}" '
     map(select(.mac == $mac)) as $events
     | any(range(0; $events | length);
         . as $i | $events[$i] as $request
@@ -1597,7 +1616,7 @@ ntp_boot_ack_option42() {
         and any($events[($i + 1):][];
           .message == "ACK" and .xid == $request.xid
           and .time >= $request.time
-          and .yiaddr == $ip and .ntp == [$a, $b]))
+          and .yiaddr == $ip and .ntp == $expected))
   ' "${GUEST_EVENTS}" > /dev/null
 }
 
@@ -1611,7 +1630,7 @@ ntp_fixture_released() {
 
 # The restored projection must leave the network served: the primary
 # reservation, the server ip on the bind interface, the UDP/67 listener and the
-# metrics endpoint all survive the three ntp reloads.
+# metrics endpoint all survive the ntp reloads.
 ntp_pool_still_serving() {
   reservation_stable && leader_services_healthy && metric_pool_equals 1 10
 }
@@ -1619,7 +1638,10 @@ ntp_pool_still_serving() {
 run_ntp_checks() {
   local deadline manifest elapsed started
   started=${SECONDS}
-  deadline=$((SECONDS + 900))
+  # Three guest boots happen inside this scenario (initial, bad-name restart,
+  # recovery restart), each bounded by the harness's per-boot timeouts, so the
+  # scenario keeps its own hard completion bound with headroom for them.
+  deadline=$((SECONDS + 1200))
   SCENARIO_DEADLINE="${deadline}"
   log "core: qualifying the pool ntp projection and its served option 42"
 
@@ -1653,7 +1675,7 @@ run_ntp_checks() {
   capture_checkpoint 05-boot-initial "first guest boot answered DHCP for ${RESERVED_IP}"
   wait_before_deadline CORE-NTP-ON-WIRE-LITERALS "${deadline}" 60 \
     "the boot's recorded ack carries exactly [${NTP_LITERAL_A}, ${NTP_LITERAL_B}] in that order" \
-    ntp_boot_ack_option42
+    ntp_ack_option42 "${NTP_LITERAL_A}" "${NTP_LITERAL_B}"
   stop_guest initial "${deadline}"
 
   log "core: an unresolvable ntp name keeps the last-good servers and keeps serving"
@@ -1675,6 +1697,18 @@ run_ntp_checks() {
     "the resolver failure never rejected the registration or the reload" \
     ntp_no_registration_failure
 
+  # The gauge is bookkeeping; the promise is about the wire. The guest is
+  # halted and keeps its reservation, so the harness's ordinary restart boots
+  # the same pinned guest again and its own ACK has to carry the last-good pair
+  # the live pool serves. A fresh boot is needed because no packet from before
+  # the failed reload can prove what the pool serves after it.
+  log "core: restarting the guest proves the last-good option 42 on the wire"
+  start_guest_and_assert ntp-badname "${deadline}"
+  wait_before_deadline CORE-NTP-BADNAME-ON-WIRE "${deadline}" 60 \
+    "the boot's recorded ack still carries exactly [${NTP_LITERAL_A}, ${NTP_LITERAL_B}] in that order" \
+    ntp_ack_option42 "${NTP_LITERAL_A}" "${NTP_LITERAL_B}"
+  stop_guest ntp-badname "${deadline}"
+
   log "core: the pool still serves a new halted vm while the ntp name fails"
   manifest="${E2E_ARTIFACTS_DIR}/39-ntp-fixture-vm.yaml"
   render_halted_vm "${NTP_FIXTURE_VM}" "${NTP_FIXTURE_MAC}" "${manifest}"
@@ -1693,6 +1727,15 @@ run_ntp_checks() {
   wait_before_deadline CORE-NTP-RECOVERY-GAUGE "${deadline}" 60 \
     "the single literal server is published as ntp_servers=1 and resolution_failed=0" \
     ntp_gauges_are 1 0
+  # The replaced projection has to be on the wire, not only in the counter: the
+  # next boot's own ACK must carry the single literal and nothing of the
+  # last-good pair.
+  log "core: restarting the guest proves the recovered single literal on the wire"
+  start_guest_and_assert ntp-recovery "${deadline}"
+  wait_before_deadline CORE-NTP-RECOVERY-ON-WIRE "${deadline}" 60 \
+    "the boot's recorded ack carries exactly [${NTP_LITERAL_A}] and no stale last-good address" \
+    ntp_ack_option42 "${NTP_LITERAL_A}"
+  stop_guest ntp-recovery "${deadline}"
 
   log "core: restoring the pool without ntp servers clears the gauges"
   ntp_spec_set "${NTP_SPEC_ORIGINAL}"
@@ -1704,6 +1747,9 @@ run_ntp_checks() {
   wait_before_deadline CORE-NTP-CLEANUP-SERVING "${deadline}" 90 \
     "the restored pool still serves ${RESERVED_IP} with its listener and metrics" \
     ntp_pool_still_serving
+  # The restored projection is proven on the wire by the core lifecycle's next
+  # boot (CORE-NTP-CLEANUP-ON-WIRE, right after this scenario), so the cleanup
+  # needs no extra restart: that boot's own ACK must carry no option 42.
 
   guard_case CORE-NTP-DEADLINE \
     "ntp scenarios completed within their own deadline" test "${SECONDS}" -lt "${deadline}"
@@ -2574,6 +2620,12 @@ main() {
   # boot instead of adding a second one.
   run_ntp_checks
   start_guest_and_assert restart
+  # This boot is the first exchange after the restore to the no-ntp projection,
+  # so it also proves the cleanup on the wire: the ACK must carry no option 42
+  # at all, not a zeroed or stale one.
+  wait_for CORE-NTP-CLEANUP-ON-WIRE 60 \
+    "the first ack after the restored no-ntp projection carries no option 42" \
+    ntp_ack_option42 none
   capture_checkpoint 06-boot-restart "second guest boot reused ${RESERVED_IP} after a stop"
   stop_guest restart
 
