@@ -1632,7 +1632,7 @@ run_ntp_checks() {
   assert_case CORE-NTP-BASELINE-SPEC \
     "the served pool starts without an ntp key in its spec" ntp_spec_has_no_ntp
   NTP_SPEC_ORIGINAL="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
-    jq -ce '.spec.ipv4config.ntp // null')" ||
+    jq -c '.spec.ipv4config.ntp // null')" ||
     die "cannot read the ntp projection of ${KIH_IPPOOL_NAME}"
   [ "${NTP_SPEC_ORIGINAL}" = "null" ] ||
     die "the ntp scenario requires a pool without a configured ntp projection, got ${NTP_SPEC_ORIGINAL}"
