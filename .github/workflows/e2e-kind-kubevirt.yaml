@@ -129,7 +129,9 @@ jobs:
       - name: Run the kind, Multus and KubeVirt end-to-end suite
         # `run.sh` prints its `report.txt` from the exit trap on success and on
         # failure alike, so the suite summary is already in this step's log.
-        timeout-minutes: 40
+        # the suite carries the wire, ntp, orphan-sweep and drain scenarios now,
+        # and the groups that run the core body finish just over the old ceiling
+        timeout-minutes: 55
         run: |
           short_sha="${GITHUB_SHA}"
           short_sha="${short_sha%${short_sha#????????}}"
