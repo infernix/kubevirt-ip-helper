@@ -196,6 +196,35 @@ EOF
 
 Now create a Virtual Machine in the same network as the \<NETWORKATTACHMENTDEFINITION_NAME> to test if the DHCP service works.
 
+#### NTP servers (`spec.ipv4config.ntp`)
+
+The `ntp` entries are served to the clients in DHCP option 42. Prefer literal
+IPv4 addresses: they reach the clients exactly as written and never depend on
+a resolver.
+
+A fully qualified hostname is resolved from the DNS view of the helper pod
+(the cluster resolver, so only names the pod can look up work), and a short
+name additionally follows the pod's DNS search list. Only IPv4 (A) records
+are served; an AAAA-only or empty answer is reported as a failure instead of
+being dropped silently.
+
+The name resolution never gates the pool: the pool registers and keeps
+serving with the addresses it already knows. When a lookup fails (NXDOMAIN,
+a timeout, or no IPv4 records), the last-known addresses stay in option 42,
+the failure is logged with the pool name, and the pool is retried. A
+successful lookup replaces option 42 in place, without restarting the
+helper: the resolution runs once at registration under a short cold-start
+budget, and it is refreshed on the informer resync of the IPPool - at most
+once every 5 minutes per pool.
+
+Two gauges report the resolution state per pool (labels `ippool`, `subnet`,
+`network`):
+
+- `kubevirtiphelper_ippool_ntp_servers`: number of IPv4 NTP servers currently
+  served in option 42.
+- `kubevirtiphelper_ippool_ntp_resolution_failed`: `1` when the last
+  resolution attempt had a failure, `0` otherwise.
+
 The `serverip` and the `router` of a pool are the addresses of the helper's own interface and of the gateway: they must not lie inside the allocation range (`pool.start` to `pool.end`), because the allocator would hand an in-range address to a guest while the infrastructure still uses it. A pool whose `serverip` or `router` lies inside its allocation range is rejected - by the ippool admission check before the object is stored, and by the same check mirrored in the helper's own registration for objects which reach the controller anyway (for example when the webhook is not installed) - unless the address is also listed in `pool.exclude`, which reserves it explicitly. This is a compatibility change: a pool which previously served its own infrastructure address to a guest was accepted silently and is now rejected; fix such a pool by moving the address outside the allocation range or by adding it to the exclude list.
 
 ### Status information
