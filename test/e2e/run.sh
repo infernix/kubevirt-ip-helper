@@ -1483,6 +1483,236 @@ cleanup_stale_expanded_resources() {
 }
 
 
+# ---------------------------------------------------------------------------
+# NTP resolution of the pool projection (option 42)
+#
+# A pool registration must never depend on the resolver: the controller builds
+# option 42 from the literal entries of the spec plus the addresses the live
+# pool already serves, and a background refresh re-resolves the hostname
+# entries. This scenario patches the served pool's spec.ipv4config.ntp through
+# four projections and asserts both ends of that contract: the published gauges
+# (kubevirtiphelper_ippool_ntp_servers / _ntp_resolution_failed), the option 42
+# of the lane's first guest boot as decoded from its recorded ACK, and that the
+# pool keeps serving addresses while a hostname fails.
+#
+# Cost: the one guest boot it needs is the lane's existing first boot, because
+# the literal projection is patched before it - no VM lifecycle is added. The
+# bad-name projection adds one halted fixture VM (a controller-owned
+# reservation, no VMI) which is deleted again before the scenario returns the
+# pool to its no-ntp projection, and the wire proof reuses the guest node
+# capture of that boot. The three reloads and the fixture are seconds each, so
+# the typical added wall clock is under a minute; the polling bounds keep the
+# worst case inside this scenario's 900s and the suite's 40-minute budget.
+NTP_LITERAL_A="10.77.0.1"
+NTP_LITERAL_B="10.77.0.2"
+NTP_BAD_NAME="ntp.invalid"
+NTP_FIXTURE_VM="ntp-fixture-vm"
+NTP_FIXTURE_MAC="02:00:00:00:00:53"
+# The spec.ipv4config.ntp projection the pool carried before this scenario
+# patched it, so the tail restores exactly that. Empty until the scenario reads
+# it.
+NTP_SPEC_ORIGINAL=""
+# Every log assertion reads only the lines written after this instant: the
+# per-entry failure is new, and a registration failure written during the
+# scenario is what the no-registration-failure case excludes.
+NTP_LOG_SINCE=""
+
+# The published ntp gauges of the served pool, read through the metrics Service
+# from the current leader. Both series use the same label set as
+# kubevirtiphelper_ippool_used.
+ntp_gauges_are() { # <servers> <failed>
+  local text servers failed
+  text="$(metrics_text)" || return 1
+  servers="$(metric_value_for "${text}" kubevirtiphelper_ippool_ntp_servers \
+    "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
+  failed="$(metric_value_for "${text}" kubevirtiphelper_ippool_ntp_resolution_failed \
+    "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
+  [ "${servers}" = "$1" ] && [ "${failed}" = "$2" ]
+}
+
+# A pool without ntp servers may leave both series out (a pool which never
+# loaded an ntp projection) or publish them as 0/0 (the reload which removed the
+# entries writes both); the absence of option 42 is the observable either way.
+ntp_gauges_absent_or_zero() {
+  local text
+  text="$(metrics_text)" || return 1
+  if ! printf '%s\n' "${text}" |
+    grep -q "^kubevirtiphelper_ippool_ntp_.*ippool=\"${KIH_IPPOOL_NAME}\""; then
+    return 0
+  fi
+  ntp_gauges_are 0 0
+}
+
+ntp_spec_has_no_ntp() {
+  kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
+    jq -e '.spec.ipv4config | has("ntp") | not' > /dev/null
+}
+
+# A merge patch replaces the ntp list; the null of a JSON merge patch removes
+# the key, which is how a pool which never carried ntp is restored.
+ntp_spec_set() { # <json array or null>
+  kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+    -p "{\"spec\":{\"ipv4config\":{\"ntp\":$1}}}" > /dev/null
+}
+
+helper_log_since() { # <RFC3339 instant>
+  local pod
+  pod="$(current_leader_pod)" || return 1
+  kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" --since-time="$1" 2> /dev/null
+}
+
+# The per-entry failure is an error line which names the entry and the pool; it
+# must not be a silent drop of the entry.
+ntp_failure_logged() {
+  helper_log_since "${NTP_LOG_SINCE}" |
+    grep -F "cannot resolve the ntp entry ${NTP_BAD_NAME} of pool ${KIH_IPPOOL_NAME}" |
+    grep -F 'level=error' > /dev/null
+}
+
+# A resolver failure must never reject the registration (the pre-fix behaviour
+# rejected the whole pool reload) nor reject the reload of the same object.
+ntp_no_registration_failure() {
+  local logs
+  logs="$(helper_log_since "${NTP_LOG_SINCE}")" || return 1
+  ! printf '%s\n' "${logs}" | grep -E \
+    'cannot register the dhcp pool of network|error while registering DHCP pool for network|error while updating dhcppool' \
+    > /dev/null
+}
+
+# The ACK of the first guest boot carries exactly the pool's two literal ntp
+# servers, in their configured order: a helper which dropped one, reordered
+# them or served a stale address fails here instead of showing a plausible
+# list. The exchange is the guest's own, so it also proves the served option 42
+# reaches a stock client without any synthetic packet.
+ntp_boot_ack_option42() {
+  refresh_dhcp_events || return 1
+  jq -se --arg mac "${KIH_VM_MAC}" --arg ip "${RESERVED_IP}" \
+    --arg a "${NTP_LITERAL_A}" --arg b "${NTP_LITERAL_B}" '
+    map(select(.mac == $mac)) as $events
+    | any(range(0; $events | length);
+        . as $i | $events[$i] as $request
+        | $request.message == "REQUEST" and $request.ciaddr == "0.0.0.0"
+        and any($events[($i + 1):][];
+          .message == "ACK" and .xid == $request.xid
+          and .time >= $request.time
+          and .yiaddr == $ip and .ntp == [$a, $b]))
+  ' "${GUEST_EVENTS}" > /dev/null
+}
+
+# The halted fixture VM is deleted inside the scenario, so the pool must return
+# to the single halted primary reservation the rest of the core phase expects.
+ntp_fixture_released() {
+  vm_absent_named "${NTP_FIXTURE_VM}" &&
+    vmnetcfg_absent_named "${NTP_FIXTURE_VM}" &&
+    metric_pool_equals 1 10
+}
+
+# The restored projection must leave the network served: the primary
+# reservation, the server ip on the bind interface, the UDP/67 listener and the
+# metrics endpoint all survive the three ntp reloads.
+ntp_pool_still_serving() {
+  reservation_stable && leader_services_healthy && metric_pool_equals 1 10
+}
+
+run_ntp_checks() {
+  local deadline manifest elapsed started
+  started=${SECONDS}
+  deadline=$((SECONDS + 900))
+  SCENARIO_DEADLINE="${deadline}"
+  log "core: qualifying the pool ntp projection and its served option 42"
+
+  assert_case CORE-NTP-BASELINE \
+    "the served pool publishes no ntp series (or 0/0) before the scenario patches it" \
+    ntp_gauges_absent_or_zero
+  # The tail restores this exact projection, so the baseline is also the
+  # expected end state: a pool which already carried ntp would make the
+  # restored gauge ambiguous.
+  assert_case CORE-NTP-BASELINE-SPEC \
+    "the served pool starts without an ntp key in its spec" ntp_spec_has_no_ntp
+  NTP_SPEC_ORIGINAL="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
+    jq -ce '.spec.ipv4config.ntp // null')" ||
+    die "cannot read the ntp projection of ${KIH_IPPOOL_NAME}"
+  [ "${NTP_SPEC_ORIGINAL}" = "null" ] ||
+    die "the ntp scenario requires a pool without a configured ntp projection, got ${NTP_SPEC_ORIGINAL}"
+
+  log "core: literal ntp servers are published and served in option 42"
+  ntp_spec_set "[\"${NTP_LITERAL_A}\",\"${NTP_LITERAL_B}\"]"
+  # The literal entries never cost a lookup, so the reload publishes them
+  # without a refresh: the poll only waits for the informer event to be
+  # processed and the metrics endpoint to expose the new series.
+  wait_before_deadline CORE-NTP-LITERALS-GAUGE "${deadline}" 60 \
+    "the literal ntp servers are published as ntp_servers=2 and resolution_failed=0" \
+    ntp_gauges_are 2 0
+
+  # The wire proof is the lane's ordinary first guest boot, taken on the
+  # literal projection so its own REQUEST/ACK carries the pool's option 42.
+  log "core: booting the guest on the literal projection for the wire proof"
+  start_guest_and_assert initial "${deadline}"
+  capture_checkpoint 05-boot-initial "first guest boot answered DHCP for ${RESERVED_IP}"
+  wait_before_deadline CORE-NTP-ON-WIRE-LITERALS "${deadline}" 60 \
+    "the boot's recorded ack carries exactly [${NTP_LITERAL_A}, ${NTP_LITERAL_B}] in that order" \
+    ntp_boot_ack_option42
+  stop_guest initial "${deadline}"
+
+  log "core: an unresolvable ntp name keeps the last-good servers and keeps serving"
+  NTP_LOG_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ntp_spec_set "[\"${NTP_BAD_NAME}\"]"
+  # Bound: the registration spawns the refresh without waiting for it, so a
+  # refresh which races the cache replacement aborts unrecorded and the
+  # one-minute informer resync retries it. 120s leaves the resync, the 5s
+  # refresh budget and a slow resolver inside the bound; the gauge is polled,
+  # never slept on. ntp_servers must stay 2: the live pool is the last-good
+  # cache, so a failed resolution may not drop option 42.
+  wait_before_deadline CORE-NTP-BADNAME-GAUGE "${deadline}" 120 \
+    "the failed resolution is published as resolution_failed=1 while ntp_servers stays 2 (last-good)" \
+    ntp_gauges_are 2 1
+  wait_before_deadline CORE-NTP-BADNAME-LOG "${deadline}" 30 \
+    "the helper logs the per-entry failure naming ${NTP_BAD_NAME} as an error" \
+    ntp_failure_logged
+  assert_case CORE-NTP-BADNAME-NO-REGISTRATION-FAILURE \
+    "the resolver failure never rejected the registration or the reload" \
+    ntp_no_registration_failure
+
+  log "core: the pool still serves a new halted vm while the ntp name fails"
+  manifest="${E2E_ARTIFACTS_DIR}/39-ntp-fixture-vm.yaml"
+  render_halted_vm "${NTP_FIXTURE_VM}" "${NTP_FIXTURE_MAC}" "${manifest}"
+  kubectl apply -f "${manifest}" > /dev/null
+  wait_before_deadline CORE-NTP-BADNAME-SERVES "${deadline}" 120 \
+    "a new halted vm receives a controller-owned reservation while the ntp name fails" \
+    named_reservation_kept "${NTP_FIXTURE_VM}" "${NTP_FIXTURE_MAC}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${NTP_FIXTURE_VM}" \
+    --wait=true --timeout=180s > /dev/null
+  wait_before_deadline CORE-NTP-FIXTURE-RELEASED "${deadline}" 180 \
+    "the ntp fixture releases its reservation and returns the pool accounting to 1/10" \
+    ntp_fixture_released
+
+  log "core: a recovered literal set replaces the last-good servers"
+  ntp_spec_set "[\"${NTP_LITERAL_A}\"]"
+  wait_before_deadline CORE-NTP-RECOVERY-GAUGE "${deadline}" 60 \
+    "the single literal server is published as ntp_servers=1 and resolution_failed=0" \
+    ntp_gauges_are 1 0
+
+  log "core: restoring the pool without ntp servers clears the gauges"
+  ntp_spec_set "${NTP_SPEC_ORIGINAL}"
+  wait_before_deadline CORE-NTP-CLEANUP-GAUGE "${deadline}" 60 \
+    "the restored pool publishes 0/0 (or no ntp series)" ntp_gauges_absent_or_zero
+  assert_case CORE-NTP-CLEANUP-SPEC \
+    "the pool spec is back to its original projection without an ntp key" \
+    ntp_spec_has_no_ntp
+  wait_before_deadline CORE-NTP-CLEANUP-SERVING "${deadline}" 90 \
+    "the restored pool still serves ${RESERVED_IP} with its listener and metrics" \
+    ntp_pool_still_serving
+
+  guard_case CORE-NTP-DEADLINE \
+    "ntp scenarios completed within their own deadline" test "${SECONDS}" -lt "${deadline}"
+  elapsed=$((SECONDS - started))
+  printf '%s\n' "${elapsed}" > "${E2E_ARTIFACTS_DIR}/ntp-cost-seconds.txt"
+  log "core: ntp checks completed in ${elapsed}s"
+  SCENARIO_DEADLINE=0
+}
+
 run_pool_group() {
   report_group pool
   local deadline i name mac manifest refused_ip reclaim_ip old_vm old_mac duplicate_before duplicate_marker
@@ -2317,9 +2547,10 @@ main() {
   wait_for CORE-METRICS-VMNETCFG-OK 60 "VMNetCfg OK metric" metric_vm_ok
   capture_checkpoint 04-halted-reservation "halted VM holds ${RESERVED_IP} with IPPool accounting"
 
-  start_guest_and_assert initial
-  capture_checkpoint 05-boot-initial "first guest boot answered DHCP for ${RESERVED_IP}"
-  stop_guest initial
+  # The pool ntp projection precedes the first boot: the literal projection is
+  # what that boot's option 42 proves on the wire, so the scenario wraps the
+  # boot instead of adding a second one.
+  run_ntp_checks
   start_guest_and_assert restart
   capture_checkpoint 06-boot-restart "second guest boot reused ${RESERVED_IP} after a stop"
   stop_guest restart
