@@ -44,16 +44,16 @@ func parkedNTPLookup(entered chan struct{}, release chan struct{}) func(ctx cont
 	}
 }
 
-// waitNTPIdle waits for the refresh goroutines of a pool to finish, so a
-// test can restore the lookup seam without racing a still running
-// resolution.
-func waitNTPIdle(t *testing.T, c *Controller, poolName string) {
+// waitNTPIdle waits for the refresh goroutines of a network to finish, so a
+// test can assert the settled state (or switch the seam) without racing a
+// still running resolution.
+func waitNTPIdle(t *testing.T, c *Controller, networkName string) {
 	t.Helper()
 
 	deadline := time.Now().Add(shutdownWait)
 	for time.Now().Before(deadline) {
 		c.ntpMu.Lock()
-		inFlight := c.ntpInFlight[poolName]
+		_, inFlight := c.ntpInFlight[networkName]
 		c.ntpMu.Unlock()
 
 		if !inFlight {
@@ -63,7 +63,7 @@ func waitNTPIdle(t *testing.T, c *Controller, poolName string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	t.Fatalf("the ntp refresh of pool %s did not settle", poolName)
+	t.Fatalf("the ntp refresh of network %s did not settle", networkName)
 }
 
 // TestReloadWithAnNTPHostnameAppliesWithoutWaitingForTheResolver pins the
@@ -116,14 +116,12 @@ func TestReloadWithAnNTPHostnameAppliesWithoutWaitingForTheResolver(t *testing.T
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	oldLookup := ntpLookupIP
-	ntpLookupIP = parkedNTPLookup(entered, release)
-	// the seam is restored only after the spawned refresh settled: a still
-	// running lookup would read the global while a later test rewrites it
+	controller.ntpLookupIP = parkedNTPLookup(entered, release)
+	// the seam lives on this controller and the parked lookup is released
+	// before the test ends, so no resolution outlives the fixture
 	t.Cleanup(func() {
 		close(release)
-		waitNTPIdle(t, controller, "pool-gap")
-		ntpLookupIP = oldLookup
+		waitNTPIdle(t, controller, "net-gap")
 	})
 
 	started := time.Now()

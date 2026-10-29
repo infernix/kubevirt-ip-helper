@@ -1,7 +1,6 @@
 package ippool
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -309,35 +308,35 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while restting IPPool metrics for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// cache the pool with a status carrying the protected claims and the
-	// excluded addresses. the cached projection is the spec which was
-	// actually installed on the nic, the dhcp pool and the ipam subnet:
-	// the status write is built on a fresh api GET, so its response may
-	// carry a spec which was updated on the api after the informer
-	// delivered this object (for example while the application was still
-	// initializing and ignoring updates). caching that readback would
-	// swallow the update forever - the next resync compares the event
-	// against the newer cached projection and takes the NOCHANGE branch -
-	// so only the freshly rebuilt status of the response is adopted, on
-	// a deep copy of the input spec
+	// the installed projection enters the cache inside the publication
+	// section: the cached object is the served projection every reader
+	// (and the reload comparison) works from, so it must not be replaced
+	// between a refresh's validation and its commit.
+	//
+	// the cached projection is the spec which was actually installed on the
+	// nic, the dhcp pool and the ipam subnet: the status write is built on a
+	// fresh api GET, so its response may carry a spec which was updated on
+	// the api after the informer delivered this object (for example while the
+	// application was still initializing and ignoring updates). caching that
+	// readback would swallow the update forever - the next resync compares
+	// the event against the newer cached projection and takes the NOCHANGE
+	// branch - so only the freshly rebuilt status of the response is
+	// adopted, on a deep copy of the input spec
 	installed := pool.DeepCopy()
 	installed.Status = rPool.Status
-	if err = c.cache.Add(installed); err != nil {
+
+	if err = c.publishInstalledProjection(installed); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// record the live registration of this era: the pool NAME owns the
-	// networkname key it registered under, so a later update which does
-	// not carry that networkname anymore (a rename swallowed while the
-	// application was initializing, re-delivered by a resync with
-	// old==new) can still find and tear the old registration down instead
-	// of registering the pool a second time
-	if c.registeredPools == nil {
-		c.registeredPools = make(map[string]string)
-	}
-	c.registeredPools[pool.Name] = pool.Spec.NetworkName
-
 	log.Infof("(ippool.registerIPPool) [%s] new IPPool registered", pool.Name)
+
+	// the ntp refresh of the fresh registration is scheduled only here: the
+	// dhcp pool, the ntp fence and the cached projection are all installed,
+	// so the refresh has an incarnation to claim and a projection to resolve
+	// against. a refresh spawned any earlier (inside the dhcp publication)
+	// raced the cache write and had to discard its own resolution.
+	go c.refreshNTP(installed.DeepCopy())
 
 	return
 }
@@ -565,28 +564,87 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		go c.refreshNTP(newPool.DeepCopy())
 
 		return
-	} else if updateAction == IPPOOL_RELOAD {
-		log.Infof("(ippool.handleIPPoolObjectChange) IPPool configuration changes detected, updating the dhcppool")
-		if err := c.createOrUpdateDHCPPool(newPool); err != nil {
-			// a rejected reload must not enter the invalid configuration
-			// into the cache either: keep the previously cached pool
-			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %w",
-				newPool.Spec.NetworkName, err)
+	}
+
+	log.Infof("(ippool.handleIPPoolObjectChange) IPPool configuration changes detected, updating the dhcppool")
+
+	return c.publishReload(newPool)
+}
+
+// publishReload installs a reloadable pool update as one publication: the
+// dhcp replacement, the ntp fence of the new projection and the cached
+// projection leave the worker in one section, so a refresh commit can never
+// interleave between them. the pre-fix order published the dhcp pool and the
+// cache as two separate steps guarded by a cache comparison, which let an old
+// resolution pass its check before the reload and apply its addresses after
+// it - restoring option 42 the reload had explicitly dropped. the initial
+// refresh of the new projection is scheduled once the section is published,
+// mirroring the registration.
+func (c *Controller) publishReload(pool *kihv1.IPPool) error {
+	// the ntp projection (and its bounded cold-start resolution) is built
+	// outside the publication section: dns never holds it
+	projection := c.ntpProjectionForPublication(pool)
+
+	var (
+		installErr error
+		cacheErr   error
+	)
+
+	func() {
+		c.publishMu.Lock()
+		defer c.publishMu.Unlock()
+
+		// the reloaded projection replaces the cached pool in one atomic
+		// step: a delete-then-add sequence would expose a transient "pool
+		// missing" window to the concurrent readers of the shared cache, and
+		// a reader which acts on it (a cleanup which aborts, a binding which
+		// fails its restore) would diverge from the live registration. the
+		// replacement creates the entry when the pool is not cached yet, so
+		// the outcome is identical to the previous delete-if-cached plus add
+		// sequence
+		if installErr = c.publishDHCPPool(pool, projection); installErr != nil {
+			return
 		}
+
+		cacheErr = c.cache.Upsert(pool)
+	}()
+
+	if installErr != nil {
+		// a rejected reload must not enter the invalid configuration into
+		// the cache either: keep the previously cached pool
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %w",
+			pool.Spec.NetworkName, installErr)
+	}
+	if cacheErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) failed to replace pool %s in cache: %s", pool.Name, cacheErr.Error())
 	}
 
-	// the reloaded projection replaces the cached pool in one atomic step:
-	// a delete-then-add sequence would expose a transient "pool missing"
-	// window to the concurrent readers of the shared cache, and a reader
-	// which acts on it (a cleanup which aborts, a binding which fails its
-	// restore) would diverge from the live registration. the replacement
-	// creates the entry when the pool is not cached yet, so the outcome is
-	// identical to the previous delete-if-cached plus add sequence
-	if err := c.cache.Upsert(newPool); err != nil {
-		return fmt.Errorf("(ippool.handleIPPoolObjectChange) failed to replace pool %s in cache: %s", newPool.Name, err.Error())
+	go c.refreshNTP(pool.DeepCopy())
+
+	return nil
+}
+
+// publishInstalledProjection caches the installed projection of a
+// registration and records the live registration of this era, both inside the
+// publication section. the record maps the pool NAME to the networkname key it
+// registered under, so a later update which does not carry that networkname
+// anymore (a rename swallowed while the application was initializing,
+// re-delivered by a resync with old==new) can still find and tear the old
+// registration down instead of registering the pool a second time.
+func (c *Controller) publishInstalledProjection(installed *kihv1.IPPool) error {
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	if err := c.cache.Add(installed); err != nil {
+		return err
 	}
 
-	return
+	if c.registeredPools == nil {
+		c.registeredPools = make(map[string]string)
+	}
+	c.registeredPools[installed.Name] = installed.Spec.NetworkName
+
+	return nil
 }
 
 func (c *Controller) stopDHCPListener(pool *kihv1.IPPool) {
@@ -599,6 +657,15 @@ func (c *Controller) stopDHCPListener(pool *kihv1.IPPool) {
 
 func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	log.Debugf("(ippool.cleanupIPPoolObjects) [%s] starting cleanup of IPPool", pool.Name)
+
+	// the whole teardown is one publication section: the served state of the
+	// network (dhcp pool and leases, metrics, ntp bookkeeping, cached
+	// projection) leaves in one step relative to a refresh commit, so a
+	// resolution which was started for this registration can never write
+	// into the state of a successor - forgetNTP advances the fence, the
+	// generation the commit validates against
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
 
 	c.stopDHCPListener(pool)
 	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
@@ -619,7 +686,11 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	// which keeps the leases of the live vms and the same projection)
 	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
-	c.forgetNTP(pool.Name)
+	// the fence of the torn-down registration is advanced (and its claim,
+	// attempt clock and failure state dropped) before the cache entry
+	// leaves: every refresh which is still in flight for this registration
+	// is fenced from here on
+	c.forgetNTP(pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
 	// the pool name holds no live registration anymore (delete on the nil
 	// map of a never-registered pool is a no-op)
@@ -635,7 +706,23 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	return
 }
 
+// createOrUpdateDHCPPool installs the dhcp projection of a pool as one
+// publication: the ntp projection is built outside the publication section
+// (a cold-start resolution must never hold it) and the section itself only
+// stores the addresses, advances the ntp fence and publishes the gauges.
 func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
+	projection := c.ntpProjectionForPublication(pool)
+
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	return c.publishDHCPPool(pool, projection)
+}
+
+// publishDHCPPool is the dhcp part of one publication; the caller holds
+// publishMu. it replaces the pool entry of the network, installs the ntp
+// fence of the published projection and publishes the ntp gauges.
+func (c *Controller) publishDHCPPool(pool *kihv1.IPPool, projection ntpProjection) (err error) {
 	// validate the projection first: only an ipv4 subnet with a registrable
 	// range may replace the active dhcp pool, otherwise a rejected update
 	// must fail before the allocator is touched at all
@@ -650,19 +737,6 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
 	}
 	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
-
-	// the ntp projection is built from addresses only: literal entries are
-	// parsed here, and the live pool carries the addresses of the hostname
-	// entries it currently serves (the last-good cache). only a pool
-	// without any last-good address resolves its hostnames once, under a
-	// short cold-start budget - and even then the resolution is not a
-	// precondition of the registration: on timeout or failure the pool
-	// registers with whatever answered, and the resync-driven refresh
-	// fills option 42 in later without a restart. this keeps the reload of
-	// a network - with the dns change of the same object - independent of
-	// the resolver, which the pre-fix code ran synchronously and rejected
-	// the whole reload for.
-	ntpAddresses, ntpFailures := c.ntpAddressesForRegistration(pool)
 
 	// register the new subnet in dhcp (F07): the pool entry is replaced in
 	// one atomic step, so the live pool of the network keeps answering
@@ -685,7 +759,7 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.DNS,
 		pool.Spec.IPv4Config.DomainName,
 		pool.Spec.IPv4Config.DomainSearch,
-		ntpAddresses,
+		projection.addresses,
 		pool.Spec.IPv4Config.LeaseTime,
 		pool.Spec.BindInterface,
 	); err != nil {
@@ -693,39 +767,15 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 			pool.Spec.NetworkName, err)
 	}
 
-	c.noteNTP(pool, ntpAddresses, ntpFailures)
-	// the refresh is a short-lived guarded goroutine: it re-resolves the
-	// hostname entries against a (possibly) recovered resolver and updates
-	// option 42 of the pool in place. the pool copy keeps the goroutine
-	// out of the informer object the workers may keep using.
-	go c.refreshNTP(pool.DeepCopy())
+	// the served state is now the published projection: the fence is
+	// advanced first, so any refresh which captured the previous incarnation
+	// (and every refresh which is still in flight for it) is fenced from
+	// here on, and the gauges are published for the projection which is now
+	// installed
+	c.advanceNTPFence(pool)
+	c.noteNTP(pool, projection.addresses, projection.failures, projection.attempted)
 
 	return
-}
-
-// ntpAddressesForRegistration builds the ntp addresses of a registration
-// from the address sources which never depend on the resolver: the literal
-// entries of the spec and the addresses the live pool currently serves for
-// the same hostname entries. only when neither yields an address does the
-// registration wait for one cold-start resolution under its budget.
-func (c *Controller) ntpAddressesForRegistration(pool *kihv1.IPPool) (addresses []net.IP, failures map[string]error) {
-	entries := pool.Spec.IPv4Config.NTP
-	if !hasNTPHostname(entries) {
-		return literalNTPAddresses(entries), nil
-	}
-
-	lastGood, _ := c.dhcp.PoolNTP(pool.Spec.NetworkName)
-	if len(lastGood) > 0 {
-		// the literals are served from the spec, the hostname entries from
-		// the last-good set; dedupe keeps a literal which the last-good set
-		// already contains from being served twice
-		return dedupeNTP(append(literalNTPAddresses(entries), lastGood...)), nil
-	}
-
-	resolveCtx, cancel := context.WithTimeout(c.ctx, ntpColdStartBudget)
-	defer cancel()
-
-	return resolveNTP(resolveCtx, entries)
 }
 
 // validatePoolProjection verifies the address fields of the pool spec
