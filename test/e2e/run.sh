@@ -4138,7 +4138,7 @@ ntp_gauges_absent_or_zero() {
 
 ntp_spec_ntp() {
   kubectl get ippool "${KIH_IPPOOL_NAME}" -o json |
-    jq -ce '.spec.ipv4config.ntp // null'
+    jq -c '.spec.ipv4config.ntp // null'
 }
 
 ntp_spec_has_no_ntp() {
