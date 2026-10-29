@@ -4630,9 +4630,31 @@ EOF
   SCENARIO_DEADLINE=0
 }
 
+# image_content_matches reports whether a node's loaded image is the image the
+# runtime built: <built-image-inspect-json> <loaded-crictl-inspecti-json>.
+# the runtime and the node's containerd do not always identify the same image
+# with the same digest (docker's config digest vs the node's target digest, and
+# the two representations differ between docker's image stores), so compare the
+# digest first and the content - the rootfs diff ids and the non-zero image
+# config - when they disagree. the content is what "the exact built image" means.
+image_content_matches() {
+  local record="$1" loaded="$2" built_id loaded_id built_layers loaded_layers
+  local built_config loaded_config normalized
+  built_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")' <<< "${record}")" || return 1
+  loaded_id="$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" || return 1
+  [ "${loaded_id}" != "${built_id}" ] || return 0
+  built_layers="$(jq -Ser '.[0].RootFS.Layers | sort' <<< "${record}")" || return 1
+  loaded_layers="$(jq -Ser '.info.imageSpec.rootfs.diff_ids | sort' <<< "${loaded}")" || return 1
+  [ "${built_layers}" = "${loaded_layers}" ] || return 1
+  normalized='walk(if type == "object" then with_entries(select(.value != null and .value != false and .value != "" and .value != {} and .value != [])) else . end)'
+  built_config="$(jq -Ser ".[0].Config | ${normalized}" <<< "${record}")" || return 1
+  loaded_config="$(jq -Ser ".info.imageSpec.config | ${normalized}" <<< "${loaded}")" || return 1
+  [ "${built_config}" = "${loaded_config}" ]
+}
+
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
-  local image_id webhook_image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
+  local image_id webhook_image_id repository image_record webhook_image_record nodes node loaded before_deployment install_mode reload_before cutoff
   local -a kind_nodes=()
   # versions.env composes E2E_ARTIFACTS_DIR as ${root}/runs/${E2E_RUN_ID},
   # and report/evidence derive the artifact root by stripping that exact
@@ -4664,15 +4686,15 @@ main() {
   report_case_pass "image ${E2E_IMAGE} present in ${RUNTIME}"
   report_case_start CORE-WEBHOOK-IMAGE-BUILT "singleton admission image built from repository root"
   "${RUNTIME}" build -f "${ROOT_DIR}/build/Dockerfile.webhook" -t "${E2E_WEBHOOK_IMAGE}" "${ROOT_DIR}"
-  image_record="$("${RUNTIME}" image inspect "${E2E_WEBHOOK_IMAGE}")"
+  webhook_image_record="$("${RUNTIME}" image inspect "${E2E_WEBHOOK_IMAGE}")"
   webhook_image_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")
-    | select(test("^[0-9a-f]{64}$"))' <<< "${image_record}")"
+    | select(test("^[0-9a-f]{64}$"))' <<< "${webhook_image_record}")"
   repository="${E2E_WEBHOOK_IMAGE%@*}"
   case "${repository##*/}" in *:*) repository="${repository%:*}" ;; esac
   "${RUNTIME}" tag "${E2E_WEBHOOK_IMAGE}" "${repository}:e2e-${webhook_image_id}"
   E2E_WEBHOOK_IMAGE="${repository}:e2e-${webhook_image_id}"
   export E2E_WEBHOOK_IMAGE
-  printf '%s\n' "${image_record}" > "${E2E_ARTIFACTS_DIR}/built-webhook-image.json"
+  printf '%s\n' "${webhook_image_record}" > "${E2E_ARTIFACTS_DIR}/built-webhook-image.json"
   report_case_pass "webhook image ${E2E_WEBHOOK_IMAGE} present in ${RUNTIME}"
   report_case_start CORE-BOOTSTRAP \
     "disposable cluster bootstrapped with bridge CNI, Multus and KubeVirt"
@@ -4692,11 +4714,11 @@ main() {
   for node in "${kind_nodes[@]}"; do
     loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_IMAGE}")"
     assert_case "CORE-IMAGE-${node}" "node ${node} loaded the exact built image content" \
-      test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${image_id}"
+      image_content_matches "${image_record}" "${loaded}"
     printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-image-${node}.json"
     loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_WEBHOOK_IMAGE}")"
     assert_case "CORE-WEBHOOK-IMAGE-${node}" "node ${node} loaded exact webhook image content" \
-      test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${webhook_image_id}"
+      image_content_matches "${webhook_image_record}" "${loaded}"
     printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-webhook-image-${node}.json"
   done
   report_case_start CORE-BOOTSTRAP-JOURNAL \
