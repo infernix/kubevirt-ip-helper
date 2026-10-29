@@ -4643,8 +4643,8 @@ image_content_matches() {
   built_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")' <<< "${record}")" || return 1
   loaded_id="$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" || return 1
   [ "${loaded_id}" != "${built_id}" ] || return 0
-  built_layers="$(jq -Ser '.[0].RootFS.Layers | sort' <<< "${record}")" || return 1
-  loaded_layers="$(jq -Ser '.info.imageSpec.rootfs.diff_ids | sort' <<< "${loaded}")" || return 1
+  built_layers="$(jq -Ser '.[0].RootFS.Layers' <<< "${record}")" || return 1
+  loaded_layers="$(jq -Ser '.info.imageSpec.rootfs.diff_ids' <<< "${loaded}")" || return 1
   [ "${built_layers}" = "${loaded_layers}" ] || return 1
   normalized='walk(if type == "object" then with_entries(select(.value != null and .value != false and .value != "" and .value != {} and .value != [])) else . end)'
   built_config="$(jq -Ser ".[0].Config | ${normalized}" <<< "${record}")" || return 1
