@@ -74,6 +74,15 @@ type Controller struct {
 	// resync with old==new) can find the live registration it must tear
 	// down instead of registering the pool a second time
 	registeredPools map[string]string
+	// ntpMu guards the resolution bookkeeping of the ntp refresh: a pool
+	// resolves at most one refresh at a time (ntpInFlight) and is
+	// re-attempted at most once per ntpRefreshInterval (ntpLastAttempt).
+	// the resync of the object is the only cadence - there is no ticker
+	// and no long-lived resolution goroutine, so the maps are the entire
+	// lifecycle state of a refresh.
+	ntpMu          sync.Mutex
+	ntpInFlight    map[string]bool
+	ntpLastAttempt map[string]time.Time
 }
 
 func NewController(
@@ -91,18 +100,20 @@ func NewController(
 	verifyVM func(namespace string, name string) (bool, error),
 ) *Controller {
 	return &Controller{
-		informer:     informer,
-		indexer:      indexer,
-		queue:        queue,
-		ctx:          ctx,
-		cache:        cache,
-		ipam:         ipam,
-		dhcp:         dhcp,
-		metrics:      metrics,
-		kihClientset: kihClientset,
-		appStatus:    appStatus,
-		gate:         startupGate,
-		verifyVM:     verifyVM,
+		informer:       informer,
+		indexer:        indexer,
+		queue:          queue,
+		ctx:            ctx,
+		cache:          cache,
+		ipam:           ipam,
+		dhcp:           dhcp,
+		metrics:        metrics,
+		kihClientset:   kihClientset,
+		appStatus:      appStatus,
+		gate:           startupGate,
+		verifyVM:       verifyVM,
+		ntpInFlight:    make(map[string]bool),
+		ntpLastAttempt: make(map[string]time.Time),
 	}
 }
 

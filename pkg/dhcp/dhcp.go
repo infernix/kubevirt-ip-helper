@@ -105,11 +105,6 @@ type DHCPAllocator struct {
 	lastUnknownHWAddr  time.Time
 	unknownHWAddrCount uint64
 	mutex              sync.Mutex
-
-	// resolver resolves ntp hostname entries during pool registrations;
-	// a nil resolver uses net.DefaultResolver. the field lets tests
-	// observe and shortcut resolution without swapping the global.
-	resolver *net.Resolver
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
@@ -128,66 +123,6 @@ func NewDHCPAllocator() *DHCPAllocator {
 	}
 }
 
-// SetResolver overrides the resolver used for the ntp hostname resolution
-// of pool registrations: the nil default is net.DefaultResolver. the
-// override exists so cross-package tests can park a replacement inside
-// its resolution without swapping the global resolver (the F07 reload
-// regressions observe the serving state while a replacement resolves).
-func (a *DHCPAllocator) SetResolver(r *net.Resolver) {
-	a.resolver = r
-}
-
-// ntpResolutionBudget bounds the aggregate ntp resolution of one pool
-// registration (F08): the lookups of every hostname entry share it, so a
-// resolver which blackholes cannot hold the single ippool worker - and
-// with it the era join of a shutdown - forever. it is a variable so the
-// test can shrink it.
-var ntpResolutionBudget = 30 * time.Second
-
-// resolveNTPServers normalizes the ntp server entries into ip addresses,
-// resolving hostname entries through the resolver of the allocator under
-// the caller's context. AddPool runs it before taking the allocator lock:
-// the dhcp packet handler reads the pools and leases under the same
-// mutex, so a slow or broken resolver during one pool registration must
-// not stall packet processing on every pool. entries which cannot be
-// resolved are logged and skipped, so a pool with a broken ntp hostname
-// still registers - but a canceled context (the era ended, or the
-// aggregate budget fired) aborts the registration instead: cancellation
-// is not a resolution failure whose partial result may be published.
-func (a *DHCPAllocator) resolveNTPServers(ctx context.Context, NTPServers []string) (ntp []net.IP, err error) {
-	resolver := a.resolver
-	if resolver == nil {
-		resolver = net.DefaultResolver
-	}
-
-	for _, entry := range NTPServers {
-		hostip := net.ParseIP(entry)
-		if hostip.To4() != nil {
-			ntp = append(ntp, hostip)
-
-			continue
-		}
-
-		hostips, lookupErr := resolver.LookupIP(ctx, "ip", entry)
-		if lookupErr != nil {
-			if ctx.Err() != nil {
-				// the era was canceled or the aggregate budget fired:
-				// the lookup did not fail on its own, it was abandoned
-				return ntp, ctx.Err()
-			}
-
-			log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", entry, lookupErr)
-		}
-		for _, ip := range hostips {
-			if ip.To4() != nil {
-				ntp = append(ntp, ip)
-			}
-		}
-	}
-
-	return
-}
-
 func (a *DHCPAllocator) AddPool(
 	ctx context.Context,
 	name string,
@@ -197,7 +132,7 @@ func (a *DHCPAllocator) AddPool(
 	DNSServers []string,
 	domainName string,
 	domainSearch []string,
-	NTPServers []string,
+	NTP []net.IP,
 	leaseTime int,
 	nic string,
 ) (err error) {
@@ -241,20 +176,15 @@ func (a *DHCPAllocator) AddPool(
 		}
 	}
 
-	// resolve the ntp hostnames before taking the lock, the packet
-	// handler must not wait behind a slow resolver. the resolution runs
-	// under the caller's context with one aggregate budget for every
-	// entry (F08): a canceled era or an exhausted budget aborts the
-	// registration before any state is taken, so a dying era never
-	// publishes partial replacement data and a blackholing resolver
-	// cannot hold the ippool worker and the era join unbounded
-	resolveCtx, resolveCancel := context.WithTimeout(ctx, ntpResolutionBudget)
-	ntp, resolveErr := a.resolveNTPServers(resolveCtx, NTPServers)
-	resolveCancel()
-	if resolveErr != nil {
-		return fmt.Errorf("(dhcp.AddPool) the ntp resolution of pool %s did not complete: %w", name, resolveErr)
-	}
-
+	// the ntp entries arrive as addresses: the resolution of configured
+	// hostnames belongs to the ippool controller (pkg/controller/ippool),
+	// which keeps the live pool as its last-good cache and refreshes it on
+	// the informer resync. registration therefore never waits for dns -
+	// the pool always serves the best-known set, and a resolver which
+	// blackholes cannot hold the ippool worker or the era join. only the
+	// atomic replace-under-lock below remains, so a replacement is visible
+	// to the packet handler in one step and never exposes a pool-absent
+	// window.
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -267,7 +197,11 @@ func (a *DHCPAllocator) AddPool(
 	}
 	pool.DomainName = domainName
 	pool.DomainSearch = domainSearch
-	pool.NTP = ntp
+	// copy the ntp addresses: the caller (and its cached pool) must not be
+	// able to rewrite the served option 42 through the slice it passed in
+	if len(NTP) > 0 {
+		pool.NTP = append([]net.IP(nil), NTP...)
+	}
 	pool.LeaseTime = leaseTime
 	pool.Nic = nic
 
@@ -332,6 +266,46 @@ func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
 	defer a.mutex.Unlock()
 
 	return a.pools[name]
+}
+
+// SetPoolNTP replaces the served ntp addresses (option 42) of a registered
+// pool in one atomic step and reports whether the pool exists. the live
+// pool is the last-good cache of the ntp resolution: the ippool controller
+// refreshes the addresses after a successful lookup, while a failed lookup
+// simply leaves the previously served set in place. a slice copy keeps the
+// caller's buffer out of the served state.
+func (a *DHCPAllocator) SetPoolNTP(name string, ntp []net.IP) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	pool, exists := a.pools[name]
+	if !exists {
+		return false
+	}
+
+	if len(ntp) == 0 {
+		pool.NTP = nil
+	} else {
+		pool.NTP = append([]net.IP(nil), ntp...)
+	}
+	a.pools[name] = pool
+
+	return true
+}
+
+// PoolNTP returns a copy of the ntp addresses a registered pool currently
+// serves and reports whether the pool exists. the copy keeps a caller from
+// mutating the served option 42 through the returned slice.
+func (a *DHCPAllocator) PoolNTP(name string) ([]net.IP, bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	pool, exists := a.pools[name]
+	if !exists {
+		return nil, false
+	}
+
+	return append([]net.IP(nil), pool.NTP...), true
 }
 
 func (a *DHCPAllocator) DeletePool(name string) (err error) {

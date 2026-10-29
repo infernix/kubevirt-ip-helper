@@ -1,104 +1,99 @@
 package dhcp
 
-// F08 regression tests: the ntp resolution of a pool registration must be
-// bounded and cancelable. the resolution used to run on
-// context.Background(), so a blackholing resolver held the single ippool
-// worker - and with it the era join of a shutdown - forever, and a
-// canceled era still published whatever the resolution had produced so
-// far. the registration now runs under the caller's context with one
-// aggregate budget: cancellation and budget exhaustion abort it before
-// any state is taken, so nothing partial is published and the hang is
-// bounded.
+// F08 regression tests at the new boundary: a pool registration must not
+// depend on dns at all. the allocator used to resolve the ntp hostnames of
+// a registration under one aggregate budget, so a blackholing resolver
+// rejected the whole reload of a network - and with it the dns change of
+// the same object - or stalled the startup gate of a new pool. AddPool now
+// takes addresses from the caller (the ippool controller resolves and
+// refreshes them), so the registration is pure state: it never waits for a
+// resolver, and a canceled era still aborts before any state is taken.
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
-	"sync"
 	"testing"
 	"time"
 )
 
-// parkingResolver returns a resolver whose dial parks until its context
-// is done or the release channel closes, mirroring a resolver which
-// honors cancellation. entered closes once a lookup started.
-func parkingResolver(entered chan struct{}, release chan struct{}) *net.Resolver {
-	var once sync.Once
+// TestAddPoolRegistrationNeverWaitsForNTP pins the F08 boundary: the
+// registration of a pool with a full ntp projection returns immediately,
+// because the addresses arrive with the call and no lookup runs inside it.
+// the pre-fix code resolved the entries synchronously here and a parked
+// resolver either held the call for its whole budget (and then rejected it)
+// or lost the entries silently.
+func TestAddPoolRegistrationNeverWaitsForNTP(t *testing.T) {
+	a := NewDHCPAllocator()
 
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			once.Do(func() { close(entered) })
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-release:
-				return nil, errors.New("the parked resolver was released without a connection")
-			}
-		},
+	ntp := make([]net.IP, 0, 200)
+	for i := range 200 {
+		ntp = append(ntp, net.ParseIP(fmt.Sprintf("10.0.1.%d", i%250)))
+	}
+
+	started := time.Now()
+	if err := a.AddPool(
+		context.Background(),
+		"net-immediate",
+		"192.168.0.1",
+		"255.255.255.0",
+		"192.168.0.254",
+		nil,
+		"",
+		nil,
+		ntp,
+		60,
+		"eth0",
+	); err != nil {
+		t.Fatalf("AddPool: %v", err)
+	}
+	elapsed := time.Since(started)
+
+	if elapsed > time.Second {
+		t.Errorf("the registration took %s, want it independent of any (dns) budget", elapsed)
+	}
+	if !a.CheckPool("net-immediate") {
+		t.Fatal("the registration did not publish the pool")
+	}
+	served, exists := a.PoolNTP("net-immediate")
+	if !exists || len(served) != len(ntp) {
+		t.Fatalf("served ntp = %d entries (exists=%v), want the %d registered addresses", len(served), exists, len(ntp))
+	}
+	for i := range ntp {
+		if !served[i].Equal(ntp[i]) {
+			t.Fatalf("served ntp[%d] = %v, want %v (the configured order)", i, served[i], ntp[i])
+		}
 	}
 }
 
-// boundedAddPoolResult waits for the AddPool result with a hard test
-// deadline, so a registration which ignores its cancellation or budget
-// fails the test instead of hanging the suite.
-func boundedAddPoolResult(t *testing.T, done <-chan error) error {
-	t.Helper()
-
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(5 * time.Second):
-		t.Fatal("AddPool did not return although its context was canceled or its budget exhausted")
-
-		return nil
-	}
-}
-
-// TestAddPoolAbortsTheResolutionWhenTheEraIsCanceled pins the F08
-// cancellation semantics: the registration runs under the caller's
-// context, so canceling it aborts the resolution and publishes nothing -
-// not even the entries which already resolved.
-func TestAddPoolAbortsTheResolutionWhenTheEraIsCanceled(t *testing.T) {
+// TestAddPoolAbortsTheRegistrationWhenTheEraIsCanceled pins the preserved
+// cancellation semantics: a registration which runs on a canceled context
+// publishes nothing - not a pool, not a replacement - because the era it
+// would serve is already gone.
+func TestAddPoolAbortsTheRegistrationWhenTheEraIsCanceled(t *testing.T) {
 	t.Run("a canceled registration publishes no pool", func(t *testing.T) {
 		a := NewDHCPAllocator()
-		entered := make(chan struct{})
-		release := make(chan struct{})
-		a.SetResolver(parkingResolver(entered, release))
 
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() {
-			done <- a.AddPool(ctx, "net-cancel", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"cancel-ntp.invalid"}, 60, "eth0")
-		}()
-		<-entered
 		cancel()
 
-		err := boundedAddPoolResult(t, done)
+		err := a.AddPool(ctx, "net-cancel", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []net.IP{net.ParseIP("10.0.0.53")}, 60, "eth0")
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("AddPool on a canceled era = %v, want the propagated context.Canceled", err)
 		}
 		if a.CheckPool("net-cancel") {
 			t.Error("the canceled registration published a pool, want no state taken")
 		}
-		close(release)
 	})
 
 	t.Run("a canceled replacement keeps the serving pool", func(t *testing.T) {
 		a := newTestPooledAllocator(t)
-		entered := make(chan struct{})
-		release := make(chan struct{})
-		a.SetResolver(parkingResolver(entered, release))
 
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() {
-			done <- a.AddPool(ctx, "pool1", "192.168.0.1", "255.255.255.0", "192.168.0.254", []string{"1.1.1.1", "8.8.8.8"}, "example.com", []string{"example.com"}, []string{"replacement-ntp.invalid"}, 120, "eth0")
-		}()
-		<-entered
 		cancel()
 
-		err := boundedAddPoolResult(t, done)
+		err := a.AddPool(ctx, "pool1", "192.168.0.1", "255.255.255.0", "192.168.0.254", []string{"1.1.1.1", "8.8.8.8"}, "example.com", []string{"example.com"}, []net.IP{net.ParseIP("10.0.0.54")}, 120, "eth0")
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("AddPool on a canceled era = %v, want the propagated context.Canceled", err)
 		}
@@ -108,39 +103,9 @@ func TestAddPoolAbortsTheResolutionWhenTheEraIsCanceled(t *testing.T) {
 		if pool.LeaseTime != 3600 {
 			t.Errorf("serving lease time = %d after the canceled replacement, want the old 3600", pool.LeaseTime)
 		}
-		close(release)
+		served, _ := a.PoolNTP("pool1")
+		if len(served) != 1 || !served[0].Equal(net.ParseIP("10.0.0.53")) {
+			t.Errorf("serving ntp = %v after the canceled replacement, want the old [10.0.0.53]", served)
+		}
 	})
-}
-
-// TestAddPoolResolutionBudgetBoundsTheHang pins the F08 aggregate budget:
-// even against a resolver which never answers, the registration returns
-// within the budget and publishes nothing.
-func TestAddPoolResolutionBudgetBoundsTheHang(t *testing.T) {
-	oldBudget := ntpResolutionBudget
-	ntpResolutionBudget = 100 * time.Millisecond
-	t.Cleanup(func() { ntpResolutionBudget = oldBudget })
-
-	a := NewDHCPAllocator()
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	a.SetResolver(parkingResolver(entered, release))
-
-	started := time.Now()
-	done := make(chan error, 1)
-	go func() {
-		done <- a.AddPool(context.Background(), "net-budget", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"hanging-ntp.invalid"}, 60, "eth0")
-	}()
-	<-entered
-
-	err := boundedAddPoolResult(t, done)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("AddPool against a parked resolver = %v, want the budget's DeadlineExceeded", err)
-	}
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
-		t.Errorf("the resolution returned after %s, want it bounded near the budget", elapsed)
-	}
-	if a.CheckPool("net-budget") {
-		t.Error("the budget-exhausted registration published a pool, want no state taken")
-	}
-	close(release)
 }

@@ -20,6 +20,7 @@ package ippool
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	kihdhcp "github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -61,7 +62,7 @@ func occupiedInterfaceSeedPool(t *testing.T, d *kihdhcp.DHCPAllocator, networkNa
 		[]string{"10.10.10.2", "10.10.10.3"},
 		"example.local",
 		[]string{"example.local"},
-		[]string{"10.10.10.4"},
+		[]net.IP{net.ParseIP("10.10.10.4")},
 		3600,
 		nic,
 	); err != nil {

@@ -10,9 +10,7 @@ package dhcp
 
 import (
 	"context"
-	"errors"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -41,71 +39,125 @@ func requestForLease(t *testing.T, a *DHCPAllocator) *dhcpv4.DHCPv4 {
 	return resp
 }
 
-// TestReplacementKeepsServingWhileTheNTPResolutionBlocks is the review's
-// F07 acceptance at the packet level: a valid DHCPREQUEST which arrives
-// while the replacement is still resolving must be ACKed with the old
-// options, and the same request must be ACKed with the new options once
-// the replacement is published.
-func TestReplacementKeepsServingWhileTheNTPResolutionBlocks(t *testing.T) {
+// TestReplacementIsAtomicForConcurrentRequests pins the preserved F07
+// property at the packet level: a replacement swaps the pool entry in one
+// step under the allocator lock, so a request which races the replacement
+// is always answered from a complete configuration - the old options or
+// the new ones, never a pool-absent nack and never a mix of both. the
+// pre-fix code could park a replacement inside its ntp resolution; that
+// window is gone with the resolution, and this test keeps the remaining
+// lock property honest.
+func TestReplacementIsAtomicForConcurrentRequests(t *testing.T) {
 	a := newTestPooledAllocator(t)
 
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	a.resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			once.Do(func() { close(entered) })
-			<-release
+	oldNTP := net.ParseIP("10.0.0.53")
+	newNTP := net.ParseIP("10.0.0.54")
 
-			return nil, errors.New("the blocked resolver was released without a connection")
-		},
-	}
-
-	// the replacement of pool1: same addresses, a hostname ntp entry which
-	// parks in the blocked resolution, and a new lease time
 	done := make(chan error, 1)
 	go func() {
-		done <- a.AddPool(
-			context.Background(),
-			"pool1",
-			"192.168.0.1",
-			"255.255.255.0",
-			"192.168.0.254",
-			[]string{"1.1.1.1", "8.8.8.8"},
-			"example.com",
-			[]string{"example.com"},
-			[]string{"replacement-ntp.invalid"},
-			120,
-			"eth0",
-		)
+		defer close(done)
+		for range 200 {
+			if err := a.AddPool(
+				context.Background(),
+				"pool1",
+				"192.168.0.1",
+				"255.255.255.0",
+				"192.168.0.254",
+				[]string{"1.1.1.1", "8.8.8.8"},
+				"example.com",
+				[]string{"example.com"},
+				[]net.IP{newNTP},
+				120,
+				"eth0",
+			); err != nil {
+				done <- err
+
+				return
+			}
+		}
 	}()
-	<-entered
 
-	// a valid renewal arrives while the replacement is still resolving:
-	// it must be acked with the old options, not nacked against a
-	// pool-absent registry
-	resp := requestForLease(t, a)
-	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
-		t.Fatalf("message type = %v while the replacement resolves, want Ack", mt)
-	}
-	if got := resp.IPAddressLeaseTime(0); got != 3600*time.Second {
-		t.Errorf("lease time = %v while the replacement resolves, want the old 3600s", got)
+	for range 200 {
+		resp := requestForLease(t, a)
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+			t.Fatalf("message type = %v while the replacement runs, want Ack", mt)
+		}
+
+		switch got := resp.IPAddressLeaseTime(0); got {
+		case 3600 * time.Second:
+			if ntp := resp.NTPServers(); len(ntp) != 1 || !ntp[0].Equal(oldNTP) {
+				t.Fatalf("ntp = %v with the old lease time, want [%v]", ntp, oldNTP)
+			}
+		case 120 * time.Second:
+			if ntp := resp.NTPServers(); len(ntp) != 1 || !ntp[0].Equal(newNTP) {
+				t.Fatalf("ntp = %v with the new lease time, want [%v]", ntp, newNTP)
+			}
+		default:
+			t.Fatalf("lease time = %v during the replacement, want the old 3600s or the new 120s", got)
+		}
 	}
 
-	close(release)
 	if err := <-done; err != nil {
-		t.Fatalf("the blocked replacement did not converge: %v", err)
+		t.Fatalf("the replacement did not converge: %v", err)
 	}
 
-	// the replacement is published: the same request is acked with the
-	// new options
-	resp = requestForLease(t, a)
+	// the last replacement is published: the same request is acked with
+	// the new options
+	resp := requestForLease(t, a)
 	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
 		t.Fatalf("message type = %v after the replacement was published, want Ack", mt)
 	}
 	if got := resp.IPAddressLeaseTime(0); got != 120*time.Second {
 		t.Errorf("lease time = %v after the replacement was published, want the new 120s", got)
+	}
+}
+
+// TestSetPoolNTPUpdatesOption42 pins the ntp refresh seam of the allocator:
+// replacing the addresses of a live pool is visible in the very next reply,
+// and the call is a no-op for an absent pool. the served state is copied
+// both ways, so neither the caller nor a reader can reach into it.
+func TestSetPoolNTPUpdatesOption42(t *testing.T) {
+	a := newTestPooledAllocator(t)
+
+	updated := []net.IP{net.ParseIP("10.0.0.54"), net.ParseIP("10.0.0.55")}
+	if !a.SetPoolNTP("pool1", updated) {
+		t.Fatal("SetPoolNTP reported the registered pool absent")
+	}
+
+	resp := requestForLease(t, a)
+	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+		t.Fatalf("message type = %v, want Ack", mt)
+	}
+	if got := resp.NTPServers(); len(got) != 2 || !got[0].Equal(updated[0]) || !got[1].Equal(updated[1]) {
+		t.Fatalf("ntp = %v after SetPoolNTP, want %v", got, updated)
+	}
+
+	// the served addresses are a copy: mutating the caller's buffer must
+	// not rewrite option 42
+	updated[0] = net.ParseIP("10.9.9.9")
+	if got, _ := a.PoolNTP("pool1"); !got[0].Equal(net.ParseIP("10.0.0.54")) {
+		t.Errorf("ntp = %v after the caller mutated its buffer, want the served 10.0.0.54", got)
+	}
+
+	// the reader gets a copy as well
+	read, exists := a.PoolNTP("pool1")
+	if !exists {
+		t.Fatal("PoolNTP reported the registered pool absent")
+	}
+	read[0] = net.ParseIP("10.9.9.9")
+	if got, _ := a.PoolNTP("pool1"); !got[0].Equal(net.ParseIP("10.0.0.54")) {
+		t.Errorf("ntp = %v after the reader mutated its copy, want the served 10.0.0.54", got)
+	}
+
+	// an absent pool is a no-op: no entry may be created by a late refresh
+	if a.SetPoolNTP("pool-gone", []net.IP{net.ParseIP("10.0.0.56")}) {
+		t.Error("SetPoolNTP reported an absent pool as present")
+	}
+	if a.CheckPool("pool-gone") {
+		t.Error("SetPoolNTP registered a pool which does not exist")
+	}
+	if got, exists := a.PoolNTP("pool-gone"); exists || len(got) != 0 {
+		t.Errorf("PoolNTP of an absent pool = %v (exists=%v), want nothing", got, exists)
 	}
 }
 
@@ -127,7 +179,7 @@ func TestRejectedReplacementKeepsTheOldPoolServing(t *testing.T) {
 		[]string{"dns.example.invalid"},
 		"example.com",
 		[]string{"example.com"},
-		[]string{"10.0.0.53"},
+		[]net.IP{net.ParseIP("10.0.0.53")},
 		120,
 		"eth0",
 	); err == nil {

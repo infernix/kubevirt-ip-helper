@@ -1,6 +1,7 @@
 package ippool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -554,7 +555,15 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 	}
 
 	if updateAction == IPPOOL_NOCHANGE {
-		// no pool options are changed, so the pool cache doesn't have to be updated
+		// no pool options are changed, so the pool cache doesn't have to be
+		// updated. the resync of an unchanged object is the ntp refresh
+		// cadence of the pool: a hostname whose dns answer was unavailable
+		// at registration (or moved since) is re-resolved here without a
+		// restart. the refresh is guarded and short-lived, so the worker
+		// does not wait for it, and a pool without hostname entries
+		// returns immediately.
+		go c.refreshNTP(newPool.DeepCopy())
+
 		return
 	} else if updateAction == IPPOOL_RELOAD {
 		log.Infof("(ippool.handleIPPoolObjectChange) IPPool configuration changes detected, updating the dhcppool")
@@ -610,6 +619,7 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	// which keeps the leases of the live vms and the same projection)
 	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
+	c.forgetNTP(pool.Name)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
 	// the pool name holds no live registration anymore (delete on the nil
 	// map of a never-registered pool is a no-op)
@@ -641,17 +651,24 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	}
 	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
 
-	// register the new subnet in dhcp (F07): AddPool resolves the ntp
-	// hostnames before it takes the allocator lock and then replaces the
-	// pool entry in one atomic step, so the live pool of the network keeps
-	// answering every request until the replacement is published - a
-	// delete-before-add here opened a pool-absent window (as long as the
-	// ntp resolution of the replacement takes) in which a valid renewal
-	// was nacked and the client needlessly lost its still-valid address.
-	// the resolution runs under the era context with one aggregate budget
-	// (F08): a canceled era or a blackholing resolver aborts the reload
-	// before any state is taken, so the worker never hangs on the era
-	// join and the live pool keeps serving
+	// the ntp projection is built from addresses only: literal entries are
+	// parsed here, and the live pool carries the addresses of the hostname
+	// entries it currently serves (the last-good cache). only a pool
+	// without any last-good address resolves its hostnames once, under a
+	// short cold-start budget - and even then the resolution is not a
+	// precondition of the registration: on timeout or failure the pool
+	// registers with whatever answered, and the resync-driven refresh
+	// fills option 42 in later without a restart. this keeps the reload of
+	// a network - with the dns change of the same object - independent of
+	// the resolver, which the pre-fix code ran synchronously and rejected
+	// the whole reload for.
+	ntpAddresses, ntpFailures := c.ntpAddressesForRegistration(pool)
+
+	// register the new subnet in dhcp (F07): the pool entry is replaced in
+	// one atomic step, so the live pool of the network keeps answering
+	// every request until the replacement is published - a delete-before-add
+	// here opened a pool-absent window in which a valid renewal was nacked
+	// and the client needlessly lost its still-valid address.
 	// the AddPool validation is the backstop of the up-front
 	// validatePoolProjection admission: a rejected replacement validates
 	// before any state is taken, so the previously registered pool keeps
@@ -668,7 +685,7 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.DNS,
 		pool.Spec.IPv4Config.DomainName,
 		pool.Spec.IPv4Config.DomainSearch,
-		pool.Spec.IPv4Config.NTP,
+		ntpAddresses,
 		pool.Spec.IPv4Config.LeaseTime,
 		pool.Spec.BindInterface,
 	); err != nil {
@@ -676,7 +693,39 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 			pool.Spec.NetworkName, err)
 	}
 
+	c.noteNTP(pool, ntpAddresses, ntpFailures)
+	// the refresh is a short-lived guarded goroutine: it re-resolves the
+	// hostname entries against a (possibly) recovered resolver and updates
+	// option 42 of the pool in place. the pool copy keeps the goroutine
+	// out of the informer object the workers may keep using.
+	go c.refreshNTP(pool.DeepCopy())
+
 	return
+}
+
+// ntpAddressesForRegistration builds the ntp addresses of a registration
+// from the address sources which never depend on the resolver: the literal
+// entries of the spec and the addresses the live pool currently serves for
+// the same hostname entries. only when neither yields an address does the
+// registration wait for one cold-start resolution under its budget.
+func (c *Controller) ntpAddressesForRegistration(pool *kihv1.IPPool) (addresses []net.IP, failures map[string]error) {
+	entries := pool.Spec.IPv4Config.NTP
+	if !hasNTPHostname(entries) {
+		return literalNTPAddresses(entries), nil
+	}
+
+	lastGood, _ := c.dhcp.PoolNTP(pool.Spec.NetworkName)
+	if len(lastGood) > 0 {
+		// the literals are served from the spec, the hostname entries from
+		// the last-good set; dedupe keeps a literal which the last-good set
+		// already contains from being served twice
+		return dedupeNTP(append(literalNTPAddresses(entries), lastGood...)), nil
+	}
+
+	resolveCtx, cancel := context.WithTimeout(c.ctx, ntpColdStartBudget)
+	defer cancel()
+
+	return resolveNTP(resolveCtx, entries)
 }
 
 // validatePoolProjection verifies the address fields of the pool spec

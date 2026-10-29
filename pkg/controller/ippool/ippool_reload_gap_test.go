@@ -5,9 +5,10 @@ package ippool
 // the reload used to delete the live dhcp pool before AddPool resolved the
 // replacement's ntp hostnames, so every request of that window found a
 // pool-absent registry and was nacked - a valid renewal needlessly lost
-// its still-valid address. the replacement must be built and published
-// atomically: the live pool keeps answering until the swap, and a
-// replacement which AddPool rejects leaves the serving state untouched.
+// its still-valid address. the replacement is now built from addresses the
+// registration already knows (the live pool is the last-good cache of the
+// hostname entries), so the swap is atomic and independent of the
+// resolver: neither a dns change nor a blackholed resolver delays it.
 
 import (
 	"context"
@@ -16,44 +17,76 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
-// blockingResolver returns a resolver whose dial parks until release is
-// closed and then fails the lookup: the reload under test blocks inside
-// the replacement's ntp resolution, which is exactly the window the
-// removed delete used to open. entered closes once the resolution started.
-func blockingResolver(entered chan struct{}, release chan struct{}) *net.Resolver {
+// parkedNTPLookup returns a lookup which parks until the context ends or
+// the release channel closes and always fails: it mirrors a resolver which
+// blackholes, so a reload which waited for it would be visibly slow instead
+// of quietly broken. entered (when non-nil) is closed by the first lookup,
+// so a test can wait for the background refresh to be inside the resolver.
+func parkedNTPLookup(entered chan struct{}, release chan struct{}) func(ctx context.Context, network string, host string) ([]net.IP, error) {
 	var once sync.Once
 
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network string, host string) ([]net.IP, error) {
+		if entered != nil {
 			once.Do(func() { close(entered) })
-			<-release
+		}
 
-			return nil, errors.New("the blocked resolver was released without a connection")
-		},
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+			return nil, errors.New("the parked lookup was released without an answer")
+		}
 	}
 }
 
-// TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves pins
-// the F07 serving continuity: while the replacement of a reloadable option
-// update is still resolving its ntp hostnames, the network's live pool
-// must remain registered with the old options. the pre-fix code deleted
-// the pool before the resolution, so the registry was pool-absent for the
-// whole resolution and a valid renewal of that window was nacked.
-func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testing.T) {
+// waitNTPIdle waits for the refresh goroutines of a pool to finish, so a
+// test can restore the lookup seam without racing a still running
+// resolution.
+func waitNTPIdle(t *testing.T, c *Controller, poolName string) {
+	t.Helper()
+
+	deadline := time.Now().Add(shutdownWait)
+	for time.Now().Before(deadline) {
+		c.ntpMu.Lock()
+		inFlight := c.ntpInFlight[poolName]
+		c.ntpMu.Unlock()
+
+		if !inFlight {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("the ntp refresh of pool %s did not settle", poolName)
+}
+
+// TestReloadWithAnNTPHostnameAppliesWithoutWaitingForTheResolver pins the
+// F07 serving continuity: a reloadable update which also changes the dns
+// and the ntp section of the object is published at once - the dns change
+// is applied, the network keeps its last-good ntp addresses, and the
+// replacement never parks in the resolver. the pre-fix code resolved the
+// new ntp hostname synchronously inside the reload and a blackholed
+// resolver rejected the whole reload after its 30s budget, leaving the dns
+// change unapplied.
+func TestReloadWithAnNTPHostnameAppliesWithoutWaitingForTheResolver(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
 
 	oldPool := testPool("pool-gap", "net-gap", 60)
-	oldPool.Spec.IPv4Config.NTP = []string{"192.168.1.1"}
+	oldPool.Spec.IPv4Config.NTP = []string{"ntp-good.invalid"}
+	oldPool.Spec.IPv4Config.DNS = []string{"1.1.1.1"}
 	newPool := testPool("pool-gap", "net-gap", 120)
-	// a hostname entry makes the replacement resolve before it is
-	// installed, and the blocked resolver parks the reload there
-	newPool.Spec.IPv4Config.NTP = []string{"gap-ntp.invalid"}
+	// the new ntp entry is a hostname and the resolver blackholes: the
+	// reload must still publish the dns change and keep the last-good
+	// ntp address of the live pool
+	newPool.Spec.IPv4Config.NTP = []string{"ntp-broken.invalid"}
+	newPool.Spec.IPv4Config.DNS = []string{"8.8.8.8"}
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(newPool); err != nil {
@@ -71,10 +104,10 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 		"192.168.1.1",
 		"255.255.255.0",
 		"192.168.1.1",
-		nil,
+		[]string{"1.1.1.1"},
 		"",
 		nil,
-		[]string{"192.168.1.1"},
+		[]net.IP{net.ParseIP("192.168.1.1")},
 		60,
 		"test-fake-iface",
 	); err != nil {
@@ -83,41 +116,53 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	controller.dhcp.SetResolver(blockingResolver(entered, release))
+	oldLookup := ntpLookupIP
+	ntpLookupIP = parkedNTPLookup(entered, release)
+	// the seam is restored only after the spawned refresh settled: a still
+	// running lookup would read the global while a later test rewrites it
+	t.Cleanup(func() {
+		close(release)
+		waitNTPIdle(t, controller, "pool-gap")
+		ntpLookupIP = oldLookup
+	})
 
-	done := make(chan error, 1)
-	go func() {
-		done <- controller.handleIPPoolObjectChange(*oldPool, newPool)
-	}()
-	<-entered
-
-	// the replacement is still resolving: the live pool must still be
-	// registered with the old options - the pre-fix code had already
-	// deleted it at this point, and every request of the window was
-	// nacked against the pool-absent registry
-	if !controller.dhcp.CheckPool("net-gap") {
-		t.Fatal("the reload unregistered the serving pool while the replacement resolves")
+	started := time.Now()
+	if err := controller.handleIPPoolObjectChange(*oldPool, newPool); err != nil {
+		t.Fatalf("the reload was rejected: %v", err)
 	}
-	if pool := controller.dhcp.GetPool("net-gap"); pool.LeaseTime != 60 {
-		t.Fatalf("serving lease time = %d while the replacement resolves, want the old 60", pool.LeaseTime)
-	}
-
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("the blocked reload did not converge: %v", err)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("the reload took %s, want it independent of the resolver", elapsed)
 	}
 
-	// the replacement is published now: the same network serves the new
-	// options and the cache carries the updated object
-	if pool := controller.dhcp.GetPool("net-gap"); pool.LeaseTime != 120 {
+	// the replacement is published: the dns change is applied and the
+	// network keeps serving the last-good ntp address until the refresh
+	// can resolve the new hostname
+	pool := controller.dhcp.GetPool("net-gap")
+	if pool.LeaseTime != 120 {
 		t.Errorf("serving lease time = %d after the reload, want the new 120", pool.LeaseTime)
 	}
+	if got := pool.DNS; len(got) != 1 || !got[0].Equal(net.ParseIP("8.8.8.8")) {
+		t.Errorf("serving dns = %v after the reload, want the new [8.8.8.8]", got)
+	}
+	if got := pool.NTP; len(got) != 1 || !got[0].Equal(net.ParseIP("192.168.1.1")) {
+		t.Errorf("serving ntp = %v after the reload, want the last-good [192.168.1.1]", got)
+	}
+
 	got, err := cacheAllocator.Get("pool", "net-gap")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
 	}
 	if leaseTime := got.(kihv1.IPPool).Spec.IPv4Config.LeaseTime; leaseTime != 120 {
 		t.Errorf("cache lease time = %d after the reload, want 120", leaseTime)
+	}
+
+	// the spawned refresh owns the new hostname: it must have reached the
+	// resolver, so the last-good addresses above are the ones it is about
+	// to replace (and not the outcome of a silent no-op)
+	select {
+	case <-entered:
+	case <-time.After(shutdownWait):
+		t.Fatal("the background ntp refresh did not attempt the new hostname")
 	}
 }
 

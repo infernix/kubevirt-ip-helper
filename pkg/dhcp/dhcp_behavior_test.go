@@ -79,7 +79,7 @@ func newTestPooledAllocator(t *testing.T) *DHCPAllocator {
 		[]string{"1.1.1.1", "8.8.8.8"},
 		"example.com",
 		[]string{"example.com"},
-		[]string{"10.0.0.53"},
+		[]net.IP{net.ParseIP("10.0.0.53")},
 		3600,
 		"eth0",
 	); err != nil {
@@ -991,13 +991,13 @@ func TestUsageWithMissingPoolDoesNotPanic(t *testing.T) {
 	}
 }
 
-// Hostname resolution in AddPool is intentionally not covered: without a
-// resolver seam the results depend on the host configuration (localhost may
-// map to several v4/v6 addresses, name lookups may delay or vary). Only
-// literal addresses are tested here.
+// AddPool takes ntp addresses, not names: every entry which reaches the
+// allocator is served as option 42 in order, and the hostname resolution
+// of the configured entries is the ippool controller's job. Only the
+// address projection is tested here.
 func TestAddPoolAcceptsLiteralNTPAddresses(t *testing.T) {
 	a := New()
-	if err := a.AddPool(context.Background(), "p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"10.0.0.53"}, 3600, "eth0"); err != nil {
+	if err := a.AddPool(context.Background(), "p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []net.IP{net.ParseIP("10.0.0.53")}, 3600, "eth0"); err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
 
@@ -1161,72 +1161,10 @@ func TestGetLeaseByIPAndNetworkIsNetworkScoped(t *testing.T) {
 	}
 }
 
-// ntp hostnames must be resolved outside the allocator lock: the dhcp
-// packet handler reads the pools and leases under the same mutex, so
-// resolving inside the lock lets one pool with a slow or broken ntp
-// hostname stall renewals on every other pool.
-func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
-	a := New()
-
-	// the resolver dials from concurrent goroutines (one per dns server),
-	// so the observations of the allocator lock must be collected under
-	// their own mutex: only the allocator lock itself is under test. the
-	// assertions read a snapshot taken under the same mutex - a dial which
-	// has not run yet appends into a set nobody is reading, which is fine:
-	// the assertion is that every observed resolution ran outside the
-	// allocator lock, not that the resolution was complete.
-	var observationsMutex sync.Mutex
-	var lockFreeDuringResolve []bool
-	a.resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			// the probe runs serialized with itself: two concurrent dial
-			// goroutines probing the allocator lock at the same time would
-			// contend on it and report a held lock which nobody holds
-			observationsMutex.Lock()
-
-			// the resolver runs on the AddPool goroutine: if the allocator
-			// lock is already held there, the resolution happens under it
-			free := a.mutex.TryLock()
-			if free {
-				a.mutex.Unlock()
-			}
-			lockFreeDuringResolve = append(lockFreeDuringResolve, free)
-
-			observationsMutex.Unlock()
-
-			// fail fast: an unresolvable hostname is logged and skipped, so
-			// the pool registers without ntp servers like before
-			return nil, errors.New("no dns server in tests")
-		},
-	}
-
-	if err := a.AddPool(context.Background(), "net-a", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, []string{"192.168.0.10", "ntp.example.invalid"}, 60, "lo"); err != nil {
-		t.Fatalf("AddPool: %v", err)
-	}
-
-	// every access to the observations is mutex-guarded: the assertions
-	// read a snapshot taken under the same lock the dials append under
-	observationsMutex.Lock()
-	observed := append([]bool(nil), lockFreeDuringResolve...)
-	observationsMutex.Unlock()
-
-	if len(observed) == 0 {
-		t.Fatal("the ntp hostname was not resolved, want the resolver to run during AddPool")
-	}
-	for _, free := range observed {
-		if !free {
-			t.Error("the ntp hostname was resolved while the allocator lock was held: packet processing would stall behind the resolver")
-		}
-	}
-
-	// literal ips register without resolution, the unresolvable entry is
-	// skipped and the pool still comes up
-	pool := a.GetPool("net-a")
-	if len(pool.NTP) != 1 || !pool.NTP[0].Equal(net.ParseIP("192.168.0.10")) {
-		t.Errorf("pool ntp = %v, want only the literal 192.168.0.10", pool.NTP)
-	}
-}
+// ntp hostnames are resolved by the ippool controller (see
+// pkg/controller/ippool resolveNTP), never by the allocator: AddPool takes
+// addresses, so a resolver can no longer stall packet processing on every
+// pool of the process. the resolution properties are pinned there.
 
 // TestRemoveLeasesForNetwork pins the pool-deletion lease sweep: deleting
 // a pool must not leave its leases behind, which would blackhole the
