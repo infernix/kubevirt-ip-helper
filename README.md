@@ -382,7 +382,37 @@ EOF
 > The example uses the plain manifests' `kubevirt-ip-helper`; with the Helm chart
 > the qualified name is `<release-namespace>/<nad-name>` (the chart enforces `dhcp`).
 
+#### NTP servers (`spec.ipv4config.ntp`)
+
+The `ntp` entries are served to the clients in DHCP option 42. Prefer literal
+IPv4 addresses: they reach the clients exactly as written and never depend on
+a resolver.
+
+A fully qualified hostname is resolved from the DNS view of the helper pod
+(the cluster resolver, so only names the pod can look up work), and a short
+name additionally follows the pod's DNS search list. Only IPv4 (A) records
+are served; an AAAA-only or empty answer is reported as a failure instead of
+being dropped silently.
+
+The name resolution never gates the pool: the pool registers and keeps
+serving with the addresses it already knows. When a lookup fails (NXDOMAIN,
+a timeout, or no IPv4 records), the last-known addresses stay in option 42,
+the failure is logged with the pool name, and the pool is retried. A
+successful lookup replaces option 42 in place, without restarting the
+helper: the resolution runs once at registration under a short cold-start
+budget, and it is refreshed on the informer resync of the IPPool - at most
+once every 5 minutes per pool.
+
+Two gauges report the resolution state per pool (labels `ippool`, `subnet`,
+`network`):
+
+- `kubevirtiphelper_ippool_ntp_servers`: number of IPv4 NTP servers currently
+  served in option 42.
+- `kubevirtiphelper_ippool_ntp_resolution_failed`: `1` when the last
+  resolution attempt had a failure, `0` otherwise.
+
 Create a VM using the same shared network, for example this two-NIC excerpt:
+
 
 ```YAML
 apiVersion: kubevirt.io/v1
