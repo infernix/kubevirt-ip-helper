@@ -610,7 +610,7 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 		[]string{"10.10.10.2", "10.10.10.3"},
 		"example.local",
 		[]string{"example.local"},
-		[]string{"10.10.10.4"},
+		[]net.IP{net.ParseIP("10.10.10.4")},
 		3600,
 		"eth-test",
 	); err != nil {
@@ -677,7 +677,7 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 		[]string{"10.10.10.2", "10.10.10.3"},
 		"example.local",
 		[]string{"example.local"},
-		[]string{"10.10.10.4"},
+		[]net.IP{net.ParseIP("10.10.10.4")},
 		3600,
 		"eth-test",
 	); err != nil {
@@ -751,7 +751,7 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 				[]string{"10.10.10.2", "10.10.10.3"},
 				"example.local",
 				[]string{"example.local"},
-				[]string{"10.10.10.4"},
+				[]net.IP{net.ParseIP("10.10.10.4")},
 				3600,
 				"eth-test",
 			); err != nil {
@@ -1204,7 +1204,7 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 				[]string{"10.10.10.2", "10.10.10.3"},
 				"example.local",
 				[]string{"example.local"},
-				[]string{"10.10.10.4"},
+				[]net.IP{net.ParseIP("10.10.10.4")},
 				3600,
 				"eth-test",
 			); err != nil {
@@ -1319,7 +1319,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 				[]string{"10.10.10.2", "10.10.10.3"},
 				"example.local",
 				[]string{"example.local"},
-				[]string{"10.10.10.4"},
+				[]net.IP{net.ParseIP("10.10.10.4")},
 				3600,
 				"eth-test",
 			); err != nil {
@@ -1416,7 +1416,7 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 		[]string{"10.10.10.2", "10.10.10.3"},
 		"example.local",
 		[]string{"example.local"},
-		[]string{"10.10.10.4"},
+		[]net.IP{net.ParseIP("10.10.10.4")},
 		3600,
 		"eth-test",
 	); err != nil {

@@ -18,7 +18,7 @@ func TestDHCP(t *testing.T) {
 		DNSServers   []string
 		domainName   string
 		domainSearch []string
-		NTPServers   []string
+		NTPServers   []net.IP
 		leaseTime    int
 		nic          string
 		want         error
@@ -31,7 +31,7 @@ func TestDHCP(t *testing.T) {
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
-			NTPServers:   []string{"localhost", "127.0.0.2"},
+			NTPServers:   []net.IP{net.ParseIP("127.0.0.2")},
 			leaseTime:    300,
 			nic:          "eth1",
 			want:         nil,
@@ -44,7 +44,7 @@ func TestDHCP(t *testing.T) {
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
-			NTPServers:   []string{},
+			NTPServers:   []net.IP{},
 			leaseTime:    1800,
 			nic:          "eth1",
 			want:         nil,
@@ -57,7 +57,7 @@ func TestDHCP(t *testing.T) {
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
-			NTPServers:   []string{},
+			NTPServers:   []net.IP{},
 			leaseTime:    0,
 			nic:          "",
 			want:         nil,

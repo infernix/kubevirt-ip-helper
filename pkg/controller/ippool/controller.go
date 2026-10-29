@@ -83,6 +83,16 @@ type Controller struct {
 	// controllers default to dhcp.Run, tests substitute a nil-returning
 	// stub
 	runListener func(networkName string, nic string) error
+
+	// ntpMu guards the resolution bookkeeping of the ntp refresh: a pool
+	// resolves at most one refresh at a time (ntpInFlight) and is
+	// re-attempted at most once per ntpRefreshInterval (ntpLastAttempt).
+	// the resync of the object is the only cadence - there is no ticker
+	// and no long-lived resolution goroutine, so the maps are the entire
+	// lifecycle state of a refresh.
+	ntpMu          sync.Mutex
+	ntpInFlight    map[string]bool
+	ntpLastAttempt map[string]time.Time
 }
 
 func NewController(
@@ -101,19 +111,21 @@ func NewController(
 	scope util.NetworkScope,
 ) *Controller {
 	return &Controller{
-		informer:     informer,
-		indexer:      indexer,
-		queue:        queue,
-		ctx:          ctx,
-		cache:        cache,
-		ipam:         ipam,
-		dhcp:         dhcp,
-		metrics:      metrics,
-		kihClientset: kihClientset,
-		appStatus:    appStatus,
-		gate:         startupGate,
-		verifyVM:     verifyVM,
-		scope:        scope,
+		informer:       informer,
+		indexer:        indexer,
+		queue:          queue,
+		ctx:            ctx,
+		cache:          cache,
+		ipam:           ipam,
+		dhcp:           dhcp,
+		metrics:        metrics,
+		kihClientset:   kihClientset,
+		appStatus:      appStatus,
+		gate:           startupGate,
+		verifyVM:       verifyVM,
+		scope:          scope,
+		ntpInFlight:    make(map[string]bool),
+		ntpLastAttempt: make(map[string]time.Time),
 	}
 }
 
