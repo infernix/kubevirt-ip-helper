@@ -403,13 +403,25 @@ helper: the resolution runs once at registration under a short cold-start
 budget, and it is refreshed on the informer resync of the IPPool - at most
 once every 5 minutes per pool.
 
+Editing the literal entries is authoritative: a literal removed from the
+spec stops being served at the next registration, even while a hostname
+entry in the same spec is failing (the retained last-known addresses cover
+the hostnames, not the literals the spec dropped). Provenance is tracked by
+address value, so a hostname which happened to resolve to a removed
+literal's address loses that address too and re-adds it on its next
+successful lookup.
+
 Two gauges report the resolution state per pool (labels `ippool`, `subnet`,
 `network`):
 
 - `kubevirtiphelper_ippool_ntp_servers`: number of IPv4 NTP servers currently
   served in option 42.
 - `kubevirtiphelper_ippool_ntp_resolution_failed`: `1` when the last
-  resolution attempt had a failure, `0` otherwise.
+  resolution attempt had a failure, `0` otherwise. Reusing the last-good
+  addresses on a reload which changed another option (lease time, DNS, domain)
+  is not a resolution attempt, so it preserves the current value until a lookup
+  actually completes or the last hostname entry is removed; a failed lookup is
+  therefore not hidden by an unrelated change.
 
 Create a VM using the same shared network, for example this two-NIC excerpt:
 
