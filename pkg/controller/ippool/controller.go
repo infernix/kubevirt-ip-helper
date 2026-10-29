@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,15 +85,52 @@ type Controller struct {
 	// stub
 	runListener func(networkName string, nic string) error
 
-	// ntpMu guards the resolution bookkeeping of the ntp refresh: a pool
-	// resolves at most one refresh at a time (ntpInFlight) and is
-	// re-attempted at most once per ntpRefreshInterval (ntpLastAttempt).
-	// the resync of the object is the only cadence - there is no ticker
-	// and no long-lived resolution goroutine, so the maps are the entire
-	// lifecycle state of a refresh.
+	// publishMu is the publication section of the controller: the worker
+	// publishes the served state of a network (the dhcp pool and the ntp
+	// fence of a registration or a reload, and with it the cached
+	// projection; the teardown of all of them) inside this section, and a
+	// refresh commits its addresses inside the same section. a resolution
+	// therefore can never be validated against one projection and applied
+	// to its successor, and no refresh can be applied between the parts of
+	// a publication. dns never runs inside the section: the projections are
+	// built before it and the refresh resolves before it.
+	publishMu sync.Mutex
+
+	// ntpLookupIP is the resolver seam of the ntp resolution: production
+	// controllers hold net.DefaultResolver.LookupIP, a test installs its own
+	// lookup on the controller it drives. the seam is a field and not a
+	// package global, so tests neither mutate shared state nor race each
+	// other (or a running refresh) through it.
+	ntpLookupIP ntpLookupFunc
+	// ntpColdStartDuration and ntpRefreshDuration are the resolution
+	// budgets, ntpRefreshInterval the throttle of a repeated attempt of an
+	// unchanged projection. NewController installs the production values; a
+	// test shrinks them on its own controller. the resync of the object is
+	// the only cadence - there is no ticker and no long-lived resolution
+	// goroutine.
+	ntpColdStartDuration time.Duration
+	ntpRefreshDuration   time.Duration
+	ntpRefreshInterval   time.Duration
+
+	// ntpMu guards the resolution bookkeeping of the ntp refresh, keyed by
+	// the network (the identity the dhcp pool and the cache share):
+	//
+	//   - ntpFences holds the incarnation of the installed ntp projection
+	//     (pool uid, entry list and a generation advanced by every
+	//     publication and every teardown);
+	//   - ntpInFlight holds the claim of the one running refresh of a
+	//     network, so a superseeded refresh never releases its successor's
+	//     claim;
+	//   - ntpLastAttempt holds the last committed attempt (the throttle);
+	//   - ntpFailed holds the outcome of the last completed resolution
+	//     attempt, which a plain reload preserves.
+	//
+	// ntpMu is always taken inside publishMu, never around it.
 	ntpMu          sync.Mutex
-	ntpInFlight    map[string]bool
+	ntpFences      map[string]ntpFence
+	ntpInFlight    map[string]ntpClaim
 	ntpLastAttempt map[string]time.Time
+	ntpFailed      map[string]bool
 }
 
 func NewController(
@@ -111,21 +149,28 @@ func NewController(
 	scope util.NetworkScope,
 ) *Controller {
 	return &Controller{
-		informer:       informer,
-		indexer:        indexer,
-		queue:          queue,
-		ctx:            ctx,
-		cache:          cache,
-		ipam:           ipam,
-		dhcp:           dhcp,
-		metrics:        metrics,
-		kihClientset:   kihClientset,
-		appStatus:      appStatus,
-		gate:           startupGate,
-		verifyVM:       verifyVM,
-		scope:          scope,
-		ntpInFlight:    make(map[string]bool),
-		ntpLastAttempt: make(map[string]time.Time),
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		ctx:          ctx,
+		cache:        cache,
+		ipam:         ipam,
+		dhcp:         dhcp,
+		metrics:      metrics,
+		kihClientset: kihClientset,
+		appStatus:    appStatus,
+		gate:         startupGate,
+		verifyVM:     verifyVM,
+		scope:        scope,
+
+		ntpLookupIP:          net.DefaultResolver.LookupIP,
+		ntpColdStartDuration: defaultNTPColdStartBudget,
+		ntpRefreshDuration:   defaultNTPRefreshBudget,
+		ntpRefreshInterval:   defaultNTPRefreshInterval,
+		ntpFences:            make(map[string]ntpFence),
+		ntpInFlight:          make(map[string]ntpClaim),
+		ntpLastAttempt:       make(map[string]time.Time),
+		ntpFailed:            make(map[string]bool),
 	}
 }
 
