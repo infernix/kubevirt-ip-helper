@@ -15,10 +15,11 @@ package ippool
 // (pool uid, generation and entry list) make the refresh commit atomic with
 // the worker's publication and fence it against a reloaded projection, a
 // teardown and a re-created pool; an explicit literal edit is subtracted
-// from the retained fallback; the failure gauge follows the last completed
-// resolution attempt instead of every publication; and address lists are
-// deep-copied at the allocator boundary. the tests below drive each of those
-// interleavings and rules through the controller-local resolution seam.
+// from the retained fallback (a spec which drops every literal entry keeps
+// it); the failure gauge follows the last completed resolution attempt
+// instead of every publication; and address lists are deep-copied at the
+// allocator boundary. the tests below drive each of those interleavings and
+// rules through the controller-local resolution seam.
 
 import (
 	"bytes"
@@ -1081,6 +1082,115 @@ func TestMixedLiteralEditRemovesObsoleteLiteralDuringDNSFailure(t *testing.T) {
 	}
 	if failed, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_resolution_failed", ntpMetricLabels(pool)); !found || failed != 1 {
 		t.Errorf("ntp failed metric = %v (found=%v), want 1 for the unresolved entry", failed, found)
+	}
+}
+
+// TestLiteralToHostnameTransitionRetainsTheServedSet pins the other half of
+// the literal subtraction rule: a spec which drops its literals entirely is
+// not a literal edit, it switched the whole projection to hostnames. the old
+// [10.77.0.1, 10.77.0.2] must keep serving exactly those addresses while
+// ntp.invalid is failing (servers=2, failed=1) instead of emptying option 42,
+// and the first successful lookup replaces the served set with its answer.
+func TestLiteralToHostnameTransitionRetainsTheServedSet(t *testing.T) {
+	pool := testPool("pool-literal-to-hostname", "infra/net-literal-to-hostname", 60)
+	pool.UID = "uid-literal-to-hostname"
+	pool.Spec.IPv4Config.NTP = []string{"10.77.0.1", "10.77.0.2"}
+
+	controller, cached := ntpTestController(t, pool, parseNTPAddresses("10.77.0.1", "10.77.0.2"))
+	shrinkNTPBudgets(t, controller, 100*time.Millisecond, time.Second, 0)
+
+	// the publication itself never waits for the resolver (the retained set
+	// is non-empty), so the reload's own refresh is parked here and the test
+	// orders the served state against the resolution
+	seam := &ntpSeam{}
+	seam.setGated()
+	controller.ntpLookupIP = seam.lookup
+
+	reloaded := cached.DeepCopy()
+	reloaded.Spec.IPv4Config.NTP = []string{"ntp.invalid"}
+
+	if err := controller.handleIPPoolObjectChange(*cached, reloaded); err != nil {
+		t.Fatalf("the literal-to-hostname transition was rejected: %v", err)
+	}
+
+	seam.waitLookup(t, 0)
+
+	// a spec without a literal entry is not a literal edit: the previous
+	// served set is the retained fallback while the name is unresolved
+	assertNTPServed(t, controller, pool.Spec.NetworkName, "10.77.0.1", "10.77.0.2")
+
+	if servers, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_servers", ntpMetricLabels(pool)); !found || servers != 2 {
+		t.Errorf("ntp servers metric = %v (found=%v), want the retained 2", servers, found)
+	}
+
+	// the failed lookup keeps the served set and records the failure: the ip4
+	// lookup fails, and its aaaa-only diagnosis (the unfiltered lookup) is the
+	// second parked call
+	seam.answerLookup(t, 0, nil, errTestNoSuchHost)
+	seam.waitLookup(t, 1)
+	seam.answerLookup(t, 1, nil, errTestNoSuchHost)
+	waitNTPIdle(t, controller, pool.Spec.NetworkName)
+
+	assertNTPServed(t, controller, pool.Spec.NetworkName, "10.77.0.1", "10.77.0.2")
+
+	if servers, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_servers", ntpMetricLabels(pool)); !found || servers != 2 {
+		t.Errorf("ntp servers metric = %v (found=%v), want the retained 2", servers, found)
+	}
+	if failed, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_resolution_failed", ntpMetricLabels(pool)); !found || failed != 1 {
+		t.Errorf("ntp failed metric = %v (found=%v), want 1 for the unresolved name", failed, found)
+	}
+
+	// the first successful lookup replaces the served set with its answer
+	seam.set("answer", []net.IP{net.ParseIP("10.77.0.9")}, nil)
+	controller.refreshNTP(reloaded.DeepCopy())
+
+	assertNTPServed(t, controller, pool.Spec.NetworkName, "10.77.0.9")
+
+	if servers, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_servers", ntpMetricLabels(pool)); !found || servers != 1 {
+		t.Errorf("ntp servers metric = %v (found=%v), want the resolved 1", servers, found)
+	}
+	if failed, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_resolution_failed", ntpMetricLabels(pool)); !found || failed != 0 {
+		t.Errorf("ntp failed metric = %v (found=%v), want 0 after the successful lookup", failed, found)
+	}
+}
+
+// TestPureLiteralSpecAfterHostnameDropsTheServeSet pins the reverse
+// transition: a pure-literal spec configures its own addresses, so the
+// last-good set of the hostname spec it replaces (10.0.0.9) must not survive.
+// option 42 is exactly the new literal at once and costs no lookup.
+func TestPureLiteralSpecAfterHostnameDropsTheServeSet(t *testing.T) {
+	pool := testPool("pool-hostname-to-literal", "infra/net-hostname-to-literal", 60)
+	pool.UID = "uid-hostname-to-literal"
+	pool.Spec.IPv4Config.NTP = []string{"broken.example"}
+
+	controller, cached := ntpTestController(t, pool, parseNTPAddresses("10.0.0.9"))
+	shrinkNTPBudgets(t, controller, time.Second, time.Second, 0)
+
+	// a gated seam would block any lookup: a pure-literal spec must not make
+	// one at all
+	seam := &ntpSeam{}
+	seam.setGated()
+	controller.ntpLookupIP = seam.lookup
+
+	reloaded := cached.DeepCopy()
+	reloaded.Spec.IPv4Config.NTP = []string{"10.0.0.3"}
+
+	if err := controller.handleIPPoolObjectChange(*cached, reloaded); err != nil {
+		t.Fatalf("the hostname-to-literal transition was rejected: %v", err)
+	}
+
+	waitNTPIdle(t, controller, pool.Spec.NetworkName)
+
+	assertNTPServed(t, controller, pool.Spec.NetworkName, "10.0.0.3")
+
+	if lookups := seam.started.Load(); lookups != 0 {
+		t.Errorf("lookups = %d, want none for a literal-only spec", lookups)
+	}
+	if servers, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_servers", ntpMetricLabels(pool)); !found || servers != 1 {
+		t.Errorf("ntp servers metric = %v (found=%v), want 1", servers, found)
+	}
+	if failed, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_ntp_resolution_failed", ntpMetricLabels(pool)); !found || failed != 0 {
+		t.Errorf("ntp failed metric = %v (found=%v), want 0: no hostname entry is left to fail", failed, found)
 	}
 }
 

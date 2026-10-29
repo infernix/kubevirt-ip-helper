@@ -274,7 +274,22 @@ func literalNTPAddresses(entries []string) []net.IP {
 // longer carries. a literal is configuration, not a cache: an explicit edit
 // of the literal entries is authoritative, which is what lets a publication
 // subtract it from the retained fallback (see retainedNTPAddresses).
+//
+// only a literal edit subtracts. a current entry list without a single
+// literal entry configures no address of its own - it moved the whole
+// projection to hostnames, from an all-literal or a mixed spec - so nothing
+// is a removed literal and the previous served set stays the fallback of the
+// hostname entries until one of them resolves. subtracting every previous
+// literal there would empty option 42 exactly while the new hostname is
+// failing, which is the state the last-good fallback exists to cover.
 func removedLiteralAddresses(previous []string, current []string) []net.IP {
+	if len(literalNTPAddresses(current)) == 0 {
+		// a spec without a literal entry is not a literal edit: the whole
+		// projection switched to hostnames, so the previous served set remains
+		// the fallback until one of them resolves
+		return nil
+	}
+
 	var removed []net.IP
 
 	for _, entry := range previous {
@@ -548,11 +563,15 @@ func (c *Controller) ntpProjectionForPublication(pool *kihv1.IPPool) ntpProjecti
 // must not drop the addresses of a name whose answer is unavailable right
 // now - a dns change of the same object would otherwise empty option 42
 // until the next resync. an explicit literal edit is authoritative instead:
-// the addresses of the literal entries the previous installed spec carried
-// and the new spec no longer carries are subtracted from the fallback, so an
-// old [10.0.0.1, broken.example] replaced by [10.0.0.2, broken.example]
-// serves [10.0.0.2] while the name is unresolved instead of keeping
-// 10.0.0.1 forever.
+// when the new spec still carries a literal entry, the addresses of the
+// literal entries the previous installed spec carried and the new spec no
+// longer carries are subtracted from the fallback, so an old
+// [10.0.0.1, broken.example] replaced by [10.0.0.2, broken.example] serves
+// [10.0.0.2] while the name is unresolved instead of keeping 10.0.0.1
+// forever. a new spec without any literal entry is not a literal edit: it
+// moved the whole projection to hostnames, and the previous served set stays
+// the fallback until one of those names resolves (see
+// removedLiteralAddresses).
 //
 // provenance is not tracked, because an address is just an address: a
 // hostname which resolved to the same address as a removed literal loses it

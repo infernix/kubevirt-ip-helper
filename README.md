@@ -217,13 +217,16 @@ helper: the resolution runs once at registration under a short cold-start
 budget, and it is refreshed on the informer resync of the IPPool - at most
 once every 5 minutes per pool.
 
-Editing the literal entries is authoritative: a literal removed from the
-spec stops being served at the next registration, even while a hostname
-entry in the same spec is failing (the retained last-known addresses cover
-the hostnames, not the literals the spec dropped). Provenance is tracked by
-address value, so a hostname which happened to resolve to a removed
-literal's address loses that address too and re-adds it on its next
-successful lookup.
+Editing the literal entries is authoritative: when the new spec still lists
+at least one literal, a literal removed from the spec stops being served at
+the next registration, even while a hostname entry in the same spec is
+failing (the retained last-known addresses cover the hostnames, not the
+literals the spec dropped). Switching the whole spec to hostnames is not a
+literal edit: the addresses it served before stay in option 42 until one of
+those names resolves, so a name which is failing right now never empties the
+option. Provenance is tracked by address value, so a hostname which happened
+to resolve to a removed literal's address loses that address too and re-adds
+it on its next successful lookup.
 
 Two gauges report the resolution state per pool (labels `ippool`, `subnet`,
 `network`):
