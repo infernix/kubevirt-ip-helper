@@ -112,6 +112,20 @@ jobs:
           docker --version
           kubectl version --client
 
+      # virt-handler's cert manager creates an inotify watcher during startup.
+      # The kind node's kubelet, containerd, CNI pods and the KubeVirt control
+      # plane already consume most of the kernel's per-user inotify instance
+      # budget (128 by default), so virt-handler dies with EMFILE ("Failed to
+      # create an inotify watcher: too many open files") and the KubeVirt gate
+      # never reaches Available. The limits are per user on the host kernel and
+      # the kind nodes share it, so raise them on the runner before the cluster
+      # is created.
+      - name: Raise the inotify limits KubeVirt needs
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=8192
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_queued_events=32768
+
       - name: Run the kind, Multus and KubeVirt end-to-end suite
         # `run.sh` prints its `report.txt` from the exit trap on success and on
         # failure alike, so the suite summary is already in this step's log.
