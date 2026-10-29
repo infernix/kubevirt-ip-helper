@@ -161,6 +161,65 @@ func TestSetPoolNTPUpdatesOption42(t *testing.T) {
 	}
 }
 
+// TestPoolNTPCopiesAddressBytes pins the ownership of the served option 42
+// bytes: net.IP is a byte slice, so an outer-slice copy alone would still
+// share every address with the caller. mutating an address which was handed
+// to AddPool or SetPoolNTP, or an address read back from PoolNTP, must never
+// change the bytes of the served packet state.
+func TestPoolNTPCopiesAddressBytes(t *testing.T) {
+	a := newTestPooledAllocator(t)
+
+	served := net.ParseIP("10.0.0.53").To4()
+	read, exists := a.PoolNTP("pool1")
+	if !exists {
+		t.Fatal("PoolNTP reported the registered pool absent")
+	}
+	if len(read) != 1 || !read[0].Equal(served) {
+		t.Fatalf("served ntp = %v, want [%v]", read, served)
+	}
+
+	// the reader's bytes are its own
+	read[0][3] = 99
+	if got, _ := a.PoolNTP("pool1"); !got[0].Equal(served) {
+		t.Errorf("ntp = %v after the reader mutated its copy's bytes, want the served %v", got, served)
+	}
+
+	// the replacement's bytes are copied as well
+	replacement := net.ParseIP("10.0.0.60").To4()
+	if !a.SetPoolNTP("pool1", []net.IP{replacement}) {
+		t.Fatal("SetPoolNTP reported the registered pool absent")
+	}
+	replacement[3] = 99
+	if got, _ := a.PoolNTP("pool1"); !got[0].Equal(net.ParseIP("10.0.0.60")) {
+		t.Errorf("ntp = %v after the caller mutated the replacement's bytes, want 10.0.0.60", got)
+	}
+
+	// the registration's bytes are copied as well
+	registered := net.ParseIP("10.0.0.61").To4()
+	if err := a.AddPool(
+		context.Background(),
+		"pool1",
+		"192.168.0.1",
+		"255.255.255.0",
+		"192.168.0.254",
+		[]string{"1.1.1.1", "8.8.8.8"},
+		"example.com",
+		[]string{"example.com"},
+		[]net.IP{registered},
+		3600,
+		"eth0",
+	); err != nil {
+		t.Fatalf("AddPool: %v", err)
+	}
+	registered[3] = 99
+
+	// the wire observes the served bytes, not the caller's buffer
+	resp := requestForLease(t, a)
+	if got := resp.NTPServers(); len(got) != 1 || !got[0].Equal(net.ParseIP("10.0.0.61")) {
+		t.Errorf("option 42 = %v after the caller mutated the registered address, want [10.0.0.61]", got)
+	}
+}
+
 // TestRejectedReplacementKeepsTheOldPoolServing pins the F07 rejection
 // continuity at the packet level: a replacement which fails AddPool's own
 // validation takes no state, so the old pool must still answer requests
